@@ -200,11 +200,7 @@ fn eager_validation_identifies_the_failed_name_or_value() {
     assert!(matches!(
         read_field_line(&mut &[0x21, b'x', 2, 1, 2][..], 1),
         Err(ReadError::Value {
-            source: LiteralError::RawTooLong {
-                length: 2,
-                limit: 1
-            }
-        })
+            source: LiteralError::RawTooLong { source } }) if source.length() == 2 && source.limit() == 1
     ));
 }
 
@@ -283,11 +279,7 @@ fn raw_and_huffman_can_hit_the_limit_on_the_name_before_reading_the_value() {
     assert!(matches!(
         read_field_line(&mut &b"\x23abc\x00"[..], 2),
         Err(ReadError::Name {
-            source: string_literal::ReadError::RawTooLong {
-                length: 3,
-                limit: 2
-            }
-        })
+            source: string_literal::ReadError::RawTooLong { source } }) if source.length() == 3 && source.limit() == 2
     ));
     let mut wire = &b"\x29\x1f\x00"[..];
     assert!(matches!(

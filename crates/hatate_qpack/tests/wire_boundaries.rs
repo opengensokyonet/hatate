@@ -113,3 +113,18 @@ fn nonminimal_encodings_are_normalized_without_changing_the_line() {
     canonical.extend_from_slice(&[b'x'; 127]);
     assert_eq!(encoded, canonical);
 }
+
+#[test]
+fn nonminimal_integer_uses_at_most_ten_continuations() {
+    let mut wire = [0x80; 11];
+    wire[9] = 0;
+    let mut rest = &wire[..];
+    assert_eq!(integer::read::<1>(1, &mut rest), Ok(1));
+    assert_eq!(rest, &[0x80]);
+
+    wire[9] = 0x80;
+    wire[10] = 0;
+    let mut rest = &wire[..];
+    assert_eq!(integer::read::<1>(1, &mut rest), Err(ReadError::TooLong));
+    assert_eq!(rest, &[0]);
+}

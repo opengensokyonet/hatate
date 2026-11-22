@@ -26,6 +26,40 @@ impl<S: AsRef<[u8]>, H: AsRef<[u8]>> AsRef<[u8]> for StringLiteral<S, H> {
     }
 }
 
+/// An uncompressed literal whose wire length exceeds the decoded limit.
+/// Its measurements can only be obtained from an actual failed check.
+///
+/// ```compile_fail
+/// use hatate_qpack::string_literal::RawLengthError;
+/// let error = RawLengthError { length: 8, limit: 8 };
+/// ```
+#[derive(Debug, PartialEq, Eq, Snafu)]
+#[snafu(display("raw literal of {length} bytes exceeds limit {limit}"))]
+pub struct RawLengthError {
+    length: u64,
+    limit: usize,
+}
+
+impl RawLengthError {
+    fn check(length: u64, limit: usize) -> Result<(), Self> {
+        if u128::from(length) > limit as u128 {
+            Err(Self { length, limit })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The peer's declared length, strictly greater than [`Self::limit`].
+    pub const fn length(&self) -> u64 {
+        self.length
+    }
+
+    /// The caller's limit in decoded octets.
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
 /// A length or payload of a string literal could not be decoded.
 #[derive(Debug, Snafu)]
 pub enum ReadError {
@@ -36,12 +70,10 @@ pub enum ReadError {
         source: integer::ReadError,
     },
     /// Raw payload exceeds the caller's limit on decoded bytes.
-    #[snafu(display("raw literal of {length} bytes exceeds limit {limit}"))]
+    #[snafu(display("raw string literal too long"))]
     RawTooLong {
-        /// Number of octets declared by the peer.
-        length: u64,
-        /// Maximum decoded size.
-        limit: usize,
+        /// The peer's declared length and the limit it exceeded.
+        source: RawLengthError,
     },
     /// The announced length cannot be addressed on this host.
     #[snafu(display("literal length exceeds addressable memory"))]
@@ -67,8 +99,8 @@ pub(crate) fn read<const N: u8, S: Buf + SplitTo>(
 ) -> Result<StringLiteral<S>, ReadError> {
     let length = integer::read::<N>(first, src).context(LengthSnafu)?;
     let encoded = first & (1 << N) != 0;
-    if !encoded && u128::from(length) > limit as u128 {
-        return Err(ReadError::RawTooLong { length, limit });
+    if !encoded {
+        RawLengthError::check(length, limit).context(RawTooLongSnafu)?;
     }
     let length = usize::try_from(length).map_err(|_| ReadError::AddressSpace)?;
     let data = src.split_to(length).context(PayloadSnafu)?;

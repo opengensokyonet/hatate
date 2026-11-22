@@ -25,7 +25,13 @@ const fn prefix_mask<const N: u8>() -> u8 {
 
 /// Read a prefixed integer given the already-consumed first octet. Its low
 /// `N` bits belong to the integer (`1..=8`, checked at compile time).
-/// Only continuation octets are consumed from `src`, including on error.
+/// The implementation accepts values through `u64::MAX` and at most ten
+/// continuation octets in addition to `first`. Non-minimal encodings within
+/// both limits are accepted. A digit that would exceed the numeric range is
+/// [`ReadError::Overflow`]. If the tenth continuation octet still requests a
+/// further octet, the encoding is [`ReadError::TooLong`] unless that digit
+/// already overflowed the value. Only continuation octets are consumed from
+/// `src`, including on error; an eleventh continuation octet is never read.
 pub fn read<const N: u8>(first: u8, src: &mut impl Buf) -> Result<u64, ReadError> {
     let mask = prefix_mask::<N>();
     let mut value = u64::from(first & mask);

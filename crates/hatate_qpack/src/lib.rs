@@ -23,6 +23,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+extern crate alloc;
+
 pub mod field_line;
 pub mod huffman;
 pub mod integer;

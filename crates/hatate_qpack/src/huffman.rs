@@ -3,11 +3,12 @@
 mod codes;
 
 use crate::InsufficientCapacityError;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use alloc::{collections::TryReserveError, vec::Vec};
+use bytes::{Buf, BufMut, Bytes};
 use codes::CODES;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
-/// A Huffman literal violates its code or the supplied output limit.
+/// A Huffman literal could not be decoded into the bounded output buffer.
 #[derive(Debug, PartialEq, Eq, Snafu)]
 pub enum DecodeError {
     /// The reserved EOS symbol occurred in the input.
@@ -19,6 +20,12 @@ pub enum DecodeError {
     /// The trailing bits differ from the leading bits of EOS.
     #[snafu(display("Huffman padding differs from the EOS prefix"))]
     InvalidPadding,
+    /// The output buffer could not grow to receive another symbol.
+    #[snafu(display("could not grow Huffman output"))]
+    ReserveOutput {
+        /// Failure to reserve space for the decoded bytes.
+        source: TryReserveError,
+    },
     /// Another symbol would exceed the maximum decoded length.
     #[snafu(display("Huffman output exceeds {limit} bytes"))]
     OutputTooLong {
@@ -62,8 +69,11 @@ static TREE: [[u16; 2]; LEAF as usize] = {
 
 /// Decode one complete Huffman payload into at most `limit` bytes.
 /// Checks the EOS and padding rules even for a partial final octet.
+/// A symbol beyond the limit yields [`DecodeError::OutputTooLong`]. If the
+/// decoded buffer needs to grow within the limit and reservation fails, the
+/// error is [`DecodeError::ReserveOutput`].
 pub fn decode(mut src: impl Buf, limit: usize) -> Result<Bytes, DecodeError> {
-    let mut output = BytesMut::new();
+    let mut output = Vec::new();
     let mut node = 0;
     let mut tail_bits = 0;
     let mut tail_is_ones = true;
@@ -81,7 +91,13 @@ pub fn decode(mut src: impl Buf, limit: usize) -> Result<Bytes, DecodeError> {
                 if output.len() == limit {
                     return Err(DecodeError::OutputTooLong { limit });
                 }
-                output.put_u8((node - LEAF) as u8);
+                if output.len() == output.capacity() {
+                    let additional = 1;
+                    #[cfg(test)]
+                    let additional = tests::reservation_size(additional);
+                    output.try_reserve(additional).context(ReserveOutputSnafu)?;
+                }
+                output.push((node - LEAF) as u8);
                 node = 0;
                 tail_bits = 0;
                 tail_is_ones = true;
@@ -94,7 +110,7 @@ pub fn decode(mut src: impl Buf, limit: usize) -> Result<Bytes, DecodeError> {
     if !tail_is_ones {
         return Err(DecodeError::InvalidPadding);
     }
-    Ok(output.freeze())
+    Ok(Bytes::from(output))
 }
 
 /// The encoded payload length, including its final padding. A slice on a
@@ -138,7 +154,61 @@ pub fn encode(dst: &mut impl BufMut, input: &[u8]) -> Result<(), InsufficientCap
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+    use bytes::BytesMut;
+    use core::cell::Cell;
+
+    // A capacity overflow in try_reserve is deterministic, even for empty
+    // vectors. Only the armed test thread changes the next growth request.
+    std::thread_local! {
+        static FAIL_NEXT_GROWTH: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn reservation_size(additional: usize) -> usize {
+        if FAIL_NEXT_GROWTH.replace(false) {
+            usize::MAX
+        } else {
+            additional
+        }
+    }
+
+    #[test]
+    fn failed_growth_reaches_the_independent_name_and_value_readers() {
+        use crate::{field_line, string_literal};
+        use core::error::Error;
+
+        FAIL_NEXT_GROWTH.set(true);
+        let direct = decode(&[0x1f][..], 1).unwrap_err();
+        assert!(matches!(direct, DecodeError::ReserveOutput { .. }));
+        assert!(direct.source().unwrap().is::<TryReserveError>());
+
+        for (wire, is_name) in [
+            (&[0x29, 0x1f, 0][..], true),
+            (&[0x40, 0x81, 0x1f][..], false),
+        ] {
+            FAIL_NEXT_GROWTH.set(true);
+            let err = field_line::read_field_line(&mut &*wire, 1).unwrap_err();
+            let source = match (is_name, err) {
+                (true, field_line::ReadError::Name { source })
+                | (false, field_line::ReadError::Value { source }) => source,
+                (_, other) => panic!("unexpected error: {other}"),
+            };
+            assert!(matches!(
+                source,
+                string_literal::ReadError::Huffman {
+                    source: DecodeError::ReserveOutput { .. }
+                }
+            ));
+        }
+        FAIL_NEXT_GROWTH.set(true);
+        assert_eq!(
+            decode(&[0x1f][..], 0),
+            Err(DecodeError::OutputTooLong { limit: 0 })
+        );
+        assert!(FAIL_NEXT_GROWTH.replace(false));
+    }
 
     #[test]
     fn appendix_c_strings() {

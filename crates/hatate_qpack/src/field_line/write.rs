@@ -1,7 +1,8 @@
 use super::{FieldLine, StringLiteral, TableIndex};
 use crate::{InsufficientCapacityError, huffman, integer};
 use bytes::BufMut;
-use snafu::Snafu;
+use core::num::TryFromIntError;
+use snafu::{ResultExt, Snafu};
 
 /// A field line cannot be written to the given destination.
 #[derive(Debug, Snafu)]
@@ -12,9 +13,18 @@ pub enum WriteError {
         /// Exact required and available capacities in octets.
         source: InsufficientCapacityError,
     },
-    /// The length of a literal's Huffman encoding exceeds u64::MAX.
-    #[snafu(display("Huffman payload exceeds the supported prefixed integer range"))]
-    LiteralLengthOverflow,
+    /// The encoded literal name length exceeds u64::MAX.
+    #[snafu(display("encoded field name length exceeds the supported prefixed integer range"))]
+    NameLengthOverflow {
+        /// Failure to represent the encoded length as a u64.
+        source: TryFromIntError,
+    },
+    /// The encoded literal value length exceeds u64::MAX.
+    #[snafu(display("encoded field value length exceeds the supported prefixed integer range"))]
+    ValueLengthOverflow {
+        /// Failure to represent the encoded length as a u64.
+        source: TryFromIntError,
+    },
 }
 
 // Each representation is either a single prefixed integer or two prefixed
@@ -45,7 +55,8 @@ impl<'a> Part<'a> {
     fn literal<const N: u8, S: AsRef<[u8]>, H: AsRef<[u8]>>(
         flags: u8,
         literal: &'a StringLiteral<S, H>,
-    ) -> Result<Self, WriteError> {
+        encoded_len: impl FnOnce(&[u8]) -> u128,
+    ) -> Result<Self, TryFromIntError> {
         let (flags, payload, length) = match literal {
             StringLiteral::Raw(data) => {
                 let data = data.as_ref();
@@ -53,8 +64,7 @@ impl<'a> Part<'a> {
             }
             StringLiteral::Huffman(data) => {
                 let data = data.as_ref();
-                let length = u64::try_from(huffman::encoded_len(data))
-                    .map_err(|_| WriteError::LiteralLengthOverflow)?;
+                let length = u64::try_from(encoded_len(data))?;
                 (flags | (1 << N), StringLiteral::Huffman(data), length)
             }
         };
@@ -86,7 +96,21 @@ pub fn write_field_line<S: AsRef<[u8]>, H: AsRef<[u8]>>(
     dst: &mut impl BufMut,
     line: &FieldLine<S, H>,
 ) -> Result<(), WriteError> {
-    let (head, value) = match line {
+    let (head, value) = prepare(line, huffman::encoded_len)?;
+    let required = head.len() + value.as_ref().map_or(0, Part::len);
+    InsufficientCapacityError::check(required, dst.remaining_mut())?;
+    head.write(dst)?;
+    if let Some(value) = value {
+        value.write(dst)?;
+    }
+    Ok(())
+}
+
+fn prepare<S: AsRef<[u8]>, H: AsRef<[u8]>>(
+    line: &FieldLine<S, H>,
+    encoded_len: impl Fn(&[u8]) -> u128,
+) -> Result<(Part<'_>, Option<Part<'_>>), WriteError> {
+    Ok(match line {
         FieldLine::Indexed(index) => {
             let head = match index {
                 TableIndex::Static(i) => Part::integer::<6>(0xc0, u64::from(i.get())),
@@ -106,7 +130,13 @@ pub fn write_field_line<S: AsRef<[u8]>, H: AsRef<[u8]>>(
                 TableIndex::Relative(i) => Part::integer::<4>(0x40 | n << 5, *i),
                 TableIndex::PostBase(i) => Part::integer::<3>(n << 3, *i),
             };
-            (head, Some(Part::literal::<7, _, _>(0, value)?))
+            (
+                head,
+                Some(
+                    Part::literal::<7, _, _>(0, value, &encoded_len)
+                        .context(ValueLengthOverflowSnafu)?,
+                ),
+            )
         }
         FieldLine::LiteralWithLiteralName {
             never_index,
@@ -115,16 +145,58 @@ pub fn write_field_line<S: AsRef<[u8]>, H: AsRef<[u8]>>(
         } => {
             let flags = 0x20 | u8::from(*never_index) << 4;
             (
-                Part::literal::<3, _, _>(flags, name)?,
-                Some(Part::literal::<7, _, _>(0, value)?),
+                Part::literal::<3, _, _>(flags, name, &encoded_len)
+                    .context(NameLengthOverflowSnafu)?,
+                Some(
+                    Part::literal::<7, _, _>(0, value, &encoded_len)
+                        .context(ValueLengthOverflowSnafu)?,
+                ),
             )
         }
-    };
-    let required = head.len() + value.as_ref().map_or(0, Part::len);
-    InsufficientCapacityError::check(required, dst.remaining_mut())?;
-    head.write(dst)?;
-    if let Some(value) = value {
-        value.write(dst)?;
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_length_overflow_identifies_the_field() {
+        let raw = StringLiteral::Raw(&b""[..]);
+        let coded = StringLiteral::Huffman(&b"x"[..]);
+        for (line, is_name) in [
+            (
+                FieldLine::LiteralWithNameReference {
+                    never_index: false,
+                    name: TableIndex::Relative(0),
+                    value: coded.clone(),
+                },
+                false,
+            ),
+            (
+                FieldLine::LiteralWithLiteralName {
+                    never_index: false,
+                    name: raw.clone(),
+                    value: coded.clone(),
+                },
+                false,
+            ),
+            (
+                FieldLine::LiteralWithLiteralName {
+                    never_index: false,
+                    name: coded,
+                    value: raw,
+                },
+                true,
+            ),
+        ] {
+            let max = u128::from(u64::MAX);
+            assert!(prepare(&line, |_| max).is_ok());
+            assert!(matches!(
+                (is_name, prepare(&line, |_| max + 1)),
+                (true, Err(WriteError::NameLengthOverflow { .. }))
+                    | (false, Err(WriteError::ValueLengthOverflow { .. }))
+            ));
+        }
     }
-    Ok(())
 }
