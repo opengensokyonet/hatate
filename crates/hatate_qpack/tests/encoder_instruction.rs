@@ -658,3 +658,58 @@ fn pending_on_both_sides_does_not_repeat_octets_or_restart_huffman_state() {
         [&[0x6c], &name[..], &[0x81, 0x1f, 2]].concat()
     );
 }
+
+#[call(sync)]
+async fn retry_before_opcode<F: Read>(io: &mut impl ReceiverAccess<Family = F>)
+where
+    <F as Read>::Error: Debug,
+{
+    use core::{
+        future::{Future, poll_fn},
+        pin::pin,
+        task::Poll,
+    };
+    let mut reader = Reader::new(io);
+    assert!(matches!(
+        reader.start(0, 0).await,
+        Err(StartError::Prefix {
+            source: hatate_qpack::instruction::OctetError::WireLimit { .. }
+        })
+    ));
+    {
+        // The Trickle host's first read waits without advancing its cursor.
+        let mut first = pin!(reader.start(1, 0));
+        poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+    }
+    assert!(matches!(
+        reader.start(1, 0).await.unwrap(),
+        Started::Duplicate(2)
+    ));
+}
+
+#[test]
+fn zero_budget_and_cancelled_first_read_preserve_boundary() {
+    use core::{
+        future::Future,
+        pin::{Pin, pin},
+        task::{Context, Poll, Waker},
+    };
+    use nitori_call::CallExecutor;
+    let mut host = Trickle {
+        rest: &[2, 0x20],
+        waiting: false,
+    };
+    {
+        let mut call = pin!(CallExecutor::execute(
+            Pin::new(&mut host),
+            RetryBeforeOpcode::new()
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(()));
+    }
+    assert_eq!(host.rest, [0x20]);
+}

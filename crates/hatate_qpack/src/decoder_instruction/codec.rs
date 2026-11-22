@@ -11,6 +11,8 @@ use snafu::{ResultExt, Snafu};
 /// Read exactly one RFC 9204 §4.4 instruction. The limit counts the first
 /// octet and all continuations. EOF before the opcode is a prefix error;
 /// EOF inside a number is attributed to that instruction's field.
+/// Resume the same future across waits. If it is dropped after consuming an
+/// octet, abandon the input stream: the cursor may point to a continuation.
 #[call(sync)]
 pub async fn read_decoder_instruction<F: Read, A: ReceiverAccess<Family = F>>(
     io: &mut A,
@@ -69,6 +71,8 @@ pub enum ReadError<E> {
 
 /// Encode one complete instruction. The wire limit is checked before any
 /// write. A write error retains the number of bytes accepted by the host.
+/// Resume the same future across waits. If cancelled after accepting a prefix,
+/// abandon the output stream: the integer may be incomplete.
 #[call(sync)]
 pub async fn write_decoder_instruction<F: Write, A: ReceiverAccess<Family = F>>(
     io: &mut A,

@@ -97,9 +97,9 @@ pub(crate) async fn read_head<F: Read, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     budget: &mut WireBudget,
     decoded_left: usize,
+    first: u8,
 ) -> Result<Head, StartError<F::Error>> {
     use start_error::*;
-    let first = instruction::octet(io, budget).await.context(PrefixSnafu)?;
     Ok(match first {
         0x80..=0xff => {
             let index = instruction::number::<6, F>(io, budget, first)

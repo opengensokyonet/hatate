@@ -33,7 +33,7 @@ pub enum NameReference {
 
 /// Sequential access to one encoder stream from within a call. Create this
 /// reader at an instruction boundary and retain it for the parsing loop.
-/// On error or cancellation after starting, abandon the stream: dropping an
+/// On error or cancellation after the opcode has been consumed, abandon the stream: dropping an
 /// unfinished state never consumes, skips, or reinterprets its remaining data.
 pub struct Reader<A> {
     io: A,
@@ -63,9 +63,12 @@ where
         if !self.at_boundary {
             return Err(codec::StartError::NotAtBoundary);
         }
-        self.at_boundary = false;
         let mut wire = WireBudget::new(max_wire_len);
-        let head = codec::read_head(&mut self.io, &mut wire, max_decoded_len).await?;
+        let first = crate::instruction::octet(&mut self.io, &mut wire)
+            .await
+            .map_err(|source| codec::StartError::Prefix { source })?;
+        self.at_boundary = false;
+        let head = codec::read_head(&mut self.io, &mut wire, max_decoded_len, first).await?;
         Ok(match head {
             codec::Head::Capacity(n) => {
                 self.at_boundary = true;
