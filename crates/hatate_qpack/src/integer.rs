@@ -33,23 +33,54 @@ const fn prefix_mask<const N: u8>() -> u8 {
 /// already overflowed the value. Only continuation octets are consumed from
 /// `src`, including on error; an eleventh continuation octet is never read.
 pub fn read<const N: u8>(first: u8, src: &mut impl Buf) -> Result<u64, ReadError> {
-    let mask = prefix_mask::<N>();
-    let mut value = u64::from(first & mask);
-    if value < u64::from(mask) {
-        return Ok(value);
-    }
-    for shift in (0..64).step_by(7) {
+    use core::ops::ControlFlow;
+    let mut continuation = match Continuation::start::<N>(first) {
+        ControlFlow::Break(value) => return Ok(value),
+        ControlFlow::Continue(state) => state,
+    };
+    loop {
         let byte = src.try_get_u8().map_err(|_| ReadError::Incomplete)?;
-        let digit = u64::from(byte & 0x7f);
-        if digit > (u64::MAX - value) >> shift {
-            return Err(ReadError::Overflow);
-        }
-        value += digit << shift;
-        if byte & 0x80 == 0 {
+        if let Some(value) = continuation.push(byte)? {
             return Ok(value);
         }
     }
-    Err(ReadError::TooLong)
+}
+
+/// The digits of one prefixed integer, shared with instruction streams where
+/// a read may suspend between any two octets.
+pub(crate) struct Continuation {
+    value: u64,
+    shift: u32,
+}
+
+impl Continuation {
+    pub(crate) fn start<const N: u8>(first: u8) -> core::ops::ControlFlow<u64, Self> {
+        use core::ops::ControlFlow;
+        let mask = prefix_mask::<N>();
+        let value = u64::from(first & mask);
+        if value < u64::from(mask) {
+            ControlFlow::Break(value)
+        } else {
+            ControlFlow::Continue(Self { value, shift: 0 })
+        }
+    }
+
+    /// Stop feeding octets at either a result or an error.
+    pub(crate) fn push(&mut self, byte: u8) -> Result<Option<u64>, ReadError> {
+        let digit = u64::from(byte & 0x7f);
+        if digit > (u64::MAX - self.value) >> self.shift {
+            return Err(ReadError::Overflow);
+        }
+        self.value += digit << self.shift;
+        if byte & 0x80 == 0 {
+            return Ok(Some(self.value));
+        }
+        if self.shift == 63 {
+            return Err(ReadError::TooLong);
+        }
+        self.shift += 7;
+        Ok(None)
+    }
 }
 
 /// One prefix octet and at most ten base-128 digits for a u64.

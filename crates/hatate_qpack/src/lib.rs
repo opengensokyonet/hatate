@@ -20,13 +20,16 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 #![no_std]
+#![feature(impl_trait_in_assoc_type)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 extern crate alloc;
 
+pub mod decoder_instruction;
 pub mod field_line;
 pub mod huffman;
+pub mod instruction;
 pub mod integer;
 pub mod static_section;
 pub mod static_table;

@@ -74,43 +74,76 @@ static TREE: [[u16; 2]; LEAF as usize] = {
 /// error is [`DecodeError::ReserveOutput`].
 pub fn decode(mut src: impl Buf, limit: usize) -> Result<Bytes, DecodeError> {
     let mut output = Vec::new();
-    let mut node = 0;
-    let mut tail_bits = 0;
-    let mut tail_is_ones = true;
+    let mut decoder = SymbolDecoder::new(limit);
     while src.has_remaining() {
         let byte = src.get_u8();
         for shift in (0..8).rev() {
-            let bit = (byte >> shift) & 1;
-            node = TREE[usize::from(node)][usize::from(bit)];
-            tail_bits += 1;
-            tail_is_ones &= bit == 1;
-            if node >= LEAF {
-                if node == EOS {
-                    return Err(DecodeError::EndOfString);
-                }
-                if output.len() == limit {
-                    return Err(DecodeError::OutputTooLong { limit });
-                }
+            if let Some(symbol) = decoder.bit((byte >> shift) & 1)? {
                 if output.len() == output.capacity() {
                     let additional = 1;
                     #[cfg(test)]
                     let additional = tests::reservation_size(additional);
                     output.try_reserve(additional).context(ReserveOutputSnafu)?;
                 }
-                output.push((node - LEAF) as u8);
-                node = 0;
-                tail_bits = 0;
-                tail_is_ones = true;
+                output.push(symbol);
             }
         }
     }
-    if tail_bits > 7 {
-        return Err(DecodeError::ExcessPadding);
-    }
-    if !tail_is_ones {
-        return Err(DecodeError::InvalidPadding);
-    }
+    decoder.finish()?;
     Ok(Bytes::from(output))
+}
+
+// Carries a partial code across encoded input octets and buffer boundaries.
+// Only the end of the entire literal is a padding boundary.
+pub(crate) struct SymbolDecoder {
+    node: u16,
+    tail_bits: u8,
+    tail_is_ones: bool,
+    produced: usize,
+    limit: usize,
+}
+
+impl SymbolDecoder {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            node: 0,
+            tail_bits: 0,
+            tail_is_ones: true,
+            produced: 0,
+            limit,
+        }
+    }
+
+    pub(crate) fn bit(&mut self, bit: u8) -> Result<Option<u8>, DecodeError> {
+        self.node = TREE[usize::from(self.node)][usize::from(bit)];
+        self.tail_bits += 1;
+        self.tail_is_ones &= bit == 1;
+        if self.node < LEAF {
+            return Ok(None);
+        }
+        if self.node == EOS {
+            return Err(DecodeError::EndOfString);
+        }
+        if self.produced == self.limit {
+            return Err(DecodeError::OutputTooLong { limit: self.limit });
+        }
+        let symbol = (self.node - LEAF) as u8;
+        self.produced += 1;
+        self.node = 0;
+        self.tail_bits = 0;
+        self.tail_is_ones = true;
+        Ok(Some(symbol))
+    }
+
+    pub(crate) fn finish(self) -> Result<usize, DecodeError> {
+        if self.tail_bits > 7 {
+            return Err(DecodeError::ExcessPadding);
+        }
+        if !self.tail_is_ones {
+            return Err(DecodeError::InvalidPadding);
+        }
+        Ok(self.produced)
+    }
 }
 
 /// The encoded payload length, including its final padding. A slice on a

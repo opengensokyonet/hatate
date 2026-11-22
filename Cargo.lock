@@ -36,6 +36,7 @@ name = "hatate_qpack"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "nitori_call",
  "nitori_io",
  "snafu",
 ]
