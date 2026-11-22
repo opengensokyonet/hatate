@@ -1,0 +1,12 @@
+[package]
+name = "hatate_qpack"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "QPACK field line representations for HTTP/3"
+
+[dependencies]
+bytes.workspace = true
+nitori_io.workspace = true
+snafu.workspace = true
