@@ -270,7 +270,7 @@ where
         let LiteralSource::Huffman(mut decoded) = name.source() else {
             panic!()
         };
-        let mut first_six = decoded.compose(ReadLimit(6));
+        let mut first_six = decoded.compose(ReadLimit(6usize));
         assert_eq!(first_six.read_array::<6>().await.unwrap(), *b"www.ex");
         assert_eq!(first_six.read(&mut Vec::new()).await.unwrap(), 0);
         assert_eq!(first_six.into_state().0, 0);
