@@ -79,16 +79,14 @@ impl<'a> Part<'a> {
         self.prefix_len as u128 + u128::from(self.payload_len)
     }
 
-    fn octets(self) -> impl Iterator<Item = u8> + 'a {
+    fn chunks(&self) -> impl Iterator<Item = WireChunk<'_>> {
         let (raw, coded) = match self.payload {
             StringLiteral::Raw(data) => (data, &[][..]),
             StringLiteral::Huffman(data) => (&[][..], data),
         };
-        self.prefix
-            .into_iter()
-            .take(self.prefix_len)
-            .chain(raw.iter().copied())
-            .chain(huffman::EncodedOctets::new(coded))
+        core::iter::once(WireChunk::Borrowed(&self.prefix[..self.prefix_len]))
+            .chain((!raw.is_empty()).then_some(WireChunk::Borrowed(raw)))
+            .chain(huffman_chunks(coded))
     }
 }
 
@@ -100,7 +98,7 @@ pub fn write_field_line<S: AsRef<[u8]>, H: AsRef<[u8]>>(
     line: &FieldLine<S, H>,
 ) -> Result<(), WriteError> {
     let prepared = Prepared::new(line)?;
-    transfer(dst, prepared.len(), prepared.octets())?;
+    transfer(dst, prepared.len(), &[], core::iter::once(&prepared))?;
     Ok(())
 }
 
@@ -123,73 +121,93 @@ impl<'a> Prepared<'a> {
         self.head.len() + self.value.as_ref().map_or(0, Part::len)
     }
 
-    pub(crate) fn octets(self) -> impl Iterator<Item = u8> + 'a {
+    fn chunks(&self) -> impl Iterator<Item = WireChunk<'_>> {
         self.head
-            .octets()
-            .chain(self.value.into_iter().flat_map(Part::octets))
+            .chunks()
+            .chain(self.value.iter().flat_map(Part::chunks))
     }
 }
 
-/// Submit the entire measured source in one BufMut operation. A segmented
-/// destination may report a more conservative capacity after its cursor moves.
-pub(crate) fn transfer(
-    dst: &mut impl BufMut,
-    required: u128,
-    octets: impl Iterator<Item = u8>,
-) -> Result<(), InsufficientCapacityError> {
-    InsufficientCapacityError::check(required, dst.remaining_mut())?;
-    let mut src = WireBuf {
-        octets,
-        remaining: required as usize,
-        chunk: [0; 256],
-        start: 0,
-        end: 0,
-    };
-    src.refill();
-    dst.put(src);
-    Ok(())
+// Prefixes and raw literals are contiguous and can be lent directly to the
+// destination. Only Huffman output needs an intermediate chunk.
+enum WireChunk<'a> {
+    Borrowed(&'a [u8]),
+    Huffman { bytes: [u8; 128], len: usize },
 }
 
-// Materialize a bounded chunk of an encoding for Buf::chunk. Its exact
-// remaining length was measured from the same borrowed payloads.
-struct WireBuf<I> {
-    octets: I,
-    remaining: usize,
-    chunk: [u8; 256],
-    start: usize,
-    end: usize,
-}
-
-impl<I: Iterator<Item = u8>> WireBuf<I> {
-    fn refill(&mut self) {
-        self.start = 0;
-        self.end = self.remaining.min(self.chunk.len());
-        for byte in &mut self.chunk[..self.end] {
-            *byte = self
-                .octets
-                .next()
-                .expect("measured encoding contains this octet");
+impl WireChunk<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(data) => data,
+            Self::Huffman { bytes, len } => &bytes[..*len],
         }
     }
 }
 
-impl<I: Iterator<Item = u8>> Buf for WireBuf<I> {
+fn huffman_chunks(data: &[u8]) -> impl Iterator<Item = WireChunk<'_>> {
+    let mut octets = huffman::EncodedOctets::new(data);
+    core::iter::from_fn(move || {
+        let first = octets.next()?;
+        let mut bytes = [0; 128];
+        bytes[0] = first;
+        let mut len = 1;
+        for (out, byte) in bytes[1..].iter_mut().zip(&mut octets) {
+            *out = byte;
+            len += 1;
+        }
+        Some(WireChunk::Huffman { bytes, len })
+    })
+}
+
+/// Submit the entire measured source in one BufMut operation. A segmented
+/// destination may report a more conservative capacity after its cursor moves.
+pub(crate) fn transfer<'a>(
+    dst: &mut impl BufMut,
+    required: u128,
+    prefix: &'a [u8],
+    lines: impl Iterator<Item = &'a Prepared<'a>>,
+) -> Result<(), InsufficientCapacityError> {
+    InsufficientCapacityError::check(required, dst.remaining_mut())?;
+    let mut chunks = (!prefix.is_empty())
+        .then_some(WireChunk::Borrowed(prefix))
+        .into_iter()
+        .chain(lines.flat_map(Prepared::chunks));
+    let current = chunks.next().unwrap_or(WireChunk::Borrowed(&[]));
+    dst.put(WireBuf {
+        chunks,
+        current,
+        start: 0,
+        remaining: required as usize,
+    });
+    Ok(())
+}
+
+struct WireBuf<'a, I> {
+    chunks: I,
+    current: WireChunk<'a>,
+    start: usize,
+    remaining: usize,
+}
+
+impl<'a, I: Iterator<Item = WireChunk<'a>>> Buf for WireBuf<'a, I> {
     fn remaining(&self) -> usize {
         self.remaining
     }
     fn chunk(&self) -> &[u8] {
-        &self.chunk[self.start..self.end]
+        &self.current.as_slice()[self.start..]
     }
     fn advance(&mut self, mut count: usize) {
         assert!(count <= self.remaining);
+        self.remaining -= count;
         while count > 0 {
-            let step = count.min(self.end - self.start);
-            self.remaining -= step;
-            self.start += step;
-            count -= step;
-            if self.start == self.end {
-                self.refill();
+            let available = self.chunk().len();
+            if count < available {
+                self.start += count;
+                return;
             }
+            count -= available;
+            self.current = self.chunks.next().unwrap_or(WireChunk::Borrowed(&[]));
+            self.start = 0;
         }
     }
 }
@@ -247,6 +265,26 @@ fn prepare<S: AsRef<[u8]>, H: AsRef<[u8]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_literals_reach_the_transfer_as_whole_borrowed_chunks() {
+        let name = [b'n'; 1024];
+        let value = [b'x'; 8192];
+        let line = FieldLine::<&[u8]>::LiteralWithLiteralName {
+            never_index: false,
+            name: StringLiteral::Raw(&name),
+            value: StringLiteral::Raw(&value),
+        };
+        let prepared = Prepared::new(&line).unwrap();
+        let mut chunks = prepared.chunks();
+        let _name_prefix = chunks.next().unwrap();
+        let name_chunk = chunks.next().unwrap();
+        assert!(core::ptr::eq(name_chunk.as_slice(), name.as_slice()));
+        let _value_prefix = chunks.next().unwrap();
+        let value_chunk = chunks.next().unwrap();
+        assert!(core::ptr::eq(value_chunk.as_slice(), value.as_slice()));
+        assert!(chunks.next().is_none());
+    }
 
     #[test]
     fn encoded_length_overflow_identifies_the_field() {

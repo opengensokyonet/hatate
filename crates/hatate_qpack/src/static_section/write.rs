@@ -75,9 +75,6 @@ pub fn write_static_section<S: AsRef<[u8]>, H: AsRef<[u8]>>(
         required += field.len();
         prepared.push(field);
     }
-    let octets = prefix::ENCODED
-        .into_iter()
-        .chain(prepared.into_iter().flat_map(Prepared::octets));
-    field_line::transfer(dst, required, octets)?;
+    field_line::transfer(dst, required, &prefix::ENCODED, prepared.iter())?;
     Ok(())
 }
