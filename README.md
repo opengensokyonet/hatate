@@ -1,6 +1,6 @@
 # hatate
 
-hatate implements HTTP/3 for Open Gensokyo Network. The [QPACK package](crates/hatate_qpack) reads and writes single field line representations from an in-memory payload. It supports the RFC 9204 static table and the RFC 7541 Huffman code. Dynamic references retain their wire index for a field section decoder to resolve.
+hatate implements HTTP/3 for Open Gensokyo Network. The [QPACK package](crates/hatate_qpack) reads and writes single field line representations from an in-memory payload. It supports the RFC 9204 static table and the RFC 7541 Huffman code. Dynamic references retain their wire index for a field section decoder to resolve. The `integer` and `huffman` modules expose the same codecs for use outside a field line.
 
 A raw literal borrows or shares its input storage. Huffman literals return decoded bytes. The caller supplies the maximum decoded size of each literal in octets. The package works with `no_std` and an allocator.
 

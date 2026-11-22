@@ -1,6 +1,7 @@
 //! QPACK field line representations (RFC 9204 §4.5.2–§4.5.6).
 //!
-//! Decode from a complete field section payload after its prefix. Each call
+//! [`integer`] and [`huffman`] also expose their codecs independently.
+//! Decode fields from a complete field section payload after its prefix. Each call
 //! consumes one representation and leaves dynamic references relative to its
 //! Base. Literal names and values retain their exact decoded octets.
 //!
@@ -27,3 +28,34 @@ pub mod huffman;
 pub mod integer;
 pub mod static_table;
 pub mod string_literal;
+
+/// An encoded value cannot fit in the supplied destination.
+#[derive(Debug, PartialEq, Eq, snafu::Snafu)]
+#[snafu(display("encoding requires {required} bytes but only {available} are available"))]
+pub struct InsufficientCapacityError {
+    required: u128,
+    available: usize,
+}
+
+impl InsufficientCapacityError {
+    fn check(required: u128, available: usize) -> Result<(), Self> {
+        if required > available as u128 {
+            Err(Self {
+                required,
+                available,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The size of the complete encoding in octets.
+    pub const fn required(&self) -> u128 {
+        self.required
+    }
+
+    /// Space available before writing.
+    pub const fn available(&self) -> usize {
+        self.available
+    }
+}

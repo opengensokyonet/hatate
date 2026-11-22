@@ -1,5 +1,5 @@
 use super::{FieldLine, StringLiteral, TableIndex};
-use crate::{huffman, integer};
+use crate::{InsufficientCapacityError, huffman, integer};
 use bytes::BufMut;
 use snafu::Snafu;
 
@@ -7,12 +7,10 @@ use snafu::Snafu;
 #[derive(Debug, Snafu)]
 pub enum WriteError {
     /// The exact wire size exceeds the available capacity.
-    #[snafu(display("field line requires {required} bytes but only {available} are available"))]
+    #[snafu(transparent)]
     InsufficientCapacity {
-        /// Required bytes including all prefixes and payloads.
-        required: u128,
-        /// Space reported by the destination.
-        available: usize,
+        /// Exact required and available capacities in octets.
+        source: InsufficientCapacityError,
     },
     /// The length of a literal's Huffman encoding exceeds u64::MAX.
     #[snafu(display("Huffman payload exceeds the supported prefixed integer range"))]
@@ -20,10 +18,10 @@ pub enum WriteError {
 }
 
 // Each representation is either a single prefixed integer or two prefixed
-// integers with their associated payloads. Preparing the prefixes measures the
-// Huffman payloads once and lets a bounded sink reject the whole line up front.
+// integers with their associated payloads. Measuring their wire sizes lets
+// a bounded sink reject the whole line before writing its first byte.
 struct Part<'a> {
-    prefix: [u8; 11],
+    prefix: [u8; integer::MAX_ENCODED_LEN],
     prefix_len: usize,
     payload: StringLiteral<&'a [u8], &'a [u8]>,
     payload_len: u64,
@@ -31,10 +29,11 @@ struct Part<'a> {
 
 impl<'a> Part<'a> {
     fn integer<const N: u8>(flags: u8, value: u64) -> Self {
-        let mut prefix = [0; 11];
+        let mut prefix = [0; integer::MAX_ENCODED_LEN];
         let mut rest = &mut prefix[..];
-        integer::write::<N>(&mut rest, flags, value);
-        let prefix_len = 11 - rest.len();
+        integer::write::<N>(&mut rest, flags, value)
+            .expect("the prefix buffer fits every encoded u64");
+        let prefix_len = integer::MAX_ENCODED_LEN - rest.len();
         Self {
             prefix,
             prefix_len,
@@ -70,12 +69,13 @@ impl<'a> Part<'a> {
         self.prefix_len as u128 + u128::from(self.payload_len)
     }
 
-    fn write(&self, dst: &mut impl BufMut) {
+    fn write(&self, dst: &mut impl BufMut) -> Result<(), InsufficientCapacityError> {
         dst.put_slice(&self.prefix[..self.prefix_len]);
         match self.payload {
             StringLiteral::Raw(data) => dst.put_slice(data),
-            StringLiteral::Huffman(data) => huffman::encode(dst, data),
+            StringLiteral::Huffman(data) => huffman::encode(dst, data)?,
         }
+        Ok(())
     }
 }
 
@@ -121,16 +121,10 @@ pub fn write_field_line<S: AsRef<[u8]>, H: AsRef<[u8]>>(
         }
     };
     let required = head.len() + value.as_ref().map_or(0, Part::len);
-    let available = dst.remaining_mut();
-    if required > available as u128 {
-        return Err(WriteError::InsufficientCapacity {
-            required,
-            available,
-        });
-    }
-    head.write(dst);
+    InsufficientCapacityError::check(required, dst.remaining_mut())?;
+    head.write(dst)?;
     if let Some(value) = value {
-        value.write(dst);
+        value.write(dst)?;
     }
     Ok(())
 }

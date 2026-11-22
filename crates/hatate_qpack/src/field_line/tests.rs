@@ -246,7 +246,7 @@ fn bounded_sink_is_untouched_on_failure_and_exact_fit_succeeds() {
         let mut dst = &mut storage[..capacity];
         let error = write_field_line(&mut dst, &line).unwrap_err();
         assert!(
-            matches!(error, WriteError::InsufficientCapacity {required: 25, available} if available == capacity)
+            matches!(error, WriteError::InsufficientCapacity {source} if source.required() == 25 && source.available() == capacity)
         );
         assert_eq!(dst.len(), capacity);
         assert_eq!(storage, [0x77; 25]);

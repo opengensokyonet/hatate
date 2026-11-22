@@ -2,6 +2,7 @@
 
 mod codes;
 
+use crate::InsufficientCapacityError;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use codes::CODES;
 use snafu::Snafu;
@@ -61,7 +62,7 @@ static TREE: [[u16; 2]; LEAF as usize] = {
 
 /// Decode one complete Huffman payload into at most `limit` bytes.
 /// Checks the EOS and padding rules even for a partial final octet.
-pub(crate) fn decode(mut src: impl Buf, limit: usize) -> Result<Bytes, DecodeError> {
+pub fn decode(mut src: impl Buf, limit: usize) -> Result<Bytes, DecodeError> {
     let mut output = BytesMut::new();
     let mut node = 0;
     let mut tail_bits = 0;
@@ -106,7 +107,16 @@ pub(crate) fn encoded_len(input: &[u8]) -> u128 {
         .div_ceil(8)
 }
 
-pub(crate) fn encode(dst: &mut impl BufMut, input: &[u8]) {
+/// Encode octets with the RFC 7541 code and pad to an octet boundary.
+/// An undersized destination is left unchanged. The string length prefix
+/// and H bit belong to the enclosing format.
+pub fn encode(dst: &mut impl BufMut, input: &[u8]) -> Result<(), InsufficientCapacityError> {
+    // Every symbol takes at most 30 bits. A growing sink generally satisfies
+    // this bound without a separate pass to count the exact encoded length.
+    let available = dst.remaining_mut();
+    if (input.len() as u128 * 30).div_ceil(8) > available as u128 {
+        InsufficientCapacityError::check(encoded_len(input), available)?;
+    }
     let mut pending = 0u64;
     let mut bits = 0;
     for &byte in input {
@@ -123,6 +133,7 @@ pub(crate) fn encode(dst: &mut impl BufMut, input: &[u8]) {
         let padding = 8 - bits;
         dst.put_u8((pending as u8) << padding | ((1 << padding) - 1));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -151,7 +162,7 @@ mod tests {
         ];
         for &(plain, encoded) in vectors {
             let mut output = BytesMut::new();
-            encode(&mut output, plain);
+            encode(&mut output, plain).unwrap();
             assert_eq!(&output[..], encoded);
             assert_eq!(&decode(encoded, plain.len()).unwrap()[..], plain);
         }
@@ -163,11 +174,11 @@ mod tests {
         for byte in 0..=255u8 {
             alphabet[usize::from(byte)] = byte;
             let mut encoded = BytesMut::new();
-            encode(&mut encoded, &[byte]);
+            encode(&mut encoded, &[byte]).unwrap();
             assert_eq!(&decode(encoded.freeze(), usize::MAX).unwrap()[..], &[byte]);
         }
         let mut encoded = BytesMut::new();
-        encode(&mut encoded, &alphabet);
+        encode(&mut encoded, &alphabet).unwrap();
         assert_eq!(
             &decode(encoded.freeze(), usize::MAX).unwrap()[..],
             &alphabet

@@ -1,5 +1,6 @@
 //! Prefixed integers (RFC 9204 §4.1.1 and RFC 7541 §5.1).
 
+use crate::InsufficientCapacityError;
 use bytes::{Buf, BufMut};
 use snafu::Snafu;
 
@@ -22,8 +23,10 @@ const fn prefix_mask<const N: u8>() -> u8 {
     u8::MAX >> (8 - N)
 }
 
-/// The caller has already consumed the first octet to dispatch on its flags.
-pub(crate) fn read<const N: u8>(first: u8, src: &mut impl Buf) -> Result<u64, ReadError> {
+/// Read a prefixed integer given the already-consumed first octet. Its low
+/// `N` bits belong to the integer (`1..=8`, checked at compile time).
+/// Only continuation octets are consumed from `src`, including on error.
+pub fn read<const N: u8>(first: u8, src: &mut impl Buf) -> Result<u64, ReadError> {
     let mask = prefix_mask::<N>();
     let mut value = u64::from(first & mask);
     if value < u64::from(mask) {
@@ -43,22 +46,35 @@ pub(crate) fn read<const N: u8>(first: u8, src: &mut impl Buf) -> Result<u64, Re
     Err(ReadError::TooLong)
 }
 
-/// Write the prefix into the low N bits; the enclosing format supplies the
-/// flags in the other bits and space in the destination.
-pub(crate) fn write<const N: u8>(dst: &mut impl BufMut, flags: u8, value: u64) {
+/// One prefix octet and at most ten base-128 digits for a u64.
+pub(crate) const MAX_ENCODED_LEN: usize = 11;
+
+/// Write the shortest encoding, keeping the high `8 - N` bits of `first`
+/// and replacing its low `N` bits. The width is in `1..=8` (checked at
+/// compile time). If the complete integer cannot fit, leave `dst` unchanged.
+pub fn write<const N: u8>(
+    dst: &mut impl BufMut,
+    first: u8,
+    value: u64,
+) -> Result<(), InsufficientCapacityError> {
     let mask = prefix_mask::<N>();
-    debug_assert_eq!(flags & mask, 0);
+    let flags = first & !mask;
     if value < u64::from(mask) {
+        InsufficientCapacityError::check(1, dst.remaining_mut())?;
         dst.put_u8(flags | value as u8);
-        return;
+        return Ok(());
     }
-    dst.put_u8(flags | mask);
     let mut remaining = value - u64::from(mask);
+    // Zero after a full prefix still occupies one continuation octet.
+    let digits = (u64::BITS - remaining.leading_zeros()).max(1).div_ceil(7);
+    InsufficientCapacityError::check(1 + u128::from(digits), dst.remaining_mut())?;
+    dst.put_u8(flags | mask);
     while remaining >= 128 {
         dst.put_u8((remaining as u8 & 0x7f) | 0x80);
         remaining >>= 7;
     }
     dst.put_u8(remaining as u8);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -70,7 +86,7 @@ mod tests {
     fn appendix_c_examples() {
         fn check<const N: u8>(value: u64, bytes: &[u8]) {
             let mut output = BytesMut::new();
-            write::<N>(&mut output, 0, value);
+            write::<N>(&mut output, 0, value).unwrap();
             assert_eq!(&output[..], bytes);
             let mut rest = &bytes[1..];
             assert_eq!(read::<N>(bytes[0], &mut rest), Ok(value));
@@ -84,7 +100,7 @@ mod tests {
     #[test]
     fn boundary_keeps_flags_and_next_octet() {
         let mut output = BytesMut::new();
-        write::<3>(&mut output, 0x50, 7);
+        write::<3>(&mut output, 0x50, 7).unwrap();
         assert_eq!(&output[..], &[0x57, 0]);
         let mut rest = &[0x80, 0, 0xa5][..];
         assert_eq!(read::<3>(0x57, &mut rest), Ok(7));
@@ -96,7 +112,7 @@ mod tests {
         fn check<const N: u8>() {
             for value in [0, 1, 127, 255, (1 << 62) - 1, u64::MAX] {
                 let mut encoded = BytesMut::new();
-                write::<N>(&mut encoded, 0, value);
+                write::<N>(&mut encoded, 0, value).unwrap();
                 let mut rest = &encoded[1..];
                 assert_eq!(read::<N>(encoded[0], &mut rest), Ok(value));
                 assert!(rest.is_empty());
