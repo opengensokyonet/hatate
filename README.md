@@ -24,13 +24,13 @@ cargo build --locked -p hatate_qpack --target x86_64-unknown-none
 
 ## Fuzzing
 
-The separate [verification/qpack-fuzz](verification/qpack-fuzz) workspace exercises the public QPACK APIs with cargo-fuzz and libFuzzer. The `integer` target compares decoding and byte consumption with a 128-bit reference calculation. The `huffman` target checks accepted wire encodings, segmented input and output bounds. The `field_line` target reads arbitrary wire sequences and constructs valid field lines to exercise the writer. The `static_section` target compares complete field sections against single-line decoding and independent size accounting. The `decoder_instruction` target checks decoder-stream dispatch, cursor movement, and wire limits. The regular test suite also exhausts one- and two-octet Huffman payloads against an independent canonical-code decoder.
+The separate [verification/qpack-fuzz](verification/qpack-fuzz) workspace exercises the public QPACK APIs with cargo-fuzz and libFuzzer. The `integer` target compares decoding and byte consumption with a 128-bit reference calculation. The `huffman` target checks accepted wire encodings, segmented input and output bounds. The `field_line` target reads arbitrary wire sequences and constructs valid field lines to exercise the writer. The `static_section` target compares complete field sections against single-line decoding and independent size accounting. The `decoder_instruction` target checks decoder-stream dispatch, cursor movement, and wire limits. The `encoder_instruction` target compares staged literal reads with in-memory decoding under independent wire and decoded limits. The regular test suite also exhausts one- and two-octet Huffman payloads against an independent canonical-code decoder.
 
 Cargo generates the verification workspace’s lockfile locally. With cargo-fuzz installed, run from the repository root. Use a writable corpus directory first so the checked-in seeds remain available for repeat runs.
 
 ```sh
 fuzz_dir=verification/qpack-fuzz
-for target in integer huffman field_line static_section decoder_instruction; do
+for target in integer huffman field_line static_section decoder_instruction encoder_instruction; do
     mkdir -p "$fuzz_dir/corpus/$target"
     cargo fuzz run --fuzz-dir "$fuzz_dir" "$target" "$fuzz_dir/corpus/$target" "$fuzz_dir/seeds/$target" -- -max_total_time=60
 done

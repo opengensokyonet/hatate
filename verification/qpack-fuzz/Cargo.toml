@@ -12,6 +12,8 @@ cargo-fuzz = true
 resolver = "3"
 
 [dependencies]
+nitori_io = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "cec268b840227a419020d37a0ec32538d8de9e86", default-features = false }
+nitori_call = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "cec268b840227a419020d37a0ec32538d8de9e86", default-features = false }
 hatate_qpack = { path = "../../crates/hatate_qpack" }
 libfuzzer-sys = "0.4.13"
 bytes = { version = "1.12.1", default-features = false }
@@ -47,6 +49,13 @@ bench = false
 [[bin]]
 name = "decoder_instruction"
 path = "fuzz_targets/decoder_instruction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encoder_instruction"
+path = "fuzz_targets/encoder_instruction.rs"
 test = false
 doc = false
 bench = false
