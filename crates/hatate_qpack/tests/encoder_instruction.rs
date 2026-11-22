@@ -578,3 +578,83 @@ fn appendix_b3_insertion_round_trips_from_the_wire() {
     assert!(hosts.0.is_empty());
     assert_eq!(&hosts.1[..example.len()], example);
 }
+
+impl ExactLen for Trickle<'_> {
+    type Length = usize;
+    fn remaining_len<'v>(view: core::pin::Pin<&mut Self::ReceiverView<'v>>) -> usize
+    where
+        Self: 'v,
+    {
+        view.get_pin_mut().rest.len()
+    }
+}
+
+#[derive(Default)]
+struct PausingSink {
+    wire: Vec<u8>,
+    waiting: bool,
+}
+nitori_call::family_receiver!(impl [] for PausingSink);
+impl Write for PausingSink {
+    type Error = core::convert::Infallible;
+    fn poll_write<'v, B: Buf + ?Sized>(
+        view: core::pin::Pin<&mut Self::ReceiverView<'v>>,
+        cx: &mut core::task::Context<'_>,
+        src: &mut B,
+    ) -> core::task::Poll<Result<usize, Self::Error>>
+    where
+        Self: 'v,
+    {
+        use core::task::Poll;
+        let sink = view.get_pin_mut().get_mut();
+        if !sink.waiting {
+            sink.waiting = true;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        sink.waiting = false;
+        if !src.has_remaining() {
+            return Poll::Ready(Ok(0));
+        }
+        sink.wire.push(src.get_u8());
+        Poll::Ready(Ok(1))
+    }
+}
+
+#[test]
+fn pending_on_both_sides_does_not_repeat_octets_or_restart_huffman_state() {
+    use core::{
+        future::Future,
+        pin::{Pin, pin},
+        task::{Context, Poll, Waker},
+    };
+    use nitori_call::CallExecutor;
+    let name = b"\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff";
+    let mut hosts = (
+        Trickle {
+            rest: name,
+            waiting: false,
+        },
+        Trickle {
+            rest: &[0x1f],
+            waiting: false,
+        },
+        PausingSink::default(),
+    );
+    {
+        let mut call = pin!(CallExecutor::execute(
+            Pin::new(&mut hosts),
+            CodedInsert::new(16)
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        // One pending read per payload octet and one pending write per wire octet.
+        for _ in 0..(13 + 16) {
+            assert!(call.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+    }
+    assert_eq!(
+        hosts.2.wire,
+        [&[0x6c], &name[..], &[0x81, 0x1f, 2]].concat()
+    );
+}
