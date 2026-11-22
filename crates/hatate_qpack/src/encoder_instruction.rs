@@ -11,6 +11,7 @@
 //! source implements `nitori_io::Read` and writes into the supplied buffer.
 //! A consumer choosing owned chunks provides its own collection adapter.
 pub mod literal;
+pub mod write;
 
 use crate::{instruction::WireBudget, static_table};
 use literal::{FinishError, Literal, LiteralSource};

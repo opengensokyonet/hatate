@@ -6,7 +6,7 @@
 use bytes::{Buf, BufMut};
 use core::num::NonZeroUsize;
 use hatate_qpack::{
-    encoder_instruction::{NameReference, Reader, Started, literal::LiteralSource},
+    encoder_instruction::{NameReference, Reader, Started, literal::LiteralSource, write::Writer},
     huffman, integer,
     static_table::Index,
 };
@@ -115,6 +115,49 @@ async fn parse<F: ReadChunk, A: ReceiverAccess<Family = F>>(
     }
 }
 
+#[call(sync)]
+async fn write_raw<N: Read + ExactLen, V: Read + ExactLen, W: Write>(
+    name: &mut impl ReceiverAccess<Family = N>,
+    value: &mut impl ReceiverAccess<Family = V>,
+    out: &mut impl ReceiverAccess<Family = W>,
+    wire: usize,
+    decoded: usize,
+) -> bool
+where
+    N::Length: TryInto<u64>,
+    V::Length: TryInto<u64>,
+{
+    let mut writer = Writer::new(out);
+    let Ok(next) = writer.literal_name(name, wire, decoded).await else {
+        return false;
+    };
+    next.value(value).await.is_ok()
+}
+
+fn check_raw_writer(body: &[u8], split: usize, wire: usize, decoded: usize) {
+    let (name, value) = body.split_at(split.min(body.len()));
+    let mut expected = Vec::new();
+    integer::write::<5>(&mut expected, 0x40, name.len() as u64).unwrap();
+    let name_end = expected.len() + name.len();
+    let name_fits = name_end < wire && name.len() <= decoded;
+    if name_fits {
+        expected.extend_from_slice(name);
+        integer::write::<7>(&mut expected, 0, value.len() as u64).unwrap();
+    }
+    let fits = name_fits && expected.len() + value.len() <= wire && body.len() <= decoded;
+    if fits {
+        expected.extend_from_slice(value);
+    } else {
+        expected.truncate(if name_fits { name_end } else { 0 });
+    }
+
+    let mut hosts = (name, value, Vec::new());
+    assert_eq!(hosts.sync_write_raw_unpin(wire, decoded), fits);
+    assert_eq!(hosts.2, expected);
+    assert_eq!(hosts.0.len(), if name_fits { 0 } else { name.len() });
+    assert_eq!(hosts.1.len(), if fits { 0 } else { value.len() });
+}
+
 fuzz_target!(|data: &[u8]| {
     let [wire, decoded, chunk, body @ ..] = data else {
         return;
@@ -123,6 +166,7 @@ fuzz_target!(|data: &[u8]| {
     let wire = usize::from(*wire);
     let decoded = usize::from(*decoded);
     let block = NonZeroUsize::new(usize::from(*chunk) + 1).unwrap();
+    check_raw_writer(body, usize::from(*chunk), wire, decoded);
     while !src.is_empty() {
         let before = src;
         let size = src.len().min(wire);

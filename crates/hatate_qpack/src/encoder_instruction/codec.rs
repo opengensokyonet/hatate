@@ -25,6 +25,13 @@ pub struct DecodedLengthError {
     remaining: usize,
 }
 impl DecodedLengthError {
+    pub(super) fn check(length: u64, remaining: usize) -> Result<(), Self> {
+        if u128::from(length) > remaining as u128 {
+            Err(Self { length, remaining })
+        } else {
+            Ok(())
+        }
+    }
     /// The on-wire length of the uncompressed data.
     pub const fn length(&self) -> u64 {
         self.length
@@ -58,12 +65,8 @@ async fn literal_header<const N: u8, F: Read>(
         .context(literal_header_error::LengthSnafu)?;
     wire.take(length)?;
     let coded = first & (1 << N) != 0;
-    if !coded && u128::from(length) > decoded_left as u128 {
-        return Err(DecodedLengthError {
-            length,
-            remaining: decoded_left,
-        }
-        .into());
+    if !coded {
+        DecodedLengthError::check(length, decoded_left)?;
     }
     // The complete payload fits the caller's usize-sized wire budget.
     Ok(Literal::new(coded, length as usize, decoded_left))

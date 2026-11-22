@@ -353,3 +353,139 @@ fn bounded_raw_chunks_borrow_the_original_input() {
     assert!(core::ptr::eq(bc, &wire[3..5]));
     assert_eq!(input, [0x20]);
 }
+
+use hatate_qpack::encoder_instruction::write::{HeaderError, LiteralError, Writer};
+
+#[call(sync)]
+async fn relay_raw<F: Read, G: Write>(
+    input: &mut impl ReceiverAccess<Family = F>,
+    output: &mut impl ReceiverAccess<Family = G>,
+    wire: usize,
+    decoded: usize,
+) -> bool
+where
+    F::Error: Debug,
+    G::Error: Debug,
+{
+    let mut reader = Reader::new(input);
+    let mut writer = Writer::new(output);
+    let Started::InsertWithLiteralName(mut name) = reader.start(256, 256).await.unwrap() else {
+        panic!("expected literal name")
+    };
+    let pending = {
+        let LiteralSource::Raw(mut src) = name.source() else {
+            panic!("expected raw name")
+        };
+        writer.literal_name(&mut src, wire, decoded).await.unwrap()
+    };
+    let mut value = name.finish().unwrap().open().await.unwrap();
+    let LiteralSource::Raw(mut src) = value.source() else {
+        panic!("expected raw value")
+    };
+    match pending.value(&mut src).await {
+        Ok(()) => {
+            value.finish().unwrap();
+            writer.duplicate(0, 1).await.unwrap();
+            true
+        }
+        Err(error) => {
+            match error {
+                LiteralError::DecodedLength { source } => {
+                    assert_eq!((source.length(), source.remaining()), (4, 3));
+                }
+                LiteralError::Header {
+                    source: HeaderError::WireLimit { source },
+                } => {
+                    assert_eq!((source.required(), source.limit()), (11, 10));
+                }
+                LiteralError::Read {
+                    source: InputError::Truncated { missing },
+                } => {
+                    assert_eq!(missing.get(), 2);
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(matches!(
+                writer.duplicate(0, 1).await,
+                Err(HeaderError::NotAtBoundary)
+            ));
+            false
+        }
+    }
+}
+
+#[test]
+fn writer_can_relay_successive_literals_from_one_cursor() {
+    let mut hosts = (&b"\x45color\x04blue\x20"[..], Vec::new());
+    assert!(hosts.sync_relay_raw_unpin(11, 9));
+    assert_eq!(hosts.0, [0x20]);
+    assert_eq!(hosts.1, b"\x45color\x04blue\x00");
+}
+
+#[test]
+fn rejected_or_truncated_value_cannot_be_followed_by_an_opcode() {
+    for (wire, decoded) in [(10, 9), (11, 8)] {
+        let mut hosts = (&b"\x45color\x04blue"[..], Vec::new());
+        assert!(!hosts.sync_relay_raw_unpin(wire, decoded));
+        assert_eq!(hosts.0, b"blue");
+        assert_eq!(hosts.1, b"\x45color");
+    }
+    let mut hosts = (&b"\x45color\x04bl"[..], Vec::new());
+    assert!(!hosts.sync_relay_raw_unpin(11, 9));
+    assert_eq!(hosts.1, b"\x45color\x04bl");
+}
+
+#[call(sync)]
+async fn reference_output<F: Read + ExactLen, G: Write>(
+    input: &mut impl ReceiverAccess<Family = F>,
+    output: &mut impl ReceiverAccess<Family = G>,
+) where
+    F::Error: Debug,
+    G::Error: Debug,
+    F::Length: TryInto<u64>,
+{
+    let mut writer = Writer::new(output);
+    writer.set_dynamic_table_capacity(220, 3).await.unwrap();
+    assert!(matches!(
+        writer
+            .name_reference(NameReference::Relative(0), 1, 0)
+            .await,
+        Err(HeaderError::WireLimit { .. })
+    ));
+    let index = hatate_qpack::static_table::Index::try_from(0).unwrap();
+    writer
+        .name_reference(NameReference::Static(index), 17, 15)
+        .await
+        .unwrap()
+        .value(input)
+        .await
+        .unwrap();
+    writer
+        .name_reference(NameReference::Relative(63), 3, 0)
+        .await
+        .unwrap()
+        .value(input)
+        .await
+        .unwrap();
+    writer.duplicate(31, 2).await.unwrap();
+    {
+        let _unfinished = writer
+            .name_reference(NameReference::Relative(0), 2, 0)
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        writer.set_dynamic_table_capacity(0, 1).await,
+        Err(HeaderError::NotAtBoundary)
+    ));
+}
+
+#[test]
+fn encoder_output_matches_appendix_b_and_keeps_an_abandoned_insertion_open() {
+    let mut hosts = (&b"www.example.com"[..], Vec::new());
+    hosts.sync_reference_output_unpin();
+    assert_eq!(
+        hosts.1,
+        b"\x3f\xbd\x01\xc0\x0fwww.example.com\xbf\x00\x00\x1f\x00\x80"
+    );
+}

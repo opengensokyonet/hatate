@@ -130,6 +130,18 @@ impl RawLiteral {
     }
 }
 
+// A short parent is a truncation error. A successful end of this layer is
+// therefore exactly the remaining declared payload, even for a live stream.
+impl<F: ReceiverFamily> nitori_io::ExactLen for Source<RawLiteral, F> {
+    type Length = usize;
+    fn remaining_len<'v>(view: Pin<&mut Self::ReceiverView<'v>>) -> usize
+    where
+        Self: 'v,
+    {
+        view.state.remaining
+    }
+}
+
 impl<F: Read> Read for Source<RawLiteral, F> {
     type Error = InputError<F::Error>;
     fn poll_read<'v, O: BufMut + ?Sized>(

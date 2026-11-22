@@ -38,7 +38,7 @@ impl WireBudget {
         }
     }
 
-    pub(crate) fn take(&mut self, bytes: u64) -> Result<(), WireLimitError> {
+    pub(crate) fn check(&self, bytes: u64) -> Result<(), WireLimitError> {
         let required = self.consumed as u128 + u128::from(bytes);
         if required > self.maximum as u128 {
             return Err(WireLimitError {
@@ -46,7 +46,12 @@ impl WireBudget {
                 limit: self.maximum,
             });
         }
-        self.consumed = required as usize;
+        Ok(())
+    }
+
+    pub(crate) fn take(&mut self, bytes: u64) -> Result<(), WireLimitError> {
+        self.check(bytes)?;
+        self.consumed += bytes as usize;
         Ok(())
     }
 }
