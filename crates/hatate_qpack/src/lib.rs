@@ -27,6 +27,7 @@
 extern crate alloc;
 
 pub mod decoder_instruction;
+pub mod encoder_instruction;
 pub mod field_line;
 pub mod huffman;
 pub mod instruction;

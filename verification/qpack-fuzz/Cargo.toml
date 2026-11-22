@@ -43,3 +43,10 @@ path = "fuzz_targets/static_section.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decoder_instruction"
+path = "fuzz_targets/decoder_instruction.rs"
+test = false
+doc = false
+bench = false

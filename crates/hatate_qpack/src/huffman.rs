@@ -135,7 +135,7 @@ impl SymbolDecoder {
         Ok(Some(symbol))
     }
 
-    pub(crate) fn finish(self) -> Result<usize, DecodeError> {
+    pub(crate) fn finish(&self) -> Result<usize, DecodeError> {
         if self.tail_bits > 7 {
             return Err(DecodeError::ExcessPadding);
         }
