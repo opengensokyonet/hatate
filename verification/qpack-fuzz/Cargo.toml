@@ -12,7 +12,7 @@ cargo-fuzz = true
 resolver = "3"
 
 [dependencies]
-hatate_qpack = { path = "../crates/hatate_qpack" }
+hatate_qpack = { path = "../../crates/hatate_qpack" }
 libfuzzer-sys = "0.4.13"
 bytes = { version = "1.12.1", default-features = false }
 

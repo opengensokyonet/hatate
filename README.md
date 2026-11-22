@@ -20,18 +20,19 @@ cargo build --locked -p hatate_qpack --target x86_64-unknown-none
 
 ## Fuzzing
 
-The separate `fuzz` workspace exercises the public QPACK APIs with cargo-fuzz and libFuzzer. The `integer` target compares decoding and byte consumption with a 128-bit reference calculation. The `huffman` target checks accepted wire encodings, segmented input and output bounds. The `field_line` target reads arbitrary wire sequences and constructs valid field lines to exercise the writer. The regular test suite also exhausts one- and two-octet Huffman payloads against an independent canonical-code decoder.
+The separate [verification/qpack-fuzz](verification/qpack-fuzz) workspace exercises the public QPACK APIs with cargo-fuzz and libFuzzer. The `integer` target compares decoding and byte consumption with a 128-bit reference calculation. The `huffman` target checks accepted wire encodings, segmented input and output bounds. The `field_line` target reads arbitrary wire sequences and constructs valid field lines to exercise the writer. The regular test suite also exhausts one- and two-octet Huffman payloads against an independent canonical-code decoder.
 
-With cargo-fuzz installed, run from the repository root. Use a writable corpus directory first so the checked-in seeds remain available for repeat runs.
+Cargo generates the verification workspace’s lockfile locally. With cargo-fuzz installed, run from the repository root. Use a writable corpus directory first so the checked-in seeds remain available for repeat runs.
 
 ```sh
+fuzz_dir=verification/qpack-fuzz
 for target in integer huffman field_line; do
-    mkdir -p "fuzz/corpus/$target"
-    cargo fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- -max_total_time=60
+    mkdir -p "$fuzz_dir/corpus/$target"
+    cargo fuzz run --fuzz-dir "$fuzz_dir" "$target" "$fuzz_dir/corpus/$target" "$fuzz_dir/seeds/$target" -- -max_total_time=60
 done
 ```
 
-To replay a saved input, pass its file path after the target, for example `cargo fuzz run huffman fuzz/seeds/huffman/rfc-host`.
+To replay a saved input, pass its file path after the target, for example `cargo fuzz run --fuzz-dir verification/qpack-fuzz huffman verification/qpack-fuzz/seeds/huffman/rfc-host`.
 
 ## License
 
