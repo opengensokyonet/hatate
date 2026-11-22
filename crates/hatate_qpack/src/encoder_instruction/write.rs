@@ -2,11 +2,22 @@
 //! the writer until its value has been transferred. Keep one writer for
 //! the stream. Abandon the stream on a partial write or cancelled insertion.
 use super::{NameReference, codec::DecodedLengthError};
+use crate::huffman::{DecodeError, SymbolDecoder};
 use crate::instruction::{EncodedInteger, WireBudget, WireLimitError};
 use core::{future::poll_fn, num::NonZeroU64, task::Poll};
 use nitori_call::ReceiverAccess;
 use nitori_io::{calls::WriteAllError, prelude::*};
 use snafu::{ResultExt, Snafu};
+
+/// A source of the exact bytes to put on the wire for one literal.
+/// In both cases the advertised length is the encoded payload length.
+pub enum Payload<S> {
+    /// Uncompressed bytes.
+    Raw(S),
+    /// Bytes already encoded and padded with the RFC 7541 Huffman code.
+    /// The writer validates them and counts decoded symbols while streaming.
+    Huffman(S),
+}
 
 /// Sequential output access to a QPACK encoder stream.
 pub struct Writer<A> {
@@ -47,6 +58,12 @@ pub enum LiteralError<R, W> {
     DecodedLength {
         /// Advertised raw length and remaining decoded budget.
         source: DecodedLengthError,
+    },
+    /// Encoded bytes violate the Huffman rules or exceed the decoded budget.
+    #[snafu(display("invalid Huffman payload for encoder instruction"))]
+    Huffman {
+        /// The coding or decoded-size failure.
+        source: DecodeError,
     },
     /// Starting or writing this literal's header failed.
     #[snafu(transparent)]
@@ -160,10 +177,10 @@ where
         })
     }
 
-    /// Transfer a raw literal name before asking the caller for its value.
+    /// Transfer a literal name before asking the caller for its value.
     pub async fn literal_name<F: Read + ExactLen>(
         &mut self,
-        name: &mut impl ReceiverAccess<Family = F>,
+        name: Payload<&mut impl ReceiverAccess<Family = F>>,
         max_wire_len: usize,
         max_decoded_len: usize,
     ) -> Result<PendingValue<'_, A>, LiteralError<F::Error, <A::Family as Write>::Error>>
@@ -176,7 +193,7 @@ where
             wire: WireBudget::new(max_wire_len),
             decoded_left: max_decoded_len,
         };
-        pending.raw::<5, F>(name, 0x40, 1).await?;
+        pending.transfer::<5, F>(name, 0x40, 1).await?;
         Ok(pending)
     }
 }
@@ -193,15 +210,23 @@ impl<A: ReceiverAccess> PendingValue<'_, A>
 where
     A::Family: Write,
 {
-    async fn raw<const N: u8, F: Read + ExactLen>(
+    async fn transfer<const N: u8, F: Read + ExactLen>(
         &mut self,
-        src: &mut impl ReceiverAccess<Family = F>,
+        payload: Payload<&mut impl ReceiverAccess<Family = F>>,
         prefix: u8,
         minimum_tail: u64,
     ) -> Result<(), LiteralError<F::Error, <A::Family as Write>::Error>>
     where
         F::Length: TryInto<u64>,
     {
+        let (src, prefix, mut decoder) = match payload {
+            Payload::Raw(src) => (src, prefix, None),
+            Payload::Huffman(src) => (
+                src,
+                prefix | (1 << N),
+                Some(SymbolDecoder::new(self.decoded_left)),
+            ),
+        };
         let declared =
             poll_fn(|cx| src.poll_access(cx, |mut view, _| Poll::Ready(view.remaining_len())))
                 .await;
@@ -214,9 +239,11 @@ where
             .map_err(HeaderError::from)?;
         self.wire.take(length).map_err(HeaderError::from)?;
         self.wire.check(minimum_tail).map_err(HeaderError::from)?;
-        DecodedLengthError::check(length, self.decoded_left)?;
+        if decoder.is_none() {
+            DecodedLengthError::check(length, self.decoded_left)?;
+            self.decoded_left -= length as usize;
+        }
         self.writer.header(&header).await?;
-        self.decoded_left -= length as usize;
         let mut remaining = length;
         let mut buf = [0; 1024];
         while let Some(missing) = NonZeroU64::new(remaining) {
@@ -228,26 +255,38 @@ where
             if count == 0 {
                 return Err(LiteralError::ShortSource { missing });
             }
+            remaining -= count as u64;
+            if let Some(decoder) = &mut decoder {
+                for &octet in &buf[..count] {
+                    for shift in (0..8).rev() {
+                        decoder
+                            .bit((octet >> shift) & 1)
+                            .context(literal_error::HuffmanSnafu)?;
+                    }
+                }
+                if remaining == 0 {
+                    self.decoded_left -= decoder.finish().context(literal_error::HuffmanSnafu)?;
+                }
+            }
             self.writer
                 .io
                 .write_all(&buf[..count])
                 .await
                 .context(literal_error::SendSnafu)?;
-            remaining -= count as u64;
         }
         Ok(())
     }
 
-    /// Transfer a raw value, consuming this state. Success restores the
+    /// Transfer a literal value, consuming this state. Success restores the
     /// instruction boundary. A failure leaves the writer inside the insertion.
     pub async fn value<F: Read + ExactLen>(
         mut self,
-        value: &mut impl ReceiverAccess<Family = F>,
+        value: Payload<&mut impl ReceiverAccess<Family = F>>,
     ) -> Result<(), LiteralError<F::Error, <A::Family as Write>::Error>>
     where
         F::Length: TryInto<u64>,
     {
-        self.raw::<7, F>(value, 0, 0).await?;
+        self.transfer::<7, F>(value, 0, 0).await?;
         self.writer.at_boundary = true;
         Ok(())
     }

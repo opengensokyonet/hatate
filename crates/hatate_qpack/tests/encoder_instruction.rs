@@ -354,7 +354,7 @@ fn bounded_raw_chunks_borrow_the_original_input() {
     assert_eq!(input, [0x20]);
 }
 
-use hatate_qpack::encoder_instruction::write::{HeaderError, LiteralError, Writer};
+use hatate_qpack::encoder_instruction::write::{HeaderError, LiteralError, Payload, Writer};
 
 #[call(sync)]
 async fn relay_raw<F: Read, G: Write>(
@@ -376,13 +376,16 @@ where
         let LiteralSource::Raw(mut src) = name.source() else {
             panic!("expected raw name")
         };
-        writer.literal_name(&mut src, wire, decoded).await.unwrap()
+        writer
+            .literal_name(Payload::Raw(&mut src), wire, decoded)
+            .await
+            .unwrap()
     };
     let mut value = name.finish().unwrap().open().await.unwrap();
     let LiteralSource::Raw(mut src) = value.source() else {
         panic!("expected raw value")
     };
-    match pending.value(&mut src).await {
+    match pending.value(Payload::Raw(&mut src)).await {
         Ok(()) => {
             value.finish().unwrap();
             writer.duplicate(0, 1).await.unwrap();
@@ -457,14 +460,14 @@ async fn reference_output<F: Read + ExactLen, G: Write>(
         .name_reference(NameReference::Static(index), 17, 15)
         .await
         .unwrap()
-        .value(input)
+        .value(Payload::Raw(input))
         .await
         .unwrap();
     writer
         .name_reference(NameReference::Relative(63), 3, 0)
         .await
         .unwrap()
-        .value(input)
+        .value(Payload::Raw(input))
         .await
         .unwrap();
     writer.duplicate(31, 2).await.unwrap();
@@ -488,4 +491,90 @@ fn encoder_output_matches_appendix_b_and_keeps_an_abandoned_insertion_open() {
         hosts.1,
         b"\x3f\xbd\x01\xc0\x0fwww.example.com\xbf\x00\x00\x1f\x00\x80"
     );
+}
+
+#[call(sync)]
+async fn coded_insert<N: Read + ExactLen, V: Read + ExactLen, O: Write>(
+    name: &mut impl ReceiverAccess<Family = N>,
+    value: &mut impl ReceiverAccess<Family = V>,
+    out: &mut impl ReceiverAccess<Family = O>,
+    limit: usize,
+) -> Result<(), huffman::DecodeError>
+where
+    N::Length: TryInto<u64>,
+    V::Length: TryInto<u64>,
+    N::Error: Debug,
+    V::Error: Debug,
+    O::Error: Debug,
+{
+    let mut writer = Writer::new(out);
+    let pending = match writer
+        .literal_name(Payload::Huffman(name), usize::MAX, limit)
+        .await
+    {
+        Ok(pending) => pending,
+        Err(LiteralError::Huffman { source }) => return Err(source),
+        Err(error) => panic!("{error:?}"),
+    };
+    match pending.value(Payload::Huffman(value)).await {
+        Ok(()) => writer.duplicate(2, 1).await.unwrap(),
+        Err(LiteralError::Huffman { source }) => {
+            assert!(matches!(
+                writer.duplicate(2, 1).await,
+                Err(HeaderError::NotAtBoundary)
+            ));
+            return Err(source);
+        }
+        Err(error) => panic!("{error:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn encoded_sources_count_decoded_symbols_and_keep_their_wire_bytes() {
+    const HOST: &[u8] = b"\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff";
+    let mut hosts = (HOST, &[0x1fu8][..], Vec::new());
+    hosts.sync_coded_insert_unpin(16).unwrap();
+    let mut expected = vec![0x6c];
+    expected.extend_from_slice(HOST);
+    expected.extend_from_slice(&[0x81, 0x1f, 2]);
+    assert_eq!(hosts.2, expected);
+    let mut tight = (HOST, &[0x1fu8][..], Vec::new());
+    assert_eq!(
+        tight.sync_coded_insert_unpin(15),
+        Err(huffman::DecodeError::OutputTooLong { limit: 0 })
+    );
+    assert_eq!(tight.2, expected[..14]);
+    let mut empty = (&[][..], &[][..], Vec::new());
+    empty.sync_coded_insert_unpin(0).unwrap();
+    assert_eq!(empty.2, [0x60, 0x80, 2]);
+}
+
+#[test]
+fn encoded_value_checks_padding_eos_and_the_last_partial_block() {
+    use huffman::DecodeError::{EndOfString, ExcessPadding, InvalidPadding};
+    for (tail, expected) in [
+        (&b"\x18"[..], InvalidPadding),
+        (&b"\xff"[..], ExcessPadding),
+        (&b"\xff\xff\xff\xff"[..], EndOfString),
+    ] {
+        let mut hosts = (&[][..], tail, Vec::new());
+        assert_eq!(hosts.sync_coded_insert_unpin(32), Err(expected));
+        assert_eq!(hosts.2, [0x60, 0x80 | tail.len() as u8]);
+    }
+    let mut body = vec![0; 1025]; // five-bit symbols straddle the 1024-octet transfer boundary
+    body.push(0x18);
+    let mut hosts = (&[][..], &body[..], Vec::new());
+    assert_eq!(hosts.sync_coded_insert_unpin(2000), Err(InvalidPadding));
+    assert!(hosts.2.ends_with(&[0; 1024]));
+    assert!(hosts.2.len() < body.len() + 4);
+}
+
+#[test]
+fn appendix_b3_insertion_round_trips_from_the_wire() {
+    let example = b"\x4acustom-key\x0ccustom-value";
+    let mut hosts = (&example[..], Vec::new());
+    assert!(hosts.sync_relay_raw_unpin(example.len(), 22));
+    assert!(hosts.0.is_empty());
+    assert_eq!(&hosts.1[..example.len()], example);
 }

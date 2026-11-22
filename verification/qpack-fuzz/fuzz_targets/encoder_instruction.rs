@@ -6,7 +6,11 @@
 use bytes::{Buf, BufMut};
 use core::num::NonZeroUsize;
 use hatate_qpack::{
-    encoder_instruction::{NameReference, Reader, Started, literal::LiteralSource, write::Writer},
+    encoder_instruction::{
+        NameReference, Reader, Started,
+        literal::LiteralSource,
+        write::{Payload, Writer},
+    },
     huffman, integer,
     static_table::Index,
 };
@@ -116,10 +120,11 @@ async fn parse<F: ReadChunk, A: ReceiverAccess<Family = F>>(
 }
 
 #[call(sync)]
-async fn write_raw<N: Read + ExactLen, V: Read + ExactLen, W: Write>(
+async fn write_literals<N: Read + ExactLen, V: Read + ExactLen, W: Write>(
     name: &mut impl ReceiverAccess<Family = N>,
     value: &mut impl ReceiverAccess<Family = V>,
     out: &mut impl ReceiverAccess<Family = W>,
+    flags: u8,
     wire: usize,
     decoded: usize,
 ) -> bool
@@ -128,6 +133,16 @@ where
     V::Length: TryInto<u64>,
 {
     let mut writer = Writer::new(out);
+    let name = if flags & 1 == 0 {
+        Payload::Raw(name)
+    } else {
+        Payload::Huffman(name)
+    };
+    let value = if flags & 2 == 0 {
+        Payload::Raw(value)
+    } else {
+        Payload::Huffman(value)
+    };
     let Ok(next) = writer.literal_name(name, wire, decoded).await else {
         return false;
     };
@@ -152,10 +167,30 @@ fn check_raw_writer(body: &[u8], split: usize, wire: usize, decoded: usize) {
     }
 
     let mut hosts = (name, value, Vec::new());
-    assert_eq!(hosts.sync_write_raw_unpin(wire, decoded), fits);
+    assert_eq!(hosts.sync_write_literals_unpin(0, wire, decoded), fits);
     assert_eq!(hosts.2, expected);
     assert_eq!(hosts.0.len(), if name_fits { 0 } else { name.len() });
     assert_eq!(hosts.1.len(), if fits { 0 } else { value.len() });
+}
+
+// Independently frame the supplied wire payloads. The contiguous reader
+// checks both H bits, padding and the combined decoded-symbol budget.
+fn check_coded_writer(body: &[u8], split: u8, wire: usize, decoded: usize) {
+    let (name, value) = body.split_at(usize::from(split).min(body.len()));
+    for flags in 1..=3 {
+        let mut expected = Vec::new();
+        integer::write::<5>(&mut expected, 0x40 | ((flags & 1) << 5), name.len() as u64).unwrap();
+        expected.extend_from_slice(name);
+        integer::write::<7>(&mut expected, (flags & 2) << 6, value.len() as u64).unwrap();
+        expected.extend_from_slice(value);
+        let fits = expected.len() <= wire && reference(&mut expected.as_slice(), decoded).is_some();
+        let mut hosts = (name, value, Vec::new());
+        assert_eq!(hosts.sync_write_literals_unpin(flags, wire, decoded), fits);
+        assert!(expected.starts_with(&hosts.2));
+        if fits {
+            assert_eq!(hosts.2, expected);
+        }
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -166,6 +201,7 @@ fuzz_target!(|data: &[u8]| {
     let wire = usize::from(*wire);
     let decoded = usize::from(*decoded);
     let block = NonZeroUsize::new(usize::from(*chunk) + 1).unwrap();
+    check_coded_writer(body, *chunk, wire, decoded);
     check_raw_writer(body, usize::from(*chunk), wire, decoded);
     while !src.is_empty() {
         let before = src;
