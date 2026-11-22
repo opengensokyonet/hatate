@@ -1,0 +1,38 @@
+[package]
+name = "hatate-qpack-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0 OR MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+hatate_qpack = { path = "../crates/hatate_qpack" }
+libfuzzer-sys = "0.4.13"
+bytes = { version = "1.12.1", default-features = false }
+
+[[bin]]
+name = "integer"
+path = "fuzz_targets/integer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "huffman"
+path = "fuzz_targets/huffman.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "field_line"
+path = "fuzz_targets/field_line.rs"
+test = false
+doc = false
+bench = false

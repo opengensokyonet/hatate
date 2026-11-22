@@ -18,6 +18,21 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-de
 cargo build --locked -p hatate_qpack --target x86_64-unknown-none
 ```
 
+## Fuzzing
+
+The separate `fuzz` workspace exercises the public QPACK APIs with cargo-fuzz and libFuzzer. The `integer` target compares decoding and byte consumption with a 128-bit reference calculation. The `huffman` target checks accepted wire encodings, segmented input and output bounds. The `field_line` target reads arbitrary wire sequences and constructs valid field lines to exercise the writer. The regular test suite also exhausts one- and two-octet Huffman payloads against an independent canonical-code decoder.
+
+With cargo-fuzz installed, run from the repository root. Use a writable corpus directory first so the checked-in seeds remain available for repeat runs.
+
+```sh
+for target in integer huffman field_line; do
+    mkdir -p "fuzz/corpus/$target"
+    cargo fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- -max_total_time=60
+done
+```
+
+To replay a saved input, pass its file path after the target, for example `cargo fuzz run huffman fuzz/seeds/huffman/rfc-host`.
+
 ## License
 
 The software and code examples are available under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT). The QPACK static table and Huffman code table carry the IETF notices for [RFC 9204](crates/hatate_qpack/LICENSE-RFC9204) and [RFC 7541](crates/hatate_qpack/LICENSE-RFC7541). Explanatory documentation is licensed under [CC BY 4.0](LICENSE-CC-BY).
