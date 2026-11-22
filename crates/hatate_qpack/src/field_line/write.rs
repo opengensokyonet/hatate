@@ -96,14 +96,38 @@ pub fn write_field_line<S: AsRef<[u8]>, H: AsRef<[u8]>>(
     dst: &mut impl BufMut,
     line: &FieldLine<S, H>,
 ) -> Result<(), WriteError> {
-    let (head, value) = prepare(line, huffman::encoded_len)?;
-    let required = head.len() + value.as_ref().map_or(0, Part::len);
-    InsufficientCapacityError::check(required, dst.remaining_mut())?;
-    head.write(dst)?;
-    if let Some(value) = value {
-        value.write(dst)?;
-    }
+    let prepared = Prepared::new(line)?;
+    InsufficientCapacityError::check(prepared.len(), dst.remaining_mut())?;
+    prepared.write(dst)?;
     Ok(())
+}
+
+// Borrow the exact payloads used for measuring this representation. This
+// also lets a whole-section writer prepare each AsRef payload just once.
+pub(crate) struct Prepared<'a> {
+    head: Part<'a>,
+    value: Option<Part<'a>>,
+}
+
+impl<'a> Prepared<'a> {
+    pub(crate) fn new<S: AsRef<[u8]>, H: AsRef<[u8]>>(
+        line: &'a FieldLine<S, H>,
+    ) -> Result<Self, WriteError> {
+        let (head, value) = prepare(line, huffman::encoded_len)?;
+        Ok(Self { head, value })
+    }
+
+    pub(crate) fn len(&self) -> u128 {
+        self.head.len() + self.value.as_ref().map_or(0, Part::len)
+    }
+
+    pub(crate) fn write(&self, dst: &mut impl BufMut) -> Result<(), InsufficientCapacityError> {
+        self.head.write(dst)?;
+        if let Some(value) = &self.value {
+            value.write(dst)?;
+        }
+        Ok(())
+    }
 }
 
 fn prepare<S: AsRef<[u8]>, H: AsRef<[u8]>>(

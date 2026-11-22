@@ -2,6 +2,8 @@
 
 hatate implements HTTP/3 for Open Gensokyo Network. The [QPACK package](crates/hatate_qpack) reads and writes single field line representations from an in-memory payload. It supports the RFC 9204 static table and the RFC 7541 Huffman code. Dynamic references retain their wire index for a field section decoder to resolve. The `integer` and `huffman` modules expose the same codecs for use outside a field line.
 
+For a connection with zero maximum dynamic table capacity, `static_section` also reads and writes complete field section payloads. Its iterator resolves static references and checks both per-literal and aggregate decoded size limits. Its writer preserves the caller’s representations and checks the whole section before writing.
+
 A raw literal borrows or shares its input storage. Huffman literals return decoded bytes. The caller supplies the maximum decoded size of each literal in octets. The package works with `no_std` and an allocator.
 
 ## Development
@@ -20,13 +22,13 @@ cargo build --locked -p hatate_qpack --target x86_64-unknown-none
 
 ## Fuzzing
 
-The separate [verification/qpack-fuzz](verification/qpack-fuzz) workspace exercises the public QPACK APIs with cargo-fuzz and libFuzzer. The `integer` target compares decoding and byte consumption with a 128-bit reference calculation. The `huffman` target checks accepted wire encodings, segmented input and output bounds. The `field_line` target reads arbitrary wire sequences and constructs valid field lines to exercise the writer. The regular test suite also exhausts one- and two-octet Huffman payloads against an independent canonical-code decoder.
+The separate [verification/qpack-fuzz](verification/qpack-fuzz) workspace exercises the public QPACK APIs with cargo-fuzz and libFuzzer. The `integer` target compares decoding and byte consumption with a 128-bit reference calculation. The `huffman` target checks accepted wire encodings, segmented input and output bounds. The `field_line` target reads arbitrary wire sequences and constructs valid field lines to exercise the writer. The `static_section` target compares complete field sections against single-line decoding and independent size accounting. The regular test suite also exhausts one- and two-octet Huffman payloads against an independent canonical-code decoder.
 
 Cargo generates the verification workspace’s lockfile locally. With cargo-fuzz installed, run from the repository root. Use a writable corpus directory first so the checked-in seeds remain available for repeat runs.
 
 ```sh
 fuzz_dir=verification/qpack-fuzz
-for target in integer huffman field_line; do
+for target in integer huffman field_line static_section; do
     mkdir -p "$fuzz_dir/corpus/$target"
     cargo fuzz run --fuzz-dir "$fuzz_dir" "$target" "$fuzz_dir/corpus/$target" "$fuzz_dir/seeds/$target" -- -max_total_time=60
 done

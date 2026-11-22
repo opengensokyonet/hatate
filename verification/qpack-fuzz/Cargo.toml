@@ -36,3 +36,10 @@ path = "fuzz_targets/field_line.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "static_section"
+path = "fuzz_targets/static_section.rs"
+test = false
+doc = false
+bench = false

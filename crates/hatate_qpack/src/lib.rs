@@ -28,6 +28,7 @@ extern crate alloc;
 pub mod field_line;
 pub mod huffman;
 pub mod integer;
+pub mod static_section;
 pub mod static_table;
 pub mod string_literal;
 

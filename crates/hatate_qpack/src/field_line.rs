@@ -9,6 +9,7 @@ use crate::string_literal::StringLiteral;
 use crate::{integer, static_table, string_literal};
 
 mod write;
+pub(crate) use write::Prepared;
 pub use write::{WriteError, write_field_line};
 
 /// A field line's reference, relative to its field section where applicable.
@@ -103,13 +104,31 @@ pub fn read_field_line<S: Buf + SplitTo>(
     src: &mut S,
     max_literal_len: usize,
 ) -> Result<FieldLine<S>, ReadError> {
+    match read_head(src)? {
+        Head::Indexed(index) => Ok(FieldLine::Indexed(index)),
+        Head::NameReference { never_index, name } => Ok(FieldLine::LiteralWithNameReference {
+            never_index,
+            name,
+            value: read_value(src, max_literal_len)?,
+        }),
+        Head::LiteralName { never_index, first } => Ok(FieldLine::LiteralWithLiteralName {
+            never_index,
+            name: read_name(first, src, max_literal_len)?,
+            value: read_value(src, max_literal_len)?,
+        }),
+    }
+}
+
+// Split dispatch from literal decoding: a section can reject a dynamic
+// reference or charge the resolved name before it starts reading the value.
+pub(crate) enum Head {
+    Indexed(TableIndex),
+    NameReference { never_index: bool, name: TableIndex },
+    LiteralName { never_index: bool, first: u8 },
+}
+
+pub(crate) fn read_head(src: &mut impl Buf) -> Result<Head, ReadError> {
     let first = src.try_get_u8().map_err(|_| ReadError::MissingPrefix)?;
-    let value = |src: &mut S| {
-        let prefix = src
-            .try_get_u8()
-            .map_err(|_| ReadError::MissingValueLength)?;
-        string_literal::read::<7, _>(prefix, src, max_literal_len).context(ValueSnafu)
-    };
     match first {
         0x80..=0xff => {
             let index = integer::read::<6>(first, src).context(FieldIndexSnafu)?;
@@ -118,7 +137,7 @@ pub fn read_field_line<S: Buf + SplitTo>(
             } else {
                 TableIndex::Relative(index)
             };
-            Ok(FieldLine::Indexed(index))
+            Ok(Head::Indexed(index))
         }
         0x40..=0x7f => {
             let index = integer::read::<4>(first, src).context(NameIndexSnafu)?;
@@ -127,30 +146,45 @@ pub fn read_field_line<S: Buf + SplitTo>(
             } else {
                 TableIndex::Relative(index)
             };
-            Ok(FieldLine::LiteralWithNameReference {
+            Ok(Head::NameReference {
                 never_index: first & 0x20 != 0,
                 name,
-                value: value(src)?,
             })
         }
-        0x20..=0x3f => Ok(FieldLine::LiteralWithLiteralName {
+        0x20..=0x3f => Ok(Head::LiteralName {
             never_index: first & 0x10 != 0,
-            name: string_literal::read::<3, _>(first, src, max_literal_len).context(NameSnafu)?,
-            value: value(src)?,
+            first,
         }),
         0x10..=0x1f => {
             let index = integer::read::<4>(first, src).context(FieldIndexSnafu)?;
-            Ok(FieldLine::Indexed(TableIndex::PostBase(index)))
+            Ok(Head::Indexed(TableIndex::PostBase(index)))
         }
         0x00..=0x0f => {
             let index = integer::read::<3>(first, src).context(NameIndexSnafu)?;
-            Ok(FieldLine::LiteralWithNameReference {
+            Ok(Head::NameReference {
                 never_index: first & 0x08 != 0,
                 name: TableIndex::PostBase(index),
-                value: value(src)?,
             })
         }
     }
+}
+
+pub(crate) fn read_name<S: Buf + SplitTo>(
+    first: u8,
+    src: &mut S,
+    limit: usize,
+) -> Result<StringLiteral<S>, ReadError> {
+    string_literal::read::<3, _>(first, src, limit).context(NameSnafu)
+}
+
+pub(crate) fn read_value<S: Buf + SplitTo>(
+    src: &mut S,
+    limit: usize,
+) -> Result<StringLiteral<S>, ReadError> {
+    let first = src
+        .try_get_u8()
+        .map_err(|_| ReadError::MissingValueLength)?;
+    string_literal::read::<7, _>(first, src, limit).context(ValueSnafu)
 }
 
 #[cfg(test)]
