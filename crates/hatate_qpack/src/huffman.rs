@@ -133,23 +133,49 @@ pub fn encode(dst: &mut impl BufMut, input: &[u8]) -> Result<(), InsufficientCap
     if (input.len() as u128 * 30).div_ceil(8) > available as u128 {
         InsufficientCapacityError::check(encoded_len(input), available)?;
     }
-    let mut pending = 0u64;
-    let mut bits = 0;
-    for &byte in input {
-        let (code, width) = CODES[usize::from(byte)];
-        // At most seven pending bits precede a code of at most 30 bits.
-        pending = (pending << width) | u64::from(code);
-        bits += width;
-        while bits >= 8 {
-            bits -= 8;
-            dst.put_u8((pending >> bits) as u8);
-        }
-    }
-    if bits > 0 {
-        let padding = 8 - bits;
-        dst.put_u8((pending as u8) << padding | ((1 << padding) - 1));
+    for byte in EncodedOctets::new(input) {
+        dst.put_u8(byte);
     }
     Ok(())
+}
+
+/// The code stream including the final EOS-prefix padding. Used both for
+/// standalone encoding and for transferring a complete measured section.
+pub(crate) struct EncodedOctets<'a> {
+    input: core::slice::Iter<'a, u8>,
+    pending: u64,
+    bits: u8,
+}
+
+impl<'a> EncodedOctets<'a> {
+    pub(crate) fn new(input: &'a [u8]) -> Self {
+        Self {
+            input: input.iter(),
+            pending: 0,
+            bits: 0,
+        }
+    }
+}
+
+impl Iterator for EncodedOctets<'_> {
+    type Item = u8;
+    fn next(&mut self) -> Option<u8> {
+        while self.bits < 8 {
+            let Some(&byte) = self.input.next() else {
+                if self.bits == 0 {
+                    return None;
+                }
+                let padding = 8 - self.bits;
+                self.bits = 0;
+                return Some((self.pending as u8) << padding | ((1 << padding) - 1));
+            };
+            let (code, width) = CODES[usize::from(byte)];
+            self.pending = (self.pending << width) | u64::from(code);
+            self.bits += width;
+        }
+        self.bits -= 8;
+        Some((self.pending >> self.bits) as u8)
+    }
 }
 
 #[cfg(test)]

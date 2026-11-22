@@ -9,7 +9,7 @@ use crate::string_literal::StringLiteral;
 use crate::{integer, static_table, string_literal};
 
 mod write;
-pub(crate) use write::Prepared;
+pub(crate) use write::{Prepared, transfer};
 pub use write::{WriteError, write_field_line};
 
 /// A field line's reference, relative to its field section where applicable.

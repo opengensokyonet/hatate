@@ -1,6 +1,6 @@
 use super::{FieldLine, StringLiteral, TableIndex};
 use crate::{InsufficientCapacityError, huffman, integer};
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 use core::num::TryFromIntError;
 use snafu::{ResultExt, Snafu};
 
@@ -79,13 +79,16 @@ impl<'a> Part<'a> {
         self.prefix_len as u128 + u128::from(self.payload_len)
     }
 
-    fn write(&self, dst: &mut impl BufMut) -> Result<(), InsufficientCapacityError> {
-        dst.put_slice(&self.prefix[..self.prefix_len]);
-        match self.payload {
-            StringLiteral::Raw(data) => dst.put_slice(data),
-            StringLiteral::Huffman(data) => huffman::encode(dst, data)?,
-        }
-        Ok(())
+    fn octets(self) -> impl Iterator<Item = u8> + 'a {
+        let (raw, coded) = match self.payload {
+            StringLiteral::Raw(data) => (data, &[][..]),
+            StringLiteral::Huffman(data) => (&[][..], data),
+        };
+        self.prefix
+            .into_iter()
+            .take(self.prefix_len)
+            .chain(raw.iter().copied())
+            .chain(huffman::EncodedOctets::new(coded))
     }
 }
 
@@ -97,8 +100,7 @@ pub fn write_field_line<S: AsRef<[u8]>, H: AsRef<[u8]>>(
     line: &FieldLine<S, H>,
 ) -> Result<(), WriteError> {
     let prepared = Prepared::new(line)?;
-    InsufficientCapacityError::check(prepared.len(), dst.remaining_mut())?;
-    prepared.write(dst)?;
+    transfer(dst, prepared.len(), prepared.octets())?;
     Ok(())
 }
 
@@ -121,12 +123,74 @@ impl<'a> Prepared<'a> {
         self.head.len() + self.value.as_ref().map_or(0, Part::len)
     }
 
-    pub(crate) fn write(&self, dst: &mut impl BufMut) -> Result<(), InsufficientCapacityError> {
-        self.head.write(dst)?;
-        if let Some(value) = &self.value {
-            value.write(dst)?;
+    pub(crate) fn octets(self) -> impl Iterator<Item = u8> + 'a {
+        self.head
+            .octets()
+            .chain(self.value.into_iter().flat_map(Part::octets))
+    }
+}
+
+/// Submit the entire measured source in one BufMut operation. A segmented
+/// destination may report a more conservative capacity after its cursor moves.
+pub(crate) fn transfer(
+    dst: &mut impl BufMut,
+    required: u128,
+    octets: impl Iterator<Item = u8>,
+) -> Result<(), InsufficientCapacityError> {
+    InsufficientCapacityError::check(required, dst.remaining_mut())?;
+    let mut src = WireBuf {
+        octets,
+        remaining: required as usize,
+        chunk: [0; 256],
+        start: 0,
+        end: 0,
+    };
+    src.refill();
+    dst.put(src);
+    Ok(())
+}
+
+// Materialize a bounded chunk of an encoding for Buf::chunk. Its exact
+// remaining length was measured from the same borrowed payloads.
+struct WireBuf<I> {
+    octets: I,
+    remaining: usize,
+    chunk: [u8; 256],
+    start: usize,
+    end: usize,
+}
+
+impl<I: Iterator<Item = u8>> WireBuf<I> {
+    fn refill(&mut self) {
+        self.start = 0;
+        self.end = self.remaining.min(self.chunk.len());
+        for byte in &mut self.chunk[..self.end] {
+            *byte = self
+                .octets
+                .next()
+                .expect("measured encoding contains this octet");
         }
-        Ok(())
+    }
+}
+
+impl<I: Iterator<Item = u8>> Buf for WireBuf<I> {
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+    fn chunk(&self) -> &[u8] {
+        &self.chunk[self.start..self.end]
+    }
+    fn advance(&mut self, mut count: usize) {
+        assert!(count <= self.remaining);
+        while count > 0 {
+            let step = count.min(self.end - self.start);
+            self.remaining -= step;
+            self.start += step;
+            count -= step;
+            if self.start == self.end {
+                self.refill();
+            }
+        }
     }
 }
 

@@ -135,12 +135,16 @@ fn dynamic_references_fail_before_reading_an_associated_value() {
             }
         );
         assert!(fields.next().is_none());
+        let reference = match tag {
+            0x80 | 0x40 => TableIndex::Relative(0),
+            _ => TableIndex::PostBase(0),
+        };
         let bad = if indexed {
-            FieldLine::Indexed(TableIndex::Relative(0))
+            FieldLine::Indexed(reference)
         } else {
             FieldLine::LiteralWithNameReference {
                 never_index: true,
-                name: TableIndex::PostBase(0),
+                name: reference,
                 value: StringLiteral::Raw(&b""[..]),
             }
         };
@@ -151,7 +155,7 @@ fn dynamic_references_fail_before_reading_an_associated_value() {
         ];
         assert!(matches!(
             write_static_section(&mut out, &lines),
-            Err(WriteError::DynamicReference { index: 1, .. })
+            Err(WriteError::DynamicReference { index: 1, source: error }) if error == source
         ));
         assert_eq!(out, b"unchanged");
     }
@@ -209,4 +213,87 @@ fn measurement_and_write_use_the_same_payload_borrow() {
     let mut out = [0; 6];
     write_static_section(&mut &mut out[..], &lines).unwrap();
     assert_eq!(out, [0, 0, 0x21, b'a', 0x81, 0x1f]);
+}
+
+// After advancing once, report just one writable byte at a time. The
+// physical storage still has all the space advertised on entry.
+struct ConservativeSink<'a> {
+    rest: &'a mut [u8],
+    advanced: bool,
+}
+
+// SAFETY: all writable chunks borrow initialized storage exclusively; the
+// inner slice maintains the cursor, and chunks never exceed remaining_mut.
+unsafe impl bytes::BufMut for ConservativeSink<'_> {
+    fn remaining_mut(&self) -> usize {
+        if self.advanced {
+            self.rest.len().min(1)
+        } else {
+            self.rest.len()
+        }
+    }
+    fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+        let size = self.rest.len().min(1);
+        bytes::buf::UninitSlice::new(&mut self.rest[..size])
+    }
+    unsafe fn advance_mut(&mut self, count: usize) {
+        assert!(count <= self.rest.len().min(1));
+        let (_, tail) = core::mem::take(&mut self.rest).split_at_mut(count);
+        self.rest = tail;
+        self.advanced |= count != 0;
+    }
+}
+
+#[test]
+fn capacity_can_be_reported_conservatively_after_the_first_write() {
+    use hatate_qpack::field_line::write_field_line;
+    let line = FieldLine::<&[u8], &[u8]>::LiteralWithNameReference {
+        never_index: false,
+        name: TableIndex::Static(Index::try_from(1).unwrap()),
+        value: StringLiteral::Huffman(b"aa"),
+    };
+    let expected = [0x51, 0x82, 0x18, 0xff];
+    let mut one = [0; 4];
+    write_field_line(
+        &mut ConservativeSink {
+            rest: &mut one,
+            advanced: false,
+        },
+        &line,
+    )
+    .unwrap();
+    assert_eq!(one, expected);
+    let mut section = [0xa5; 8];
+    write_static_section(
+        &mut ConservativeSink {
+            rest: &mut section,
+            advanced: false,
+        },
+        &[line],
+    )
+    .unwrap();
+    assert_eq!(&section[..6], &[0, 0, 0x51, 0x82, 0x18, 0xff]);
+    assert_eq!(&section[6..], &[0xa5; 2]);
+}
+
+#[test]
+fn segmented_destination_can_cross_several_encoded_chunks() {
+    let raw = [b'x'; 670];
+    let line = FieldLine::<&[u8], &[u8]>::LiteralWithLiteralName {
+        never_index: true,
+        name: StringLiteral::Raw(&raw),
+        value: StringLiteral::Huffman(&raw),
+    };
+    let mut storage = [0; 1500];
+    let mut dst = ConservativeSink {
+        rest: &mut storage,
+        advanced: false,
+    };
+    write_static_section(&mut dst, &[line]).unwrap();
+    let length = 1500 - dst.rest.len();
+    let mut fields = read_static_section(&storage[..length], 670, 1372).unwrap();
+    let field = fields.next().unwrap().unwrap();
+    assert_eq!(field.name.as_ref(), &raw);
+    assert_eq!(field.value.as_ref(), &raw);
+    assert!(fields.next().is_none());
 }

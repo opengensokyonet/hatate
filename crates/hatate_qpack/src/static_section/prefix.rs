@@ -1,8 +1,8 @@
 //! Encoded field section prefix with zero maximum dynamic table capacity
 //! (RFC 9204 §4.5.1).
 
-use crate::{InsufficientCapacityError, integer};
-use bytes::{Buf, BufMut};
+use crate::integer;
+use bytes::Buf;
 use core::num::NonZeroU64;
 use snafu::{ResultExt, Snafu};
 
@@ -59,12 +59,6 @@ pub(super) fn read(src: &mut impl Buf) -> Result<(), PrefixError> {
 }
 
 pub(super) const ENCODED: [u8; 2] = [0, 0];
-
-pub(super) fn write(dst: &mut impl BufMut) -> Result<(), InsufficientCapacityError> {
-    InsufficientCapacityError::check(ENCODED.len() as u128, dst.remaining_mut())?;
-    dst.put_slice(&ENCODED);
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -132,23 +126,5 @@ mod tests {
             })
         ));
         assert_eq!(rest, [0]);
-    }
-
-    #[test]
-    fn writes_the_canonical_prefix_as_a_unit() {
-        for capacity in 0..=2 {
-            let mut storage = [0xa5; 2];
-            let mut dst = &mut storage[..capacity];
-            if capacity == 2 {
-                write(&mut dst).unwrap();
-                assert!(dst.is_empty());
-                assert_eq!(storage, [0, 0]);
-            } else {
-                let err = write(&mut dst).unwrap_err();
-                assert_eq!((err.required(), err.available()), (2, capacity));
-                assert_eq!(dst.len(), capacity);
-                assert_eq!(storage, [0xa5; 2]);
-            }
-        }
     }
 }
