@@ -54,15 +54,12 @@ pub enum LiteralHeaderError<E> {
     DecodedLength { source: DecodedLengthError },
 }
 
-async fn literal_header<const N: u8, F: Read>(
-    io: &mut impl ReceiverAccess<Family = F>,
+fn literal_payload<const N: u8, E>(
     wire: &mut WireBudget,
     first: u8,
+    length: u64,
     decoded_left: usize,
-) -> Result<Literal, LiteralHeaderError<F::Error>> {
-    let length = instruction::number::<N, F>(io, wire, first)
-        .await
-        .context(literal_header_error::LengthSnafu)?;
+) -> Result<Literal, LiteralHeaderError<E>> {
     wire.take(length)?;
     let coded = first & (1 << N) != 0;
     if !coded {
@@ -76,6 +73,10 @@ async fn literal_header<const N: u8, F: Read>(
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum StartError<E> {
+    /// The shortest possible insertion already exceeds the wire budget.
+    /// The name payload and the value prefix have not been consumed.
+    #[snafu(transparent)]
+    WireLimit { source: WireLimitError },
     #[snafu(display("encoder stream is inside an unfinished or failed instruction"))]
     NotAtBoundary,
     #[snafu(display("could not read encoder instruction prefix"))]
@@ -102,9 +103,16 @@ pub(crate) async fn read_head<F: Read, A: ReceiverAccess<Family = F>>(
     use start_error::*;
     Ok(match first {
         0x80..=0xff => {
-            let index = instruction::number::<6, F>(io, budget, first)
-                .await
-                .context(NameIndexSnafu)?;
+            // An unfinished index needs its next digit and the value prefix.
+            let index = instruction::checked_number::<6, F, _>(
+                io,
+                budget,
+                first,
+                |wire, _| Ok(wire.check(2)?),
+                |source| StartError::NameIndex { source },
+            )
+            .await?;
+            budget.check(1)?;
             let name = if first & 0x40 != 0 {
                 NameReference::Static(
                     static_table::Index::try_from(index).context(StaticNameSnafu)?,
@@ -114,11 +122,24 @@ pub(crate) async fn read_head<F: Read, A: ReceiverAccess<Family = F>>(
             };
             Head::Reference(name)
         }
-        0x40..=0x7f => Head::Literal(
-            literal_header::<5, F>(io, budget, first, decoded_left)
-                .await
-                .context(NameSnafu)?,
-        ),
+        0x40..=0x7f => {
+            // The accumulated name length is a lower bound even before its
+            // last digit. Leave room for that digit and the value prefix.
+            let length = instruction::checked_number::<5, F, _>(
+                io,
+                budget,
+                first,
+                |wire, minimum| Ok(wire.check(u128::from(minimum) + 2)?),
+                |source| StartError::Name {
+                    source: LiteralHeaderError::Length { source },
+                },
+            )
+            .await?;
+            budget.check(u128::from(length) + 1)?;
+            Head::Literal(
+                literal_payload::<5, _>(budget, first, length, decoded_left).context(NameSnafu)?,
+            )
+        }
         0x20..=0x3f => Head::Capacity(
             instruction::number::<5, F>(io, budget, first)
                 .await
@@ -151,7 +172,9 @@ pub(crate) async fn read_value_header<F: Read, A: ReceiverAccess<Family = F>>(
     let first = instruction::octet(io, budget)
         .await
         .context(value_error::PrefixSnafu)?;
-    literal_header::<7, F>(io, budget, first, decoded_left)
+    let length = instruction::number::<7, F>(io, budget, first)
         .await
-        .context(value_error::ValueSnafu)
+        .context(literal_header_error::LengthSnafu)
+        .context(value_error::ValueSnafu)?;
+    literal_payload::<7, _>(budget, first, length, decoded_left).context(value_error::ValueSnafu)
 }

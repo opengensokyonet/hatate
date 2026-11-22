@@ -38,8 +38,8 @@ impl WireBudget {
         }
     }
 
-    pub(crate) fn check(&self, bytes: u64) -> Result<(), WireLimitError> {
-        let required = self.consumed as u128 + u128::from(bytes);
+    pub(crate) fn check(&self, bytes: u128) -> Result<(), WireLimitError> {
+        let required = self.consumed as u128 + bytes;
         if required > self.maximum as u128 {
             return Err(WireLimitError {
                 required,
@@ -50,7 +50,7 @@ impl WireBudget {
     }
 
     pub(crate) fn take(&mut self, bytes: u64) -> Result<(), WireLimitError> {
-        self.check(bytes)?;
+        self.check(u128::from(bytes))?;
         self.consumed += bytes as usize;
         Ok(())
     }
@@ -106,15 +106,33 @@ pub(crate) async fn number<const N: u8, F: Read>(
     budget: &mut WireBudget,
     first: u8,
 ) -> Result<u64, NumberError<F::Error>> {
+    checked_number::<N, F, _>(io, budget, first, |_, _| Ok(()), core::convert::identity).await
+}
+
+// The containing representation can already imply a minimum size while the
+// integer still needs another digit. Run its check before requesting that digit.
+pub(crate) async fn checked_number<const N: u8, F: Read, E>(
+    io: &mut impl ReceiverAccess<Family = F>,
+    budget: &mut WireBudget,
+    first: u8,
+    before_digit: impl Fn(&WireBudget, u64) -> Result<(), E>,
+    number_error: impl Fn(NumberError<F::Error>) -> E,
+) -> Result<u64, E> {
     let mut state = match integer::Continuation::start::<N>(first) {
         ControlFlow::Break(value) => return Ok(value),
         ControlFlow::Continue(state) => state,
     };
     loop {
+        before_digit(budget, state.minimum())?;
         let byte = octet(io, budget)
             .await
-            .context(number_error::ContinuationSnafu)?;
-        if let Some(value) = state.push(byte).context(number_error::IntegerSnafu)? {
+            .context(number_error::ContinuationSnafu)
+            .map_err(&number_error)?;
+        if let Some(value) = state
+            .push(byte)
+            .context(number_error::IntegerSnafu)
+            .map_err(&number_error)?
+        {
             return Ok(value);
         }
     }

@@ -128,7 +128,7 @@ where
         max_wire_len: usize,
     ) -> Result<(), HeaderError<<A::Family as Write>::Error>> {
         self.boundary()?;
-        WireBudget::new(max_wire_len).check(encoded.as_slice().len() as u64)?;
+        WireBudget::new(max_wire_len).check(encoded.as_slice().len() as u128)?;
         self.header(&encoded).await?;
         self.at_boundary = true;
         Ok(())
@@ -238,7 +238,9 @@ where
             .take(header.as_slice().len() as u64)
             .map_err(HeaderError::from)?;
         self.wire.take(length).map_err(HeaderError::from)?;
-        self.wire.check(minimum_tail).map_err(HeaderError::from)?;
+        self.wire
+            .check(u128::from(minimum_tail))
+            .map_err(HeaderError::from)?;
         if decoder.is_none() {
             DecodedLengthError::check(length, self.decoded_left)?;
             self.decoded_left -= length as usize;

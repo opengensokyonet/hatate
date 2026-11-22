@@ -65,6 +65,11 @@ impl Continuation {
         }
     }
 
+    /// Least value the unfinished integer can have (all further digits zero).
+    pub(crate) fn minimum(&self) -> u64 {
+        self.value
+    }
+
     /// Stop feeding octets at either a result or an error.
     pub(crate) fn push(&mut self, byte: u8) -> Result<Option<u64>, ReadError> {
         let digit = u64::from(byte & 0x7f);

@@ -713,3 +713,38 @@ fn zero_budget_and_cancelled_first_read_preserve_boundary() {
     }
     assert_eq!(host.rest, [0x20]);
 }
+
+#[call(sync)]
+async fn short_insertion<F: Read>(io: &mut impl ReceiverAccess<Family = F>, limit: usize) -> u128 {
+    let mut reader = Reader::new(io);
+    match reader.start(limit, usize::MAX).await {
+        Err(StartError::WireLimit { source }) => {
+            assert_eq!(source.limit(), limit);
+            source.required()
+        }
+        _ => panic!("expected the known minimum insertion size to exceed the limit"),
+    }
+}
+
+#[test]
+fn reject_impossible_insertions_at_the_first_decisive_octet() {
+    // Each tuple specifies the first decisive prefix, unconsumed bytes,
+    // maximum wire size, and minimum size known from just that prefix.
+    let cases: &[(&[u8], &[u8], usize, u128)] = &[
+        (&[0x41], b"x\0", 2, 3),             // raw literal name
+        (&[0x61], &[0x1f, 0], 2, 3),         // Huffman literal name
+        (&[0x80], &[0], 1, 2),               // dynamic name reference
+        (&[0xc1], &[0], 1, 2),               // static name reference
+        (&[0xff], &[0, 0], 2, 3),            // index needs another digit
+        (&[0xbf, 0x80], &[0, 0], 3, 4),      // nonminimal, still incomplete
+        (&[0x5f], &[0, b'x'], 33, 34),       // name length is already >= 31
+        (&[0x7f, 0x82], &[0, 0x1f], 36, 37), // >= 33 octets, still needs a digit
+        (&[0x5f, 4], b"x", 37, 38),          // full length 35 now known
+    ];
+    for &(prefix, tail, limit, required) in cases {
+        let input = [prefix, tail].concat();
+        let mut src = input.as_slice();
+        assert_eq!(src.sync_short_insertion_unpin(limit), required);
+        assert_eq!(src, tail);
+    }
+}
