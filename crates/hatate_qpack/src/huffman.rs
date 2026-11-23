@@ -95,6 +95,10 @@ pub fn decode(mut src: impl Buf, limit: usize) -> Result<Bytes, DecodeError> {
 
 // Carries a partial code across encoded input octets and buffer boundaries.
 // Only the end of the entire literal is a padding boundary.
+//
+// Callers stop at the first error, after which the decoder has no meaningful
+// state. An error still returns the partial code to the root, so another
+// call to `bit` neither indexes past `TREE` nor overflows `tail_bits`.
 pub(crate) struct SymbolDecoder {
     node: u16,
     tail_bits: u8,
@@ -122,17 +126,23 @@ impl SymbolDecoder {
             return Ok(None);
         }
         if self.node == EOS {
+            self.reset_code();
             return Err(DecodeError::EndOfString);
         }
         if self.produced == self.limit {
+            self.reset_code();
             return Err(DecodeError::OutputTooLong { limit: self.limit });
         }
         let symbol = (self.node - LEAF) as u8;
         self.produced += 1;
+        self.reset_code();
+        Ok(Some(symbol))
+    }
+
+    fn reset_code(&mut self) {
         self.node = 0;
         self.tail_bits = 0;
         self.tail_is_ones = true;
-        Ok(Some(symbol))
     }
 
     pub(crate) fn finish(&self) -> Result<usize, DecodeError> {
@@ -328,5 +338,34 @@ mod tests {
             decode(&[0x18][..], usize::MAX),
             Err(DecodeError::InvalidPadding)
         );
+    }
+
+    #[test]
+    fn a_bit_after_an_error_does_not_index_past_the_tree() {
+        // 'a' is the 5-bit code 00011.
+        let mut limited = SymbolDecoder::new(0);
+        let mut result = Ok(None);
+        for bit in [0, 0, 0, 1, 1] {
+            result = limited.bit(bit);
+        }
+        assert_eq!(result, Err(DecodeError::OutputTooLong { limit: 0 }));
+        assert_eq!(limited.bit(0), Ok(None));
+
+        // EOS is 30 one bits.
+        let mut eos = SymbolDecoder::new(100);
+        for _ in 0..29 {
+            assert_eq!(eos.bit(1), Ok(None));
+        }
+        assert_eq!(eos.bit(1), Err(DecodeError::EndOfString));
+        assert_eq!(eos.bit(0), Ok(None));
+
+        // Repeated errors would overflow a code length that kept counting.
+        let mut repeated = SymbolDecoder::new(100);
+        for _ in 0..20 {
+            for _ in 0..29 {
+                assert_eq!(repeated.bit(1), Ok(None));
+            }
+            assert_eq!(repeated.bit(1), Err(DecodeError::EndOfString));
+        }
     }
 }
