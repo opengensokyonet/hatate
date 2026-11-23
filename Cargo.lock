@@ -9,6 +9,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 
 [[package]]
+name = "frunk_core"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bd3c9ba2e323e8b19e77f15873f60974a7d82f89b80e50c53be44b8b92927c1"
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -39,6 +45,47 @@ dependencies = [
  "nitori_call",
  "nitori_io",
  "snafu",
+]
+
+[[package]]
+name = "hatate_wire"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "frunk_core",
+ "hatate_wire_qpack",
+ "nitori_call",
+ "nitori_io",
+ "sakuya_var_int",
+ "snafu",
+]
+
+[[package]]
+name = "hatate_wire_datagram"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "frunk_core",
+ "hatate_wire",
+ "sakuya_var_int",
+ "snafu",
+]
+
+[[package]]
+name = "hatate_wire_extended_connect"
+version = "0.0.0"
+dependencies = [
+ "frunk_core",
+ "hatate_wire",
+ "sakuya_var_int",
+ "snafu",
+]
+
+[[package]]
+name = "hatate_wire_qpack"
+version = "0.0.0"
+dependencies = [
+ "sakuya_var_int",
 ]
 
 [[package]]
@@ -102,6 +149,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "sakuya_var_int"
+version = "0.0.0"
+source = "git+https://github.com/opengensokyonet/sakuya?rev=06a59e5cb217641178b061ee3d25563eaabf206e#06a59e5cb217641178b061ee3d25563eaabf206e"
+dependencies = [
+ "bytes",
+ "nitori_call",
+ "nitori_io",
+ "snafu",
 ]
 
 [[package]]

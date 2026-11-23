@@ -1,0 +1,19 @@
+[package]
+name = "hatate_wire"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "HTTP/3 frames, settings and unidirectional stream types, composed of parts"
+
+[dependencies]
+bytes.workspace = true
+frunk_core.workspace = true
+hatate_wire_qpack.workspace = true
+nitori_call.workspace = true
+nitori_io.workspace = true
+sakuya_var_int.workspace = true
+snafu.workspace = true
+
+[dev-dependencies]
+nitori_io = { workspace = true, features = ["std"] }

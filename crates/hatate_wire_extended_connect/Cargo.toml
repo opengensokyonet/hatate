@@ -1,0 +1,13 @@
+[package]
+name = "hatate_wire_extended_connect"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Extended CONNECT (RFC 9220) on HTTP/3: the SETTINGS_ENABLE_CONNECT_PROTOCOL setting"
+
+[dependencies]
+frunk_core.workspace = true
+hatate_wire.workspace = true
+sakuya_var_int.workspace = true
+snafu.workspace = true
