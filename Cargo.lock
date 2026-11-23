@@ -67,6 +67,9 @@ dependencies = [
  "bytes",
  "frunk_core",
  "hatate_wire",
+ "hatate_wire_extended_connect",
+ "nitori_call",
+ "nitori_io",
  "sakuya_var_int",
  "snafu",
 ]

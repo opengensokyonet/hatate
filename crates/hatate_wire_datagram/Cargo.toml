@@ -12,3 +12,8 @@ frunk_core.workspace = true
 hatate_wire.workspace = true
 sakuya_var_int.workspace = true
 snafu.workspace = true
+
+[dev-dependencies]
+hatate_wire_extended_connect = { path = "../hatate_wire_extended_connect" }
+nitori_call.workspace = true
+nitori_io = { workspace = true, features = ["std"] }

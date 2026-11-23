@@ -15,6 +15,11 @@ resolver = "3"
 nitori_io = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "e6ed71c8577018dc33086881be8c72d64a9c9424", default-features = false }
 nitori_call = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "e6ed71c8577018dc33086881be8c72d64a9c9424", default-features = false }
 hatate_qpack = { path = "../../crates/hatate_qpack" }
+hatate_wire = { path = "../../crates/hatate_wire" }
+hatate_wire_datagram = { path = "../../crates/hatate_wire_datagram" }
+hatate_wire_extended_connect = { path = "../../crates/hatate_wire_extended_connect" }
+frunk_core = { version = "=0.5.0", default-features = false }
+sakuya_var_int = { version = "0.0.0", git = "https://github.com/opengensokyonet/sakuya", rev = "06a59e5cb217641178b061ee3d25563eaabf206e" }
 libfuzzer-sys = "0.4.13"
 bytes = { version = "1.12.1", default-features = false }
 
@@ -56,6 +61,13 @@ bench = false
 [[bin]]
 name = "encoder_instruction"
 path = "fuzz_targets/encoder_instruction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_frames"
+path = "fuzz_targets/wire_frames.rs"
 test = false
 doc = false
 bench = false
