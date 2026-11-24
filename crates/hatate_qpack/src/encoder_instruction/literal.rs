@@ -6,7 +6,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll, ready},
 };
-use nitori_call::{Compose, Composed, ReceiverAccess, ReceiverFamily, ViewLoan};
+use nitori_call::{Compose, Composed, ReceiverAccess, ReceiverFamily};
 use nitori_io::{Read, ReadChunk};
 use snafu::Snafu;
 
@@ -16,18 +16,25 @@ use crate::huffman::{self, SymbolDecoder};
 /// A Huffman read decodes into storage supplied by the consumer.
 pub enum LiteralSource<'a, A: ReceiverAccess> {
     /// A bounded source providing the parent's read capabilities.
-    Raw(Composed<'a, A, &'a mut RawLiteral>),
+    Raw(Composed<&'a mut A, &'a mut RawLiteral>),
     /// A bounded, decoded source implementing [`Read`].
-    Huffman(Composed<'a, A, &'a mut HuffmanLiteral>),
+    Huffman(Composed<&'a mut A, &'a mut HuffmanLiteral>),
 }
 
 /// Receiver family for a literal composed onto its parent stream.
 pub struct Source<S, F>(PhantomData<fn() -> (S, F)>);
 
-/// The parent view and literal state lent for one poll.
-pub struct SourceView<'v, S, F: ReceiverFamily> {
-    parent: ViewLoan<'v, F>,
-    state: &'v mut S,
+pin_project_lite::pin_project! {
+    /// The parent view, held by value, and the literal state.
+    pub struct SourceView<'v, S, F>
+    where
+        F: ReceiverFamily,
+        F: 'v,
+    {
+        #[pin]
+        parent: F::ReceiverView<'v>,
+        state: &'v mut S,
+    }
 }
 
 impl<S, F: ReceiverFamily> ReceiverFamily for Source<S, F> {
@@ -41,17 +48,16 @@ macro_rules! compose_literal {
     ($state:ty) => {
         impl<F: ReceiverFamily> Compose<F> for $state {
             type Family = Source<Self, F>;
-            fn compose<'v, 'p>(
+            fn compose<'v>(
                 self: Pin<&'v mut Self>,
-                parent: Pin<&'v mut F::ReceiverView<'p>>,
+                parent: F::ReceiverView<'v>,
             ) -> SourceView<'v, Self, F>
             where
-                F: 'p,
-                'p: 'v,
+                F: 'v,
                 Self::Family: 'v,
             {
                 SourceView {
-                    parent: ViewLoan::new(parent),
+                    parent,
                     state: self.get_mut(),
                 }
             }
@@ -97,7 +103,7 @@ impl RawLiteral {
 
     fn poll<'v, F: Read + 'v, O: BufMut + ?Sized>(
         &mut self,
-        parent: &mut ViewLoan<'v, F>,
+        parent: Pin<&mut F::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         destination: &mut O,
     ) -> Poll<Result<usize, InputError<F::Error>>> {
@@ -108,11 +114,11 @@ impl RawLiteral {
             return Poll::Ready(Ok(0));
         };
         let empty = destination.remaining_mut() == 0;
-        let result = ready!(parent.with(|view| F::poll_read(
-            view.into_pin(),
+        let result = ready!(F::poll_read(
+            parent,
             cx,
             &mut destination.limit(self.remaining)
-        )));
+        ));
         match result {
             Ok(0) if !empty => {
                 self.failed = true;
@@ -138,7 +144,7 @@ impl<F: ReceiverFamily> nitori_io::ExactLen for Source<RawLiteral, F> {
     where
         Self: 'v,
     {
-        view.state.remaining
+        view.project().state.remaining
     }
 }
 
@@ -152,8 +158,8 @@ impl<F: Read> Read for Source<RawLiteral, F> {
     where
         Self: 'v,
     {
-        let view = host.get_mut();
-        view.state.poll(&mut view.parent, cx, dst)
+        let view = host.project();
+        view.state.poll::<F, O>(view.parent, cx, dst)
     }
 }
 
@@ -167,19 +173,15 @@ impl<F: ReadChunk> ReadChunk for Source<RawLiteral, F> {
     where
         Self: 'v,
     {
-        let view = host.get_mut();
-        let state = &mut view.state;
+        let view = host.project();
+        let state = view.state;
         if state.failed {
             return Poll::Ready(Err(InputError::Failed));
         }
         let Some(missing) = NonZeroUsize::new(state.remaining) else {
             return Poll::Ready(Ok(None));
         };
-        let result = ready!(view.parent.with(|parent| F::poll_read_chunk(
-            parent.into_pin(),
-            cx,
-            maximum.min(missing)
-        )));
+        let result = ready!(F::poll_read_chunk(view.parent, cx, maximum.min(missing)));
         match result {
             Ok(Some(chunk)) => {
                 state.remaining -= chunk.remaining();
@@ -253,7 +255,7 @@ impl HuffmanLiteral {
     }
     fn poll<'v, F: Read + 'v, O: BufMut + ?Sized>(
         &mut self,
-        parent: &mut ViewLoan<'v, F>,
+        mut parent: Pin<&mut F::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         dst: &mut O,
     ) -> Poll<Result<usize, HuffmanReadError<F::Error>>> {
@@ -296,7 +298,7 @@ impl HuffmanLiteral {
                     .div_ceil(8)
                     .min(self.encoded.len());
                 let mut buffer = &mut self.encoded[..request];
-                self.end = match ready!(self.input.poll(parent, cx, &mut buffer)) {
+                self.end = match ready!(self.input.poll::<F, _>(parent.as_mut(), cx, &mut buffer)) {
                     Ok(n) => n,
                     Err(source) => {
                         self.decoding = Decoding::Failed;
@@ -333,8 +335,8 @@ impl<F: Read> Read for Source<HuffmanLiteral, F> {
     where
         Self: 'v,
     {
-        let view = host.get_mut();
-        view.state.poll(&mut view.parent, cx, dst)
+        let view = host.project();
+        view.state.poll::<F, O>(view.parent, cx, dst)
     }
 }
 

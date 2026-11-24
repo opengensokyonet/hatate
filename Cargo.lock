@@ -44,6 +44,7 @@ dependencies = [
  "bytes",
  "nitori_call",
  "nitori_io",
+ "pin-project-lite",
  "snafu",
 ]
 
@@ -56,6 +57,7 @@ dependencies = [
  "hatate_wire_qpack",
  "nitori_call",
  "nitori_io",
+ "pin-project-lite",
  "sakuya_var_int",
  "snafu",
 ]

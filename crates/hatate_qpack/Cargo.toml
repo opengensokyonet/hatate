@@ -10,4 +10,5 @@ description = "QPACK field line representations for HTTP/3"
 bytes.workspace = true
 nitori_call.workspace = true
 nitori_io.workspace = true
+pin-project-lite.workspace = true
 snafu.workspace = true

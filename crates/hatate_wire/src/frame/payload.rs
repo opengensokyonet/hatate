@@ -3,8 +3,8 @@
 //! [`FramePayload`] delimits a payload of a known length:
 //! `io.compose(&mut payload)` reads at most the rest of it from `io`, then
 //! answers EOF, so whoever consumes the payload cannot read the next frame.
-//! It passes on [`Read`] and [`ReadChunk`] and reports its exact remaining
-//! length ([`ExactLen`]). A stream that ends inside the payload is a
+//! It passes on [`Read`] and [`ReadChunk`], and [`Skip`] where the stream
+//! skips, and reports its exact remaining length ([`ExactLen`]). A stream that ends inside the payload is a
 //! truncated frame ([`PayloadError::Truncated`]), not an early EOF.
 use crate::error_code::{ErrorCode, ErrorCodeOf};
 use bytes::{Buf, BufMut};
@@ -14,8 +14,8 @@ use core::{
     pin::Pin,
     task::{Context, Poll, ready},
 };
-use nitori_call::{Compose, ReceiverFamily, ViewLoan};
-use nitori_io::{ExactLen, Read, ReadChunk};
+use nitori_call::{Compose, ReceiverFamily};
+use nitori_io::{ExactLen, Min, Read, ReadChunk, Skip};
 use snafu::Snafu;
 
 /// The part of a frame's payload not yet consumed. Compose it onto the
@@ -69,7 +69,7 @@ impl FramePayload {
 
     fn poll<'v, F: Read + 'v, O: BufMut + ?Sized>(
         &mut self,
-        parent: &mut ViewLoan<'v, F>,
+        parent: Pin<&mut F::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         destination: &mut O,
     ) -> Poll<Result<usize, PayloadError<F::Error>>> {
@@ -81,11 +81,7 @@ impl FramePayload {
         };
         let empty = destination.remaining_mut() == 0;
         let allowed = usize::try_from(self.remaining).unwrap_or(usize::MAX);
-        let result = ready!(parent.with(|view| F::poll_read(
-            view.into_pin(),
-            cx,
-            &mut destination.limit(allowed)
-        )));
+        let result = ready!(F::poll_read(parent, cx, &mut destination.limit(allowed)));
         match result {
             Ok(0) if !empty => {
                 self.failed = true;
@@ -170,10 +166,18 @@ impl<E> ErrorCodeOf<ErrorCode> for PayloadError<E> {
 /// The receiver family of a [`FramePayload`] composed onto a parent stream.
 pub struct PayloadSource<F>(PhantomData<fn(F) -> F>);
 
-/// The parent view and the payload state lent for one poll.
-pub struct PayloadView<'v, F: ReceiverFamily> {
-    parent: ViewLoan<'v, F>,
-    state: &'v mut FramePayload,
+pin_project_lite::pin_project! {
+    /// The view of a [`PayloadSource`]: the parent view, held by value, and
+    /// the payload state.
+    pub struct PayloadView<'v, F>
+    where
+        F: ReceiverFamily,
+        F: 'v,
+    {
+        #[pin]
+        parent: F::ReceiverView<'v>,
+        state: &'v mut FramePayload,
+    }
 }
 
 impl<F: ReceiverFamily> ReceiverFamily for PayloadSource<F> {
@@ -185,17 +189,13 @@ impl<F: ReceiverFamily> ReceiverFamily for PayloadSource<F> {
 
 impl<F: ReceiverFamily> Compose<F> for FramePayload {
     type Family = PayloadSource<F>;
-    fn compose<'v, 'p>(
-        self: Pin<&'v mut Self>,
-        parent: Pin<&'v mut F::ReceiverView<'p>>,
-    ) -> PayloadView<'v, F>
+    fn compose<'v>(self: Pin<&'v mut Self>, parent: F::ReceiverView<'v>) -> PayloadView<'v, F>
     where
-        F: 'p,
-        'p: 'v,
+        F: 'v,
         Self::Family: 'v,
     {
         PayloadView {
-            parent: ViewLoan::new(parent),
+            parent,
             state: self.get_mut(),
         }
     }
@@ -209,7 +209,7 @@ impl<F: ReceiverFamily> ExactLen for PayloadSource<F> {
     where
         Self: 'v,
     {
-        view.state.remaining
+        view.project().state.remaining
     }
 }
 
@@ -223,8 +223,8 @@ impl<F: Read> Read for PayloadSource<F> {
     where
         Self: 'v,
     {
-        let view = host.get_mut();
-        view.state.poll(&mut view.parent, cx, destination)
+        let view = host.project();
+        view.state.poll::<F, O>(view.parent, cx, destination)
     }
 }
 
@@ -238,8 +238,8 @@ impl<F: ReadChunk> ReadChunk for PayloadSource<F> {
     where
         Self: 'v,
     {
-        let view = host.get_mut();
-        let state = &mut view.state;
+        let view = host.project();
+        let state = view.state;
         if state.failed {
             return Poll::Ready(Err(PayloadError::Failed));
         }
@@ -250,15 +250,76 @@ impl<F: ReadChunk> ReadChunk for PayloadSource<F> {
             .ok()
             .and_then(NonZeroUsize::new)
             .map_or(maximum, |remaining| remaining.min(maximum));
-        let result = ready!(view.parent.with(|parent| F::poll_read_chunk(
-            parent.into_pin(),
-            cx,
-            allowed
-        )));
+        let result = ready!(F::poll_read_chunk(view.parent, cx, allowed));
         match result {
             Ok(Some(chunk)) => {
                 state.consume(chunk.remaining());
                 Poll::Ready(Ok(Some(chunk)))
+            }
+            Ok(None) => {
+                state.failed = true;
+                Poll::Ready(Err(PayloadError::Truncated { missing }))
+            }
+            Err(source) => {
+                state.failed = true;
+                Poll::Ready(Err(PayloadError::Host { source }))
+            }
+        }
+    }
+}
+
+/// The smaller of a caller's maximum and the rest of the payload, as one
+/// maximum for the parent.
+#[derive(Clone)]
+struct PayloadMaximum<M>(M, u64);
+
+impl<C, M: Min<C, Output = C>> Min<C> for PayloadMaximum<M>
+where
+    u64: Min<C, Output = C>,
+{
+    type Output = C;
+    fn min(self, rhs: C) -> C {
+        Min::min(self.0, Min::min(self.1, rhs))
+    }
+}
+
+/// Skips within the payload, answering EOF at its end without polling the
+/// stream, as reads do; a stream that ends inside the payload is a
+/// truncated frame. Each skip is bounded by the rest of the payload, so the
+/// count, in the stream's own `Count`, fits it.
+impl<F: Skip> Skip for PayloadSource<F>
+where
+    F::Count: Clone + Min<u64, Output = u64>,
+    u64: Min<F::Count, Output = F::Count>,
+{
+    type Count = F::Count;
+    fn poll_skip<'v, M: Min<F::Count, Output = F::Count> + Clone>(
+        host: Pin<&mut Self::ReceiverView<'v>>,
+        cx: &mut Context<'_>,
+        maximum: M,
+    ) -> Poll<Result<Option<F::Count>, Self::Error>>
+    where
+        Self: 'v,
+    {
+        let view = host.project();
+        let state = view.state;
+        if state.failed {
+            return Poll::Ready(Err(PayloadError::Failed));
+        }
+        let Some(missing) = NonZeroU64::new(state.remaining) else {
+            return Poll::Ready(Ok(None));
+        };
+        let result = ready!(F::poll_skip(
+            view.parent,
+            cx,
+            PayloadMaximum(maximum, state.remaining)
+        ));
+        match result {
+            Ok(Some(count)) => {
+                // invariant: the stream skipped at most the rest of the
+                // payload, so the minimum is the count itself.
+                state.remaining -= Min::min(count.clone(), state.remaining);
+                Poll::Ready(Ok(Some(count)))
             }
             Ok(None) => {
                 state.failed = true;
