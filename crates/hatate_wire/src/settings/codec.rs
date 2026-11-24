@@ -1,10 +1,16 @@
 //! Reading settings one at a time, and writing a SETTINGS frame.
-use super::{Http2SettingIdentifier, Setting, UnknownSetting, set::SettingsSet};
+use super::{
+    Http2SettingIdentifier, Http2SettingIdentifierError, Setting, UnknownSetting, set::SettingsSet,
+};
 use crate::{
     error_code::ErrorCode,
     frame::{
         FrameWidths, Http3FrameType,
-        codec::{WriteFrameHeadError, WriteFrameHeadExt as _},
+        codec::{
+            FrameLengthError, WriteFrameHeadError, WriteFrameHeadExt as _, length_field,
+            payload_integer_error_code,
+        },
+        payload::PayloadError,
     },
     parts::PartsError,
 };
@@ -13,7 +19,7 @@ use core::{future::poll_fn, task::Poll};
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::{ExactLen, prelude::*};
 use sakuya_var_int::{
-    VarInt, VarIntField, VarIntWidthError,
+    VarInt, VarIntField,
     call::{ReadVarIntError, ReadVarIntFieldExt as _, WriteVarIntError, WriteVarIntFieldExt as _},
 };
 use snafu::{ResultExt, Snafu};
@@ -99,7 +105,9 @@ where
         .await
         .context(read_setting_error::IdentifierSnafu)?;
     if let Some(identifier) = Http2SettingIdentifier::of(identifier.get()) {
-        return Err(ReadSettingError::Http2Identifier { identifier });
+        return Err(ReadSettingError::Http2Identifier {
+            source: Http2SettingIdentifierError::new(identifier),
+        });
     }
     let value = io
         .read_var_int_field::<VarInt>()
@@ -136,10 +144,10 @@ pub enum ReadSettingError<E, V> {
         source: ReadVarIntError<E>,
     },
     /// The identifier is one HTTP/2 left behind.
-    #[snafu(display("received HTTP/2 setting {identifier:?}"))]
+    #[snafu(display("received a setting identifier of HTTP/2"))]
     Http2Identifier {
         /// The identifier received.
-        identifier: Http2SettingIdentifier,
+        source: Http2SettingIdentifierError,
     },
     /// The part that claims the identifier rejects the value.
     #[snafu(display("invalid setting value"))]
@@ -155,18 +163,19 @@ pub enum ReadSettingError<E, V> {
     },
 }
 
-impl<E, V> ReadSettingError<E, V> {
-    /// The connection error this failure calls for: H3_FRAME_ERROR when the
-    /// payload ends inside a setting ([RFC 9114 §7.1]), H3_SETTINGS_ERROR
-    /// for a setting that is not valid ([RFC 9114 §7.2.4]). `None` when the
-    /// stream failed.
+impl<E, V> ReadSettingError<PayloadError<E>, V> {
+    /// The connection error this failure calls for, when the payload was
+    /// read through a [`FramePayload`](crate::frame::payload::FramePayload):
+    /// H3_FRAME_ERROR when the payload or the stream ends inside a setting
+    /// ([RFC 9114 §7.1]), H3_SETTINGS_ERROR for a setting that is not valid
+    /// ([RFC 9114 §7.2.4]). `None` when the stream failed.
     ///
     /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
     /// [RFC 9114 §7.2.4]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4
     pub fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Identifier { source } | Self::Value { source } => {
-                source.is_incomplete().then_some(ErrorCode::H3_FRAME_ERROR)
+                payload_integer_error_code(source)
             }
             Self::Http2Identifier { .. } | Self::Rejected { .. } | Self::Duplicate { .. } => {
                 Some(ErrorCode::H3_SETTINGS_ERROR)
@@ -189,8 +198,9 @@ impl<T> SettingsFrame<T> {
     ///
     /// # Errors
     ///
-    /// [`SettingsFrameError`] if an identifier occurs twice or the Length
-    /// does not fit its width.
+    /// [`SettingsFrameError`] if an identifier occurs twice, an unknown
+    /// setting has an identifier that a part of `S` claims, or the Length
+    /// cannot be written at its width.
     pub fn new<S: SettingsSet<Setting = T>>(
         settings: Vec<Setting<T>>,
         widths: FrameWidths,
@@ -198,6 +208,13 @@ impl<T> SettingsFrame<T> {
         let mut length = 0u64;
         for (index, setting) in settings.iter().enumerate() {
             let (identifier, value) = fields::<S>(setting);
+            if matches!(setting, Setting::Unknown(_))
+                && S::identifier_of(identifier.get()).is_some()
+            {
+                return Err(SettingsFrameError::ClaimedIdentifier {
+                    identifier: identifier.get(),
+                });
+            }
             if settings[..index]
                 .iter()
                 .any(|earlier| fields::<S>(earlier).0.get() == identifier.get())
@@ -208,9 +225,8 @@ impl<T> SettingsFrame<T> {
             }
             length += (identifier.encoded_len() + value.encoded_len()) as u64;
         }
-        let length = VarInt::new(length).map_err(|_| SettingsFrameError::LengthOutOfRange)?;
-        let length = VarIntField::new(length, widths.length_width())
-            .context(settings_frame_error::LengthWidthSnafu)?;
+        let length = length_field(length, 0, widths.length_width())
+            .context(settings_frame_error::LengthSnafu)?;
         Ok(Self {
             widths,
             length,
@@ -253,14 +269,18 @@ pub enum SettingsFrameError {
         /// The repeated identifier.
         source: DuplicateSettingError,
     },
-    /// The payload is longer than a variable-length integer can state.
-    #[snafu(display("SETTINGS payload length exceeds 2^62 - 1"))]
-    LengthOutOfRange,
-    /// The Length does not fit its width.
-    #[snafu(display("SETTINGS length does not fit its width"))]
-    LengthWidth {
-        /// The length and the width.
-        source: VarIntWidthError,
+    /// An unknown setting has an identifier that a part of the list claims,
+    /// whose value that part would check; read back, it is a known setting.
+    #[snafu(display("unknown setting has the claimed identifier {}", identifier.get()))]
+    ClaimedIdentifier {
+        /// The identifier.
+        identifier: VarInt,
+    },
+    /// The Length cannot state the payload.
+    #[snafu(display("could not encode SETTINGS length"))]
+    Length {
+        /// Why the Length cannot be written.
+        source: FrameLengthError,
     },
 }
 

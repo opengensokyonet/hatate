@@ -1,7 +1,9 @@
-//! Reading and writing frame heads, and writing frames whose payload comes
-//! from a source.
+//! Reading and writing frame heads, writing frames whose payload comes
+//! from a source, reading the Push ID of a PUSH_PROMISE, and discarding a
+//! payload.
 use super::{
-    FrameHead, FrameType, FrameWidths, Http2FrameType, Http3FrameType, PushId, set::FrameSet,
+    FrameHead, FrameType, FrameWidths, Http2FrameType, Http2FrameTypeError, Http3FrameType, PushId,
+    payload::PayloadError, set::FrameSet,
 };
 use crate::error_code::ErrorCode;
 use core::{future::poll_fn, marker::PhantomData, num::NonZeroU64, task::Poll};
@@ -36,7 +38,9 @@ pub async fn read_frame_head<S: FrameSet, F: Read, A: ReceiverAccess<Family = F>
     };
     let value = type_field.get();
     if let Some(frame_type) = Http2FrameType::of(value) {
-        return Err(ReadFrameHeadError::Http2Type { frame_type });
+        return Err(ReadFrameHeadError::Http2Type {
+            source: Http2FrameTypeError::new(frame_type),
+        });
     }
     let length = io
         .read_var_int_field::<VarInt>()
@@ -55,7 +59,8 @@ pub async fn read_frame_head<S: FrameSet, F: Read, A: ReceiverAccess<Family = F>
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum ReadFrameHeadError<E> {
-    /// The Type could not be read after its first byte.
+    /// The Type could not be read: the stream failed, or ended after the
+    /// first byte of the Type.
     #[snafu(display("could not read frame type"))]
     Type {
         /// The failure of reading the integer.
@@ -68,10 +73,10 @@ pub enum ReadFrameHeadError<E> {
         source: ReadVarIntError<E>,
     },
     /// The type is one HTTP/2 defines and HTTP/3 does not.
-    #[snafu(display("received HTTP/2 frame type {frame_type:?}"))]
+    #[snafu(display("received a frame type of HTTP/2"))]
     Http2Type {
         /// The type received.
-        frame_type: Http2FrameType,
+        source: Http2FrameTypeError,
     },
 }
 
@@ -101,13 +106,19 @@ impl<E> ReadFrameHeadError<E> {
 ///
 /// # Errors
 ///
-/// [`WriteFrameHeadError`]; bytes accepted before the failure stay written.
+/// [`WriteFrameHeadError`]. A type of HTTP/2 is reported before anything
+/// is written; bytes accepted before a later failure stay written.
 #[call(sync)]
 pub async fn write_frame_head<F: Write, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     type_field: VarIntField<VarInt>,
     length: VarIntField<VarInt>,
 ) -> Result<(), WriteFrameHeadError<F::Error>> {
+    if let Some(frame_type) = Http2FrameType::of(type_field.get()) {
+        return Err(WriteFrameHeadError::Http2Type {
+            source: Http2FrameTypeError::new(frame_type),
+        });
+    }
     io.write_var_int_field(type_field)
         .await
         .context(write_frame_head_error::TypeSnafu)?;
@@ -120,6 +131,13 @@ pub async fn write_frame_head<F: Write, A: ReceiverAccess<Family = F>>(
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum WriteFrameHeadError<E> {
+    /// The type is one HTTP/2 defines and HTTP/3 does not, which must not
+    /// be sent.
+    #[snafu(display("cannot send a frame type of HTTP/2"))]
+    Http2Type {
+        /// The type given.
+        source: Http2FrameTypeError,
+    },
     /// The Type could not be written.
     #[snafu(display("could not write frame type"))]
     Type {
@@ -138,14 +156,14 @@ pub enum WriteFrameHeadError<E> {
 /// or the frame of a type this crate does not read. The Length is the
 /// exact length `payload` reports, at `length_width`.
 ///
-/// Returns the length of the payload. The frame type is not checked: write
-/// the types of RFC 9114 with [`Http3FrameType::value`].
+/// Returns the length of the payload. Write the types of RFC 9114 with
+/// [`Http3FrameType::value`]; a type of HTTP/2 is rejected.
 ///
 /// # Errors
 ///
-/// [`WritePayloadFrameError`]. A Length that cannot be written is reported
-/// before anything is written; a failure after that leaves the stream
-/// inside the frame.
+/// [`WritePayloadFrameError`]. A Length that cannot be written and a type
+/// of HTTP/2 are reported before anything is written; a failure after that
+/// leaves the stream inside the frame.
 #[call(sync)]
 pub async fn write_payload_frame<
     R: Read + ExactLen,
@@ -161,13 +179,42 @@ pub async fn write_payload_frame<
 where
     <R as ExactLen>::Length: TryInto<u64>,
 {
-    let length = exact_length(payload).await?;
-    let length_field = length_field(length, 0, length_width)?;
+    let length = exact_length(payload)
+        .await
+        .context(write_payload_frame_error::LengthSnafu)?;
+    let length_field =
+        length_field(length, 0, length_width).context(write_payload_frame_error::LengthSnafu)?;
     io.write_frame_head(type_field, length_field)
         .await
         .context(write_payload_frame_error::HeadSnafu)?;
-    transfer(io, payload, length).await?;
+    copy_payload(io, payload, length)
+        .await
+        .context(write_payload_frame_error::PayloadSnafu)?;
     Ok(length)
+}
+
+/// Failures of [`write_payload_frame`].
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum WritePayloadFrameError<R, W> {
+    /// The Length cannot state the payload.
+    #[snafu(display("could not encode frame length"))]
+    Length {
+        /// Why the Length cannot be written.
+        source: FrameLengthError,
+    },
+    /// The head could not be written.
+    #[snafu(display("could not write frame head"))]
+    Head {
+        /// The failure of writing the head.
+        source: WriteFrameHeadError<W>,
+    },
+    /// The payload could not be copied from its source.
+    #[snafu(display("could not write frame payload"))]
+    Payload {
+        /// The failure of copying it.
+        source: CopyPayloadError<R, W>,
+    },
 }
 
 /// Writes a PUSH_PROMISE frame: `push_id`, then the encoded field section
@@ -176,8 +223,9 @@ where
 ///
 /// # Errors
 ///
-/// As [`write_payload_frame`]; [`WritePayloadFrameError::PushId`] if the
-/// push ID cannot be written.
+/// [`WritePushPromiseFrameError`]. A Length that cannot be written is
+/// reported before anything is written; a failure after that leaves the
+/// stream inside the frame.
 #[call(sync)]
 pub async fn write_push_promise_frame<
     R: Read + ExactLen,
@@ -189,100 +237,44 @@ pub async fn write_push_promise_frame<
     section: &mut P,
     widths: FrameWidths,
     push_id: VarIntField<PushId>,
-) -> Result<(), WritePayloadFrameError<R::Error, F::Error>>
+) -> Result<(), WritePushPromiseFrameError<R::Error, F::Error>>
 where
     <R as ExactLen>::Length: TryInto<u64>,
 {
-    let section_length = exact_length(section).await?;
+    let section_length = exact_length(section)
+        .await
+        .context(write_push_promise_frame_error::LengthSnafu)?;
     let length_field = length_field(
         section_length,
         push_id.encoded_len() as u64,
         widths.length_width(),
-    )?;
+    )
+    .context(write_push_promise_frame_error::LengthSnafu)?;
     let type_field = VarIntField::new(Http3FrameType::PushPromise.value(), widths.type_width())
         .expect("every width holds the frame type 0x05");
     io.write_frame_head(type_field, length_field)
         .await
-        .context(write_payload_frame_error::HeadSnafu)?;
+        .context(write_push_promise_frame_error::HeadSnafu)?;
     io.write_var_int_field(push_id)
         .await
-        .context(write_payload_frame_error::PushIdSnafu)?;
-    transfer(io, section, section_length).await
+        .context(write_push_promise_frame_error::PushIdSnafu)?;
+    copy_payload(io, section, section_length)
+        .await
+        .context(write_push_promise_frame_error::SectionSnafu)
 }
 
-/// The exact remaining length of `source`.
-async fn exact_length<R: Read + ExactLen, P: ReceiverAccess<Family = R>, W>(
-    source: &mut P,
-) -> Result<u64, WritePayloadFrameError<R::Error, W>>
-where
-    <R as ExactLen>::Length: TryInto<u64>,
-{
-    let length =
-        poll_fn(|cx| source.poll_access(cx, |mut view, _| Poll::Ready(view.remaining_len()))).await;
-    length
-        .try_into()
-        .map_err(|_| WritePayloadFrameError::LengthOutOfRange)
-}
-
-/// The Length field for `length` bytes from the source after `prefix`
-/// bytes of fields.
-fn length_field<R, W>(
-    length: u64,
-    prefix: u64,
-    width: VarIntWidth,
-) -> Result<VarIntField<VarInt>, WritePayloadFrameError<R, W>> {
-    let total = length
-        .checked_add(prefix)
-        .and_then(|total| VarInt::new(total).ok())
-        .ok_or(WritePayloadFrameError::LengthOutOfRange)?;
-    VarIntField::new(total, width).context(write_payload_frame_error::LengthWidthSnafu)
-}
-
-/// Copies exactly `length` bytes from `source` to `io`.
-async fn transfer<
-    R: Read,
-    P: ReceiverAccess<Family = R>,
-    F: Write,
-    A: ReceiverAccess<Family = F>,
->(
-    io: &mut A,
-    source: &mut P,
-    length: u64,
-) -> Result<(), WritePayloadFrameError<R::Error, F::Error>> {
-    let mut remaining = length;
-    let mut buffer = [0; 1024];
-    while let Some(missing) = NonZeroU64::new(remaining) {
-        let request = remaining.min(buffer.len() as u64) as usize;
-        let count = source
-            .read(&mut &mut buffer[..request])
-            .await
-            .context(write_payload_frame_error::ReadSnafu)?;
-        if count == 0 {
-            return Err(WritePayloadFrameError::ShortSource { missing });
-        }
-        remaining -= count as u64;
-        io.write_all(&buffer[..count])
-            .await
-            .context(write_payload_frame_error::SendSnafu)?;
-    }
-    Ok(())
-}
-
-/// Failures of [`write_payload_frame`] and [`write_push_promise_frame`].
+/// Failures of [`write_push_promise_frame`].
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-pub enum WritePayloadFrameError<R, W> {
-    /// The payload is longer than a variable-length integer can state.
-    #[snafu(display("frame payload length exceeds 2^62 - 1"))]
-    LengthOutOfRange,
-    /// The Length does not fit the requested width.
-    #[snafu(display("frame length does not fit its width"))]
-    LengthWidth {
-        /// The length and the width.
-        source: VarIntWidthError,
+pub enum WritePushPromiseFrameError<R, W> {
+    /// The Length cannot state the push ID and the field section.
+    #[snafu(display("could not encode PUSH_PROMISE length"))]
+    Length {
+        /// Why the Length cannot be written.
+        source: FrameLengthError,
     },
     /// The head could not be written.
-    #[snafu(display("could not write frame head"))]
+    #[snafu(display("could not write PUSH_PROMISE head"))]
     Head {
         /// The failure of writing the head.
         source: WriteFrameHeadError<W>,
@@ -293,6 +285,33 @@ pub enum WritePayloadFrameError<R, W> {
         /// The failure of writing the integer.
         source: WriteVarIntError<W>,
     },
+    /// The field section could not be copied from its source.
+    #[snafu(display("could not write PUSH_PROMISE field section"))]
+    Section {
+        /// The failure of copying it.
+        source: CopyPayloadError<R, W>,
+    },
+}
+
+/// The Length of a frame cannot be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
+#[snafu(module)]
+pub enum FrameLengthError {
+    /// The payload is longer than a variable-length integer can state.
+    #[snafu(display("frame payload length exceeds 2^62 - 1"))]
+    OutOfRange,
+    /// The Length does not fit the requested width.
+    #[snafu(display("frame length does not fit its width"))]
+    Width {
+        /// The length and the width.
+        source: VarIntWidthError,
+    },
+}
+
+/// Copying the bytes of a payload from its source to the stream failed.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum CopyPayloadError<R, W> {
     /// The source ended before the length it reported.
     #[snafu(display("frame payload source ended with {missing} bytes missing"))]
     ShortSource {
@@ -305,10 +324,150 @@ pub enum WritePayloadFrameError<R, W> {
         /// The source's error.
         source: R,
     },
-    /// The payload could not be written.
+    /// The bytes could not be written.
     #[snafu(display("could not write frame payload"))]
     Send {
         /// The failure and the bytes accepted in this write.
         source: WriteAllError<W>,
     },
+}
+
+/// The exact remaining length of `source`.
+async fn exact_length<R: Read + ExactLen, P: ReceiverAccess<Family = R>>(
+    source: &mut P,
+) -> Result<u64, FrameLengthError>
+where
+    <R as ExactLen>::Length: TryInto<u64>,
+{
+    let length =
+        poll_fn(|cx| source.poll_access(cx, |mut view, _| Poll::Ready(view.remaining_len()))).await;
+    // A length that does not fit a u64 exceeds 2^62 - 1 too.
+    length.try_into().map_err(|_| FrameLengthError::OutOfRange)
+}
+
+/// The Length field for `length` bytes from the source after `prefix`
+/// bytes of fields.
+pub(crate) fn length_field(
+    length: u64,
+    prefix: u64,
+    width: VarIntWidth,
+) -> Result<VarIntField<VarInt>, FrameLengthError> {
+    let total = length
+        .checked_add(prefix)
+        .and_then(|total| VarInt::new(total).ok())
+        .ok_or(FrameLengthError::OutOfRange)?;
+    VarIntField::new(total, width).context(frame_length_error::WidthSnafu)
+}
+
+/// Copies exactly `length` bytes from `source` to `io`.
+async fn copy_payload<
+    R: Read,
+    P: ReceiverAccess<Family = R>,
+    F: Write,
+    A: ReceiverAccess<Family = F>,
+>(
+    io: &mut A,
+    source: &mut P,
+    length: u64,
+) -> Result<(), CopyPayloadError<R::Error, F::Error>> {
+    let mut remaining = length;
+    let mut buffer = [0; 1024];
+    while let Some(missing) = NonZeroU64::new(remaining) {
+        let request = remaining.min(buffer.len() as u64) as usize;
+        let count = source
+            .read(&mut &mut buffer[..request])
+            .await
+            .context(copy_payload_error::ReadSnafu)?;
+        if count == 0 {
+            return Err(CopyPayloadError::ShortSource { missing });
+        }
+        // invariant: a read into a slice of `request` bytes fills at most
+        // `request`, which is at most `remaining`.
+        remaining = u64::try_from(count)
+            .ok()
+            .and_then(|count| remaining.checked_sub(count))
+            .expect("a read fills at most its destination");
+        io.write_all(&buffer[..count])
+            .await
+            .context(copy_payload_error::SendSnafu)?;
+    }
+    Ok(())
+}
+
+/// Reads the Push ID at the start of the payload of a PUSH_PROMISE frame
+/// ([RFC 9114 §7.2.5]). The encoded field section follows it, to the end of
+/// the payload.
+///
+/// `io` is the payload, a [`FramePayload`](super::payload::FramePayload)
+/// composed onto the request stream.
+///
+/// # Errors
+///
+/// [`ReadPushPromisePushIdError`]; its `error_code` gives the connection
+/// error it calls for.
+///
+/// [RFC 9114 §7.2.5]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.5
+#[call(sync)]
+pub async fn read_push_promise_push_id<F: Read, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+) -> Result<VarIntField<PushId>, ReadPushPromisePushIdError<F::Error>> {
+    io.read_var_int_field::<PushId>()
+        .await
+        .context(ReadPushPromisePushIdSnafu)
+}
+
+/// The Push ID of a PUSH_PROMISE could not be read: the payload ended
+/// before it, or the stream failed.
+#[derive(Debug, Snafu)]
+#[snafu(display("could not read the push ID of PUSH_PROMISE"))]
+pub struct ReadPushPromisePushIdError<E> {
+    source: ReadVarIntError<E>,
+}
+
+impl<E> ReadPushPromisePushIdError<E> {
+    /// The failure of reading the integer.
+    pub const fn read_error(&self) -> &ReadVarIntError<E> {
+        &self.source
+    }
+}
+
+impl<E> ReadPushPromisePushIdError<PayloadError<E>> {
+    /// The connection error this failure calls for: H3_FRAME_ERROR when the
+    /// payload is shorter than the Push ID, or the stream ended inside the
+    /// frame ([RFC 9114 §7.1]). `None` when the stream failed.
+    ///
+    /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+    pub fn error_code(&self) -> Option<ErrorCode> {
+        payload_integer_error_code(&self.source)
+    }
+}
+
+/// The connection error for a failure reading an integer from a frame
+/// payload: H3_FRAME_ERROR when the payload or the stream ended inside it.
+pub(crate) fn payload_integer_error_code<E>(
+    error: &ReadVarIntError<PayloadError<E>>,
+) -> Option<ErrorCode> {
+    if error.is_incomplete() {
+        return Some(ErrorCode::H3_FRAME_ERROR);
+    }
+    error.host_error().and_then(PayloadError::error_code)
+}
+
+/// Reads and discards the rest of a source, such as the payload of a frame
+/// of an unknown type, and returns how many bytes it discarded.
+///
+/// # Errors
+///
+/// The source's error; the bytes read before it stay consumed.
+#[call(sync)]
+pub async fn discard<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> Result<u64, F::Error> {
+    let mut buffer = [0; 256];
+    let mut discarded = 0u64;
+    loop {
+        let count = io.read(&mut &mut buffer[..]).await?;
+        if count == 0 {
+            return Ok(discarded);
+        }
+        discarded += count as u64;
+    }
 }

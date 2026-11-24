@@ -24,14 +24,10 @@ fn read(mut input: &[u8]) -> HeadResult {
 }
 
 fn var_int(value: u64, width: VarIntWidth) -> Vec<u8> {
-    let mut wire = Vec::new();
-    wire.sync_write_frame_head_unpin(
-        VarIntField::new(VarInt::new(value).unwrap(), width).unwrap(),
-        VarIntField::shortest(VarInt::from_u32(0)),
-    )
-    .unwrap();
-    wire.pop();
-    wire
+    let (bytes, len) = VarIntField::new(VarInt::new(value).unwrap(), width)
+        .unwrap()
+        .to_encoding();
+    bytes[..len].to_vec()
 }
 
 #[test]
@@ -101,7 +97,7 @@ fn http2_types_are_a_frame_unexpected_error() {
             wire.push(0);
             let error = read(&wire).unwrap_err();
             assert!(
-                matches!(&error, ReadFrameHeadError::Http2Type { frame_type: found } if *found == frame_type),
+                matches!(&error, ReadFrameHeadError::Http2Type { source } if source.frame_type() == frame_type),
                 "{error:?}"
             );
             assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_UNEXPECTED));

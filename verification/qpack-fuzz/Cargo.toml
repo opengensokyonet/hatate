@@ -71,3 +71,10 @@ path = "fuzz_targets/wire_frames.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "wire_streams"
+path = "fuzz_targets/wire_streams.rs"
+test = false
+doc = false
+bench = false

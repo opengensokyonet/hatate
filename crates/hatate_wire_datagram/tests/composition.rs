@@ -382,3 +382,34 @@ fn frame_types_and_stream_types_of_the_extensions_are_none() {
         StreamType::Unknown(VarInt::from_u32(0x08))
     );
 }
+
+#[test]
+fn an_unknown_setting_cannot_take_the_identifier_of_a_part_of_the_list() {
+    use hatate_wire::settings::{UnknownSetting, codec::SettingsFrameError};
+    fn unknown<T>(identifier: u32) -> Setting<T> {
+        Setting::Unknown(
+            UnknownSetting::new(
+                VarIntField::new(VarInt::from_u32(identifier), VarIntWidth::Two).unwrap(),
+                VarIntField::shortest(VarInt::from_u32(0)),
+            )
+            .unwrap(),
+        )
+    }
+    // SETTINGS_H3_DATAGRAM and SETTINGS_ENABLE_CONNECT_PROTOCOL are claimed
+    // when their parts are in the list, and free when they are not.
+    for identifier in [0x33, 0x08] {
+        let error = SettingsFrame::new::<All>(vec![unknown(identifier)], FrameWidths::SHORTEST)
+            .unwrap_err();
+        assert!(
+            matches!(&error, SettingsFrameError::ClaimedIdentifier { identifier: found }
+                if found.get() == u64::from(identifier)),
+            "{error:?}"
+        );
+        SettingsFrame::new::<Http3Only>(vec![unknown(identifier)], FrameWidths::SHORTEST).unwrap();
+    }
+    let only_datagram = SettingsFrame::new::<HList![hatate_wire::Part, hatate_wire_datagram::Part]>(
+        vec![unknown(0x08)],
+        FrameWidths::SHORTEST,
+    );
+    assert!(only_datagram.is_ok());
+}

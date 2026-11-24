@@ -32,9 +32,9 @@ pub struct Part;
 /// The identifier SETTINGS_ENABLE_CONNECT_PROTOCOL (0x08), the only one this
 /// part claims.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct EnableConnectProtocol;
+pub struct EnableConnectProtocolSettingIdentifier;
 
-impl EnableConnectProtocol {
+impl EnableConnectProtocolSettingIdentifier {
     /// The identifier on the wire.
     pub const VALUE: VarInt = VarInt::from_u32(0x08);
 }
@@ -92,10 +92,15 @@ impl EnableConnectProtocolSetting {
     }
 }
 
-/// A SETTINGS_ENABLE_CONNECT_PROTOCOL value other than 0 or 1
-/// ([RFC 8441 §3]); a connection error of type H3_SETTINGS_ERROR.
+/// A SETTINGS_ENABLE_CONNECT_PROTOCOL value other than 0 or 1.
+///
+/// [RFC 8441 §3] requires the value to be 0 or 1 and says nothing of a
+/// receiver that gets another; this crate rejects it as a connection error
+/// of type H3_SETTINGS_ERROR, which RFC 9114 defines for a SETTINGS frame
+/// whose contents are invalid ([RFC 9114 §8.1]).
 ///
 /// [RFC 8441 §3]: https://www.rfc-editor.org/rfc/rfc8441.html#section-3
+/// [RFC 9114 §8.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-8.1
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
 #[snafu(display("SETTINGS_ENABLE_CONNECT_PROTOCOL is {} rather than 0 or 1", value.get()))]
 pub struct EnableConnectProtocolValueError {
@@ -110,39 +115,46 @@ impl EnableConnectProtocolValueError {
 }
 
 impl SettingsPart for Part {
-    type Identifier = EnableConnectProtocol;
+    type Identifier = EnableConnectProtocolSettingIdentifier;
     type Setting = EnableConnectProtocolSetting;
     type ValueError = EnableConnectProtocolValueError;
     type Occurrences = bool;
     const SETTING_IDENTIFIERS: &'static ClaimedValues =
-        &ClaimedValues::new(&[EnableConnectProtocol::VALUE..=EnableConnectProtocol::VALUE]);
+        &ClaimedValues::new(&[EnableConnectProtocolSettingIdentifier::VALUE
+            ..=EnableConnectProtocolSettingIdentifier::VALUE]);
 
-    fn identifier_of(value: VarInt) -> Option<EnableConnectProtocol> {
-        (value == EnableConnectProtocol::VALUE).then_some(EnableConnectProtocol)
+    fn identifier_of(value: VarInt) -> Option<EnableConnectProtocolSettingIdentifier> {
+        (value == EnableConnectProtocolSettingIdentifier::VALUE)
+            .then_some(EnableConnectProtocolSettingIdentifier)
     }
 
     fn setting_of(
-        _identifier: EnableConnectProtocol,
+        _identifier: EnableConnectProtocolSettingIdentifier,
         identifier_width: VarIntWidth,
         value: VarIntField<VarInt>,
     ) -> Result<EnableConnectProtocolSetting, EnableConnectProtocolValueError> {
         EnableConnectProtocolSetting::with_widths(identifier_width, value)
     }
 
-    fn identifier(_setting: &EnableConnectProtocolSetting) -> EnableConnectProtocol {
-        EnableConnectProtocol
+    fn identifier(
+        _setting: &EnableConnectProtocolSetting,
+    ) -> EnableConnectProtocolSettingIdentifier {
+        EnableConnectProtocolSettingIdentifier
     }
 
     fn fields(
         setting: &EnableConnectProtocolSetting,
     ) -> (VarIntField<VarInt>, VarIntField<VarInt>) {
         // invariant: every width holds 0x08.
-        let identifier = VarIntField::new(EnableConnectProtocol::VALUE, setting.identifier_width)
-            .expect("every width holds the identifier 0x08");
+        let identifier = VarIntField::new(
+            EnableConnectProtocolSettingIdentifier::VALUE,
+            setting.identifier_width,
+        )
+        .expect("every width holds the identifier 0x08");
         (identifier, setting.value)
     }
 
-    fn record(occurrences: &mut bool, _identifier: EnableConnectProtocol) -> bool {
+    fn record(occurrences: &mut bool, _identifier: EnableConnectProtocolSettingIdentifier) -> bool {
         !core::mem::replace(occurrences, true)
     }
 }

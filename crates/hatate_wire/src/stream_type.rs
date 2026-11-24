@@ -201,7 +201,10 @@ pub enum Http3StreamType {
     /// [RFC 9114 §6.2.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
     Control,
     /// A push stream (0x01, [RFC 9114 §6.2.2]), which a server opens; its
-    /// Push ID follows the type.
+    /// Push ID follows the type. Read it as a field of
+    /// [`PushId`](crate::frame::PushId) with
+    /// [`sakuya_var_int::call::read_var_int_field`]; what a stream that
+    /// ends inside it calls for is for the connection to decide.
     ///
     /// [RFC 9114 §6.2.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.2
     Push,

@@ -23,12 +23,11 @@
 use crate::{Role, registry::ClaimedValues};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 use set::{FrameKind, StreamKind};
+use snafu::Snafu;
 
 #[allow(missing_docs)] // The call macro also generates operation and extension trait items.
 pub mod codec;
-#[allow(missing_docs)]
 pub mod control;
-#[allow(missing_docs)]
 pub mod payload;
 pub mod set;
 
@@ -159,6 +158,29 @@ impl Http2FrameType {
     }
 }
 
+/// A frame type that HTTP/2 defines and HTTP/3 does not, which must not be
+/// sent and is a connection error of type H3_FRAME_UNEXPECTED when
+/// received ([RFC 9114 §7.2.8]).
+///
+/// [RFC 9114 §7.2.8]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
+#[snafu(display("frame type {frame_type:?} is one that HTTP/2 left behind"))]
+pub struct Http2FrameTypeError {
+    frame_type: Http2FrameType,
+}
+
+impl Http2FrameTypeError {
+    /// The error for `frame_type`.
+    pub const fn new(frame_type: Http2FrameType) -> Self {
+        Self { frame_type }
+    }
+
+    /// The frame type.
+    pub const fn frame_type(&self) -> Http2FrameType {
+        self.frame_type
+    }
+}
+
 /// The values of [`Http2FrameType`]: no part claims them.
 pub(crate) static HTTP2_FRAME_TYPES: ClaimedValues = ClaimedValues::new(&[
     VarInt::from_u32(0x02)..=VarInt::from_u32(0x02),
@@ -198,7 +220,10 @@ impl From<PushId> for VarInt {
 }
 
 /// The widths of the Type and Length of a frame whose Length the payload
-/// determines. Both hold any value such a frame of RFC 9114 can have.
+/// determines. Every width holds the Type of a frame of RFC 9114 and the
+/// Length of a CANCEL_PUSH, GOAWAY or MAX_PUSH_ID; the Length of a SETTINGS
+/// or PUSH_PROMISE frame may not fit, which building or writing the frame
+/// reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameWidths {
     type_width: VarIntWidth,

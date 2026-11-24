@@ -1,6 +1,9 @@
 //! Walk a stream of HTTP/3 frames with the parts of HTTP/3, HTTP Datagrams and
-//! Extended CONNECT: heads, SETTINGS, the integer frames, and the rest
-//! discarded. Every frame read whole is written back and must equal its bytes.
+//! Extended CONNECT: heads, SETTINGS, the integer frames, PUSH_PROMISE (its
+//! Push ID, then the rest of the payload), and the payload of every other
+//! frame, which is collected. Every frame read whole is written back (the
+//! collected ones through `write_payload_frame` and
+//! `write_push_promise_frame`) and must equal its bytes.
 //!
 //! The first byte sets how the stream arrives: its low four bits plus one are
 //! the bytes given per read, and its high four bits the period of a
@@ -21,11 +24,14 @@ use hatate_wire::{
     frame::{
         FrameType, Http3FrameType,
         codec::ReadFrameHeadExt as _,
-        control::{
+        codec::{
+            ReadPushPromisePushIdExt as _, WritePayloadFrameHostExt as _,
+            WritePushPromiseFrameHostExt as _,
+        },
+        control::codec::{
             ReadCancelPushFrameExt as _, ReadGoawayFrameExt as _, ReadMaxPushIdFrameExt as _,
             WriteCancelPushFrameExt as _, WriteGoawayFrameExt as _, WriteMaxPushIdFrameExt as _,
         },
-        payload::DiscardExt as _,
     },
     settings::codec::{
         ReadSettingExt as _, SettingsFrame, SettingsFrameError, WriteSettingsFrameExt as _,
@@ -96,6 +102,23 @@ macro_rules! position {
                 .await;
         $wire.len() - remaining.try_into().unwrap_or(0)
     }};
+}
+
+/// The rest of `payload`, read from the stream `io`; `None` if reading failed.
+async fn collect<F: Read, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    payload: &mut hatate_wire::frame::payload::FramePayload,
+) -> Option<Vec<u8>> {
+    let mut source = io.compose(payload);
+    let mut bytes = Vec::new();
+    loop {
+        let mut buffer = [0; 64];
+        match source.read(&mut &mut buffer[..]).await {
+            Ok(0) => return Some(bytes),
+            Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Reads every frame of `wire` from `io`, writes each one it read whole to
@@ -191,12 +214,51 @@ async fn walk<
                 };
                 whole = true;
             }
-            _ => {
-                let mut source = io.compose(&mut payload);
-                match source.discard().await {
-                    Ok(discarded) => assert_eq!(discarded, length),
-                    Err(_) => return,
+            FrameType::Known(Coproduct::Inl(Http3FrameType::PushPromise)) => {
+                let push_id = {
+                    let mut source = io.compose(&mut payload);
+                    match source.read_push_promise_push_id().await {
+                        Ok(push_id) => push_id,
+                        Err(_) => return,
+                    }
+                };
+                let Some(section) = collect(io, &mut payload).await else {
+                    return;
+                };
+                if payload.finish().is_err() {
+                    return;
                 }
+                let end = position!(io, wire);
+                let mut again = (Vec::<u8>::new(), &section[..]);
+                let Ok(()) = again
+                    .write_push_promise_frame_unpin(widths, push_id)
+                    .await
+                else {
+                    panic!("a PUSH_PROMISE frame was not written");
+                };
+                assert_eq!(again.0, &wire[start..end]);
+                continue;
+            }
+            _ => {
+                // DATA, HEADERS and the frames of types no part claims.
+                let Some(bytes) = collect(io, &mut payload).await else {
+                    return;
+                };
+                assert_eq!(bytes.len() as u64, length);
+                if payload.finish().is_err() {
+                    return;
+                }
+                let end = position!(io, wire);
+                let mut again = (Vec::<u8>::new(), &bytes[..]);
+                match again
+                    .write_payload_frame_unpin(head.type_field(), widths.length_width())
+                    .await
+                {
+                    Ok(written) => assert_eq!(written, length),
+                    Err(error) => panic!("a frame of the payload was not written: {error}"),
+                }
+                assert_eq!(again.0, &wire[start..end]);
+                continue;
             }
         }
         if payload.finish().is_err() {

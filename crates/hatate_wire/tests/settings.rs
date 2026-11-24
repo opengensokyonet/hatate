@@ -165,7 +165,7 @@ fn identifiers_of_http2_are_a_settings_error() {
         ] {
             let error = read(&payload).unwrap_err();
             assert!(
-                matches!(&error, ReadSettingError::Http2Identifier { identifier } if *identifier == expected),
+                matches!(&error, ReadSettingError::Http2Identifier { source } if source.identifier() == expected),
                 "{error:?}"
             );
             assert_eq!(error.error_code(), Some(ErrorCode::H3_SETTINGS_ERROR));
@@ -227,7 +227,7 @@ fn a_payload_that_ends_between_the_pair_is_a_frame_error() {
 }
 
 #[test]
-fn a_stream_that_ends_inside_the_payload_has_no_connection_error_of_its_own() {
+fn a_stream_that_ends_inside_the_payload_is_a_frame_error() {
     let wire = [0x04, 0x04, 0x06, 0x01];
     let error = (&wire[..])
         .sync_read_settings_unpin(&mut RejectKnownDuplicates::<Parts>::new())
@@ -237,7 +237,7 @@ fn a_stream_that_ends_inside_the_payload_has_no_connection_error_of_its_own() {
             if matches!(source.host_error(), Some(PayloadError::Truncated { .. }))),
         "{error:?}"
     );
-    assert_eq!(error.error_code(), None);
+    assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
 }
 
 #[test]
@@ -438,7 +438,7 @@ fn a_length_that_does_not_fit_its_width_is_refused() {
     let many = settings(30);
     let error = built(many.clone(), FrameWidths::SHORTEST).unwrap_err();
     assert!(
-        matches!(error, SettingsFrameError::LengthWidth { .. }),
+        matches!(error, SettingsFrameError::Length { .. }),
         "{error:?}"
     );
     let wide = built(many, FrameWidths::new(VarIntWidth::One, VarIntWidth::Two)).unwrap();
@@ -455,7 +455,7 @@ fn unknown_settings_cannot_be_the_identifiers_of_http2() {
                 value_field(identifier, VarIntWidth::One),
                 value_field(0, VarIntWidth::One)
             )
-            .is_none()
+            .is_err_and(|error| error.identifier().value().get() == u64::from(identifier))
         );
     }
     assert!(
@@ -463,7 +463,7 @@ fn unknown_settings_cannot_be_the_identifiers_of_http2() {
             value_field(0, VarIntWidth::One),
             value_field(0, VarIntWidth::One)
         )
-        .is_some()
+        .is_ok()
     );
 }
 
@@ -481,4 +481,98 @@ fn a_pending_between_every_byte_changes_nothing() {
     assert_eq!(settings.unwrap(), expected);
     assert!(pending >= wire.len() - 1, "{pending}");
     assert_eq!(host.rest(), [0xff]);
+}
+
+#[test]
+fn an_unknown_setting_cannot_take_an_identifier_a_part_claims() {
+    let unknown = |identifier: u32, width| {
+        Setting::Unknown(
+            UnknownSetting::new(
+                value_field(identifier, width),
+                value_field(0, VarIntWidth::One),
+            )
+            .unwrap(),
+        )
+    };
+    // MAX_FIELD_SECTION_SIZE and the two settings of QPACK, in any width.
+    for identifier in [0x01, 0x06, 0x07] {
+        for width in [VarIntWidth::Two, VarIntWidth::Four, VarIntWidth::Eight] {
+            let error = built(vec![unknown(identifier, width)], FrameWidths::SHORTEST).unwrap_err();
+            assert!(
+                matches!(&error, SettingsFrameError::ClaimedIdentifier { identifier: found }
+                    if found.get() == u64::from(identifier)),
+                "{error:?}"
+            );
+        }
+    }
+    // Where the claimed identifier comes second the first is fine.
+    let error = built(
+        vec![
+            unknown(0x22, VarIntWidth::One),
+            unknown(0x06, VarIntWidth::One),
+        ],
+        FrameWidths::SHORTEST,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, SettingsFrameError::ClaimedIdentifier { .. }),
+        "{error:?}"
+    );
+    // Identifiers that no part claims are accepted, reserved or not.
+    for identifier in [0x00, 0x08, 0x0a, 0x21, 0x33, 0x40] {
+        let frame = built(
+            vec![unknown(identifier, VarIntWidth::Two)],
+            FrameWidths::SHORTEST,
+        )
+        .unwrap_or_else(|error| panic!("{identifier:#x}: {error:?}"));
+        assert_eq!(frame.settings().len(), 1);
+    }
+}
+
+#[test]
+fn unknown_settings_of_http2_name_the_identifier() {
+    for (identifier, expected) in [
+        (0x02, Http2SettingIdentifier::EnablePush),
+        (0x03, Http2SettingIdentifier::MaxConcurrentStreams),
+        (0x04, Http2SettingIdentifier::InitialWindowSize),
+        (0x05, Http2SettingIdentifier::MaxFrameSize),
+    ] {
+        for width in VarIntWidth::ALL {
+            let error = UnknownSetting::new(
+                value_field(identifier, width),
+                value_field(0, VarIntWidth::One),
+            )
+            .unwrap_err();
+            assert_eq!(error.identifier(), expected);
+            assert_eq!(
+                error,
+                hatate_wire::settings::Http2SettingIdentifierError::new(expected)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_stream_that_ends_between_the_pair_is_a_frame_error_too() {
+    // After the identifier, inside the value, and inside a later identifier.
+    for wire in [
+        &[0x04, 0x02, 0x06, 0x80][..],
+        &[0x04, 0x05, 0x06, 0x01, 0x07, 0x80, 0x00][..],
+        &[0x04, 0x03, 0x06, 0x01, 0x40][..],
+    ] {
+        let error = (&wire[..])
+            .sync_read_settings_unpin(&mut RejectKnownDuplicates::<Parts>::new())
+            .unwrap_err();
+        assert!(
+            matches!(&error, ReadSettingError::Identifier { source } | ReadSettingError::Value { source }
+                if matches!(source.host_error(), Some(PayloadError::Truncated { .. }))
+                    || source.is_incomplete()),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.error_code(),
+            Some(ErrorCode::H3_FRAME_ERROR),
+            "{wire:x?}"
+        );
+    }
 }

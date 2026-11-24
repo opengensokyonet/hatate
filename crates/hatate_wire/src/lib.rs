@@ -12,13 +12,44 @@
 //! rejected, as HTTP/3 requires.
 //!
 //! The parts of a list must claim disjoint values, none of them reserved.
-//! [`assert_claims_valid!`] checks a list at compile time; reading with a
-//! list that fails the check does not build either.
+//! [`assert_claims_valid!`] checks a list at compile time, in `cargo check`
+//! as well. Reading with a list that fails the check does not build either,
+//! but that check is evaluated only when the reading code is generated for
+//! the list, so `cargo build` reports it and `cargo check` does not; write
+//! [`assert_claims_valid!`] where a list is defined.
+//!
+//! A list of two parts that claim the same frame type does not read, without
+//! `assert_claims_valid!`: looking up a type in it fails to build.
+//!
+//! ```compile_fail,E0080
+//! # use frunk_core::{HList, coproduct::CNil};
+//! # use hatate_wire::{frame::set::{FramePart, FrameSet}, registry::ClaimedValues};
+//! # use sakuya_var_int::VarInt;
+//! # /// A part that claims the frame type `FRAME`.
+//! # struct Claims<const FRAME: u32>;
+//! # impl<const FRAME: u32> FramePart for Claims<FRAME> {
+//! #     type Kind = CNil;
+//! #     type TypeValue = CNil;
+//! #     const FRAME_TYPES: &'static ClaimedValues =
+//! #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
+//! #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+//! #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+//! #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+//! # }
+//! type Parts = HList![Claims<0x0a>, Claims<0x0a>];
+//! let _ = <Parts as FrameSet>::type_value_of(VarInt::from_u32(0x0a));
+//! ```
 //!
 //! Reading follows the shape of every object on a byte stream: start (read
 //! the head and look it up), advance (consume the content through a
 //! composed source), finish (check that the content ended where it should).
 //! Every variable-length integer keeps the width it had on the wire.
+//!
+//! A read that is dropped before it completes keeps nothing of what it
+//! read: the bytes the stream handed over stay consumed, and a
+//! [`FramePayload`](frame::payload::FramePayload) counts them, but the
+//! integer or setting they began is lost. Reading cannot resume from there;
+//! the stream is inside the object.
 //!
 //! [RFC 9114]: https://www.rfc-editor.org/rfc/rfc9114.html
 //! [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9
@@ -62,9 +93,9 @@ pub enum Role {
 /// hatate_wire::assert_claims_valid!(HList![hatate_wire::Part]);
 /// ```
 ///
-/// Parts that claim a value twice, or a reserved one, do not pass. The parts
-/// below each claim one frame type (the setup is hidden); two that claim the
-/// same type fail to build:
+/// Parts that claim a value twice, or a reserved one, do not pass. The part
+/// below claims one frame type, one setting identifier and one stream type
+/// (the setup is hidden). Two that claim the same frame type fail to build:
 ///
 /// ```compile_fail,E0080
 /// # use core::convert::Infallible;
@@ -74,9 +105,12 @@ pub enum Role {
 /// #     stream_type::StreamTypePart,
 /// # };
 /// # use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
-/// # /// A part that claims the frame type `FRAME` and nothing else.
-/// # struct Frame<const FRAME: u32>;
-/// # impl<const FRAME: u32> FramePart for Frame<FRAME> {
+/// # /// A part that claims the frame type `FRAME`, the setting identifier
+/// # /// `SETTING` and the stream type `STREAM`, and nothing else.
+/// # struct Claims<const FRAME: u32, const SETTING: u32, const STREAM: u32>;
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
 /// #     type Kind = CNil;
 /// #     type TypeValue = CNil;
 /// #     const FRAME_TYPES: &'static ClaimedValues =
@@ -85,12 +119,15 @@ pub enum Role {
 /// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
 /// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
-/// # impl<const FRAME: u32> SettingsPart for Frame<FRAME> {
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> SettingsPart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
 /// #     type Identifier = CNil;
 /// #     type Setting = CNil;
 /// #     type ValueError = Infallible;
 /// #     type Occurrences = ();
-/// #     const SETTING_IDENTIFIERS: &'static ClaimedValues = &ClaimedValues::NONE;
+/// #     const SETTING_IDENTIFIERS: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(SETTING)..=VarInt::from_u32(SETTING)]);
 /// #     fn identifier_of(_value: VarInt) -> Option<CNil> { None }
 /// #     fn setting_of(
 /// #         identifier: CNil,
@@ -101,19 +138,21 @@ pub enum Role {
 /// #     fn fields(setting: &CNil) -> (VarIntField<VarInt>, VarIntField<VarInt>) { match *setting {} }
 /// #     fn record(_occurrences: &mut (), identifier: CNil) -> bool { match identifier {} }
 /// # }
-/// # impl<const FRAME: u32> StreamTypePart for Frame<FRAME> {
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
 /// #     type Kind = CNil;
 /// #     type TypeValue = CNil;
-/// #     const STREAM_TYPES: &'static ClaimedValues = &ClaimedValues::NONE;
+/// #     const STREAM_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
 /// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
 /// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
 /// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
-/// hatate_wire::assert_claims_valid!(HList![Frame<0x0a>, Frame<0x0a>]);
+/// hatate_wire::assert_claims_valid!(HList![Claims<0x0a, 0x0a, 0x0a>, Claims<0x0a, 0x0b, 0x0b>]);
 /// ```
 ///
-/// and so does a part that claims 0x21, a value of the form 0x1f × N + 0x21
-/// that the registry reserves:
+/// A frame type of the form 0x1f × N + 0x21, which the registry reserves, does not pass:
 ///
 /// ```compile_fail,E0080
 /// # use core::convert::Infallible;
@@ -123,9 +162,12 @@ pub enum Role {
 /// #     stream_type::StreamTypePart,
 /// # };
 /// # use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
-/// # /// A part that claims the frame type `FRAME` and nothing else.
-/// # struct Frame<const FRAME: u32>;
-/// # impl<const FRAME: u32> FramePart for Frame<FRAME> {
+/// # /// A part that claims the frame type `FRAME`, the setting identifier
+/// # /// `SETTING` and the stream type `STREAM`, and nothing else.
+/// # struct Claims<const FRAME: u32, const SETTING: u32, const STREAM: u32>;
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
 /// #     type Kind = CNil;
 /// #     type TypeValue = CNil;
 /// #     const FRAME_TYPES: &'static ClaimedValues =
@@ -134,12 +176,15 @@ pub enum Role {
 /// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
 /// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
-/// # impl<const FRAME: u32> SettingsPart for Frame<FRAME> {
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> SettingsPart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
 /// #     type Identifier = CNil;
 /// #     type Setting = CNil;
 /// #     type ValueError = Infallible;
 /// #     type Occurrences = ();
-/// #     const SETTING_IDENTIFIERS: &'static ClaimedValues = &ClaimedValues::NONE;
+/// #     const SETTING_IDENTIFIERS: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(SETTING)..=VarInt::from_u32(SETTING)]);
 /// #     fn identifier_of(_value: VarInt) -> Option<CNil> { None }
 /// #     fn setting_of(
 /// #         identifier: CNil,
@@ -150,15 +195,360 @@ pub enum Role {
 /// #     fn fields(setting: &CNil) -> (VarIntField<VarInt>, VarIntField<VarInt>) { match *setting {} }
 /// #     fn record(_occurrences: &mut (), identifier: CNil) -> bool { match identifier {} }
 /// # }
-/// # impl<const FRAME: u32> StreamTypePart for Frame<FRAME> {
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
 /// #     type Kind = CNil;
 /// #     type TypeValue = CNil;
-/// #     const STREAM_TYPES: &'static ClaimedValues = &ClaimedValues::NONE;
+/// #     const STREAM_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
 /// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
 /// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
 /// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
-/// hatate_wire::assert_claims_valid!(HList![Frame<0x21>]);
+/// hatate_wire::assert_claims_valid!(HList![Claims<0x21, 0x0a, 0x0a>]);
+/// ```
+///
+/// Nor does a frame type of HTTP/2 that HTTP/3 left behind (0x02):
+///
+/// ```compile_fail,E0080
+/// # use core::convert::Infallible;
+/// # use frunk_core::{HList, coproduct::CNil};
+/// # use hatate_wire::{
+/// #     frame::set::FramePart, registry::ClaimedValues, settings::set::SettingsPart,
+/// #     stream_type::StreamTypePart,
+/// # };
+/// # use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
+/// # /// A part that claims the frame type `FRAME`, the setting identifier
+/// # /// `SETTING` and the stream type `STREAM`, and nothing else.
+/// # struct Claims<const FRAME: u32, const SETTING: u32, const STREAM: u32>;
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Kind = CNil;
+/// #     type TypeValue = CNil;
+/// #     const FRAME_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
+/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+/// # }
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> SettingsPart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Identifier = CNil;
+/// #     type Setting = CNil;
+/// #     type ValueError = Infallible;
+/// #     type Occurrences = ();
+/// #     const SETTING_IDENTIFIERS: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(SETTING)..=VarInt::from_u32(SETTING)]);
+/// #     fn identifier_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn setting_of(
+/// #         identifier: CNil,
+/// #         _identifier_width: VarIntWidth,
+/// #         _value: VarIntField<VarInt>,
+/// #     ) -> Result<CNil, Infallible> { match identifier {} }
+/// #     fn identifier(setting: &CNil) -> CNil { match *setting {} }
+/// #     fn fields(setting: &CNil) -> (VarIntField<VarInt>, VarIntField<VarInt>) { match *setting {} }
+/// #     fn record(_occurrences: &mut (), identifier: CNil) -> bool { match identifier {} }
+/// # }
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Kind = CNil;
+/// #     type TypeValue = CNil;
+/// #     const STREAM_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
+/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+/// # }
+/// hatate_wire::assert_claims_valid!(HList![Claims<0x02, 0x0a, 0x0a>]);
+/// ```
+///
+/// Setting identifiers have reserved values too: 0x00,
+///
+/// ```compile_fail,E0080
+/// # use core::convert::Infallible;
+/// # use frunk_core::{HList, coproduct::CNil};
+/// # use hatate_wire::{
+/// #     frame::set::FramePart, registry::ClaimedValues, settings::set::SettingsPart,
+/// #     stream_type::StreamTypePart,
+/// # };
+/// # use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
+/// # /// A part that claims the frame type `FRAME`, the setting identifier
+/// # /// `SETTING` and the stream type `STREAM`, and nothing else.
+/// # struct Claims<const FRAME: u32, const SETTING: u32, const STREAM: u32>;
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Kind = CNil;
+/// #     type TypeValue = CNil;
+/// #     const FRAME_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
+/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+/// # }
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> SettingsPart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Identifier = CNil;
+/// #     type Setting = CNil;
+/// #     type ValueError = Infallible;
+/// #     type Occurrences = ();
+/// #     const SETTING_IDENTIFIERS: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(SETTING)..=VarInt::from_u32(SETTING)]);
+/// #     fn identifier_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn setting_of(
+/// #         identifier: CNil,
+/// #         _identifier_width: VarIntWidth,
+/// #         _value: VarIntField<VarInt>,
+/// #     ) -> Result<CNil, Infallible> { match identifier {} }
+/// #     fn identifier(setting: &CNil) -> CNil { match *setting {} }
+/// #     fn fields(setting: &CNil) -> (VarIntField<VarInt>, VarIntField<VarInt>) { match *setting {} }
+/// #     fn record(_occurrences: &mut (), identifier: CNil) -> bool { match identifier {} }
+/// # }
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Kind = CNil;
+/// #     type TypeValue = CNil;
+/// #     const STREAM_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
+/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+/// # }
+/// hatate_wire::assert_claims_valid!(HList![Claims<0x0a, 0x00, 0x0a>]);
+/// ```
+///
+/// the identifiers of HTTP/2 (0x02 to 0x05),
+///
+/// ```compile_fail,E0080
+/// # use core::convert::Infallible;
+/// # use frunk_core::{HList, coproduct::CNil};
+/// # use hatate_wire::{
+/// #     frame::set::FramePart, registry::ClaimedValues, settings::set::SettingsPart,
+/// #     stream_type::StreamTypePart,
+/// # };
+/// # use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
+/// # /// A part that claims the frame type `FRAME`, the setting identifier
+/// # /// `SETTING` and the stream type `STREAM`, and nothing else.
+/// # struct Claims<const FRAME: u32, const SETTING: u32, const STREAM: u32>;
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Kind = CNil;
+/// #     type TypeValue = CNil;
+/// #     const FRAME_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
+/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+/// # }
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> SettingsPart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Identifier = CNil;
+/// #     type Setting = CNil;
+/// #     type ValueError = Infallible;
+/// #     type Occurrences = ();
+/// #     const SETTING_IDENTIFIERS: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(SETTING)..=VarInt::from_u32(SETTING)]);
+/// #     fn identifier_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn setting_of(
+/// #         identifier: CNil,
+/// #         _identifier_width: VarIntWidth,
+/// #         _value: VarIntField<VarInt>,
+/// #     ) -> Result<CNil, Infallible> { match identifier {} }
+/// #     fn identifier(setting: &CNil) -> CNil { match *setting {} }
+/// #     fn fields(setting: &CNil) -> (VarIntField<VarInt>, VarIntField<VarInt>) { match *setting {} }
+/// #     fn record(_occurrences: &mut (), identifier: CNil) -> bool { match identifier {} }
+/// # }
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Kind = CNil;
+/// #     type TypeValue = CNil;
+/// #     const STREAM_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
+/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+/// # }
+/// hatate_wire::assert_claims_valid!(HList![Claims<0x0a, 0x04, 0x0a>]);
+/// ```
+///
+/// and an identifier that another part claims, such as SETTINGS_QPACK_BLOCKED_STREAMS (0x07) of [`Part`]:
+///
+/// ```compile_fail,E0080
+/// # use core::convert::Infallible;
+/// # use frunk_core::{HList, coproduct::CNil};
+/// # use hatate_wire::{
+/// #     frame::set::FramePart, registry::ClaimedValues, settings::set::SettingsPart,
+/// #     stream_type::StreamTypePart,
+/// # };
+/// # use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
+/// # /// A part that claims the frame type `FRAME`, the setting identifier
+/// # /// `SETTING` and the stream type `STREAM`, and nothing else.
+/// # struct Claims<const FRAME: u32, const SETTING: u32, const STREAM: u32>;
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Kind = CNil;
+/// #     type TypeValue = CNil;
+/// #     const FRAME_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
+/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+/// # }
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> SettingsPart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Identifier = CNil;
+/// #     type Setting = CNil;
+/// #     type ValueError = Infallible;
+/// #     type Occurrences = ();
+/// #     const SETTING_IDENTIFIERS: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(SETTING)..=VarInt::from_u32(SETTING)]);
+/// #     fn identifier_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn setting_of(
+/// #         identifier: CNil,
+/// #         _identifier_width: VarIntWidth,
+/// #         _value: VarIntField<VarInt>,
+/// #     ) -> Result<CNil, Infallible> { match identifier {} }
+/// #     fn identifier(setting: &CNil) -> CNil { match *setting {} }
+/// #     fn fields(setting: &CNil) -> (VarIntField<VarInt>, VarIntField<VarInt>) { match *setting {} }
+/// #     fn record(_occurrences: &mut (), identifier: CNil) -> bool { match identifier {} }
+/// # }
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Kind = CNil;
+/// #     type TypeValue = CNil;
+/// #     const STREAM_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
+/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+/// # }
+/// hatate_wire::assert_claims_valid!(HList![hatate_wire::Part, Claims<0x0a, 0x07, 0x0a>]);
+/// ```
+///
+/// A stream type that another part claims, such as the QPACK encoder stream (0x02) of [`Part`], does not pass:
+///
+/// ```compile_fail,E0080
+/// # use core::convert::Infallible;
+/// # use frunk_core::{HList, coproduct::CNil};
+/// # use hatate_wire::{
+/// #     frame::set::FramePart, registry::ClaimedValues, settings::set::SettingsPart,
+/// #     stream_type::StreamTypePart,
+/// # };
+/// # use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
+/// # /// A part that claims the frame type `FRAME`, the setting identifier
+/// # /// `SETTING` and the stream type `STREAM`, and nothing else.
+/// # struct Claims<const FRAME: u32, const SETTING: u32, const STREAM: u32>;
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Kind = CNil;
+/// #     type TypeValue = CNil;
+/// #     const FRAME_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
+/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+/// # }
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> SettingsPart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Identifier = CNil;
+/// #     type Setting = CNil;
+/// #     type ValueError = Infallible;
+/// #     type Occurrences = ();
+/// #     const SETTING_IDENTIFIERS: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(SETTING)..=VarInt::from_u32(SETTING)]);
+/// #     fn identifier_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn setting_of(
+/// #         identifier: CNil,
+/// #         _identifier_width: VarIntWidth,
+/// #         _value: VarIntField<VarInt>,
+/// #     ) -> Result<CNil, Infallible> { match identifier {} }
+/// #     fn identifier(setting: &CNil) -> CNil { match *setting {} }
+/// #     fn fields(setting: &CNil) -> (VarIntField<VarInt>, VarIntField<VarInt>) { match *setting {} }
+/// #     fn record(_occurrences: &mut (), identifier: CNil) -> bool { match identifier {} }
+/// # }
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Kind = CNil;
+/// #     type TypeValue = CNil;
+/// #     const STREAM_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
+/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+/// # }
+/// hatate_wire::assert_claims_valid!(HList![hatate_wire::Part, Claims<0x0a, 0x0a, 0x02>]);
+/// ```
+///
+/// Nor does a reserved stream type (0x21):
+///
+/// ```compile_fail,E0080
+/// # use core::convert::Infallible;
+/// # use frunk_core::{HList, coproduct::CNil};
+/// # use hatate_wire::{
+/// #     frame::set::FramePart, registry::ClaimedValues, settings::set::SettingsPart,
+/// #     stream_type::StreamTypePart,
+/// # };
+/// # use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
+/// # /// A part that claims the frame type `FRAME`, the setting identifier
+/// # /// `SETTING` and the stream type `STREAM`, and nothing else.
+/// # struct Claims<const FRAME: u32, const SETTING: u32, const STREAM: u32>;
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Kind = CNil;
+/// #     type TypeValue = CNil;
+/// #     const FRAME_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
+/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+/// # }
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> SettingsPart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Identifier = CNil;
+/// #     type Setting = CNil;
+/// #     type ValueError = Infallible;
+/// #     type Occurrences = ();
+/// #     const SETTING_IDENTIFIERS: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(SETTING)..=VarInt::from_u32(SETTING)]);
+/// #     fn identifier_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn setting_of(
+/// #         identifier: CNil,
+/// #         _identifier_width: VarIntWidth,
+/// #         _value: VarIntField<VarInt>,
+/// #     ) -> Result<CNil, Infallible> { match identifier {} }
+/// #     fn identifier(setting: &CNil) -> CNil { match *setting {} }
+/// #     fn fields(setting: &CNil) -> (VarIntField<VarInt>, VarIntField<VarInt>) { match *setting {} }
+/// #     fn record(_occurrences: &mut (), identifier: CNil) -> bool { match identifier {} }
+/// # }
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
+/// #     type Kind = CNil;
+/// #     type TypeValue = CNil;
+/// #     const STREAM_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
+/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
+/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
+/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
+/// # }
+/// hatate_wire::assert_claims_valid!(HList![Claims<0x0a, 0x0a, 0x21>]);
 /// ```
 ///
 /// The same parts pass when their claims are disjoint and unreserved:
@@ -171,9 +561,12 @@ pub enum Role {
 /// #     stream_type::StreamTypePart,
 /// # };
 /// # use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
-/// # /// A part that claims the frame type `FRAME` and nothing else.
-/// # struct Frame<const FRAME: u32>;
-/// # impl<const FRAME: u32> FramePart for Frame<FRAME> {
+/// # /// A part that claims the frame type `FRAME`, the setting identifier
+/// # /// `SETTING` and the stream type `STREAM`, and nothing else.
+/// # struct Claims<const FRAME: u32, const SETTING: u32, const STREAM: u32>;
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
 /// #     type Kind = CNil;
 /// #     type TypeValue = CNil;
 /// #     const FRAME_TYPES: &'static ClaimedValues =
@@ -182,12 +575,15 @@ pub enum Role {
 /// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
 /// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
-/// # impl<const FRAME: u32> SettingsPart for Frame<FRAME> {
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> SettingsPart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
 /// #     type Identifier = CNil;
 /// #     type Setting = CNil;
 /// #     type ValueError = Infallible;
 /// #     type Occurrences = ();
-/// #     const SETTING_IDENTIFIERS: &'static ClaimedValues = &ClaimedValues::NONE;
+/// #     const SETTING_IDENTIFIERS: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(SETTING)..=VarInt::from_u32(SETTING)]);
 /// #     fn identifier_of(_value: VarInt) -> Option<CNil> { None }
 /// #     fn setting_of(
 /// #         identifier: CNil,
@@ -198,15 +594,18 @@ pub enum Role {
 /// #     fn fields(setting: &CNil) -> (VarIntField<VarInt>, VarIntField<VarInt>) { match *setting {} }
 /// #     fn record(_occurrences: &mut (), identifier: CNil) -> bool { match identifier {} }
 /// # }
-/// # impl<const FRAME: u32> StreamTypePart for Frame<FRAME> {
+/// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
+/// #     for Claims<FRAME, SETTING, STREAM>
+/// # {
 /// #     type Kind = CNil;
 /// #     type TypeValue = CNil;
-/// #     const STREAM_TYPES: &'static ClaimedValues = &ClaimedValues::NONE;
+/// #     const STREAM_TYPES: &'static ClaimedValues =
+/// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
 /// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
 /// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
 /// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
-/// hatate_wire::assert_claims_valid!(HList![Frame<0x0a>, Frame<0x0b>]);
+/// hatate_wire::assert_claims_valid!(HList![hatate_wire::Part, Claims<0x0a, 0x0a, 0x0a>, Claims<0x0b, 0x0b, 0x0b>]);
 /// ```
 #[macro_export]
 macro_rules! assert_claims_valid {

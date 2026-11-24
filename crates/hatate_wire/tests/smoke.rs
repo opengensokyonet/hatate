@@ -3,7 +3,9 @@ use core::marker::PhantomData;
 use frunk_core::HList;
 use hatate_wire::{
     defaults::RejectKnownDuplicates,
-    frame::{FrameType, Http3FrameType, control::ReadGoawayFrameExt as _, payload::FramePayload},
+    frame::{
+        FrameType, Http3FrameType, control::codec::ReadGoawayFrameExt as _, payload::FramePayload,
+    },
     settings::{Setting, codec::ReadSettingExt as _},
 };
 use nitori_call::{ReceiverAccess, call};

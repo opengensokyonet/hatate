@@ -7,10 +7,11 @@ use common::Liar;
 use core::marker::PhantomData;
 use frunk_core::HList;
 use hatate_wire::frame::{
-    FrameType, FrameWidths, Http3FrameType, PushId,
+    FrameType, FrameWidths, Http2FrameType, Http3FrameType, PushId,
     codec::{
-        ReadFrameHeadHostExt as _, WritePayloadFrameError, WritePayloadFrameHostExt as _,
-        WritePushPromiseFrameHostExt as _,
+        CopyPayloadError, FrameLengthError, ReadFrameHeadHostExt as _, WriteFrameHeadError,
+        WriteFrameHeadHostExt as _, WritePayloadFrameError, WritePayloadFrameHostExt as _,
+        WritePushPromiseFrameError, WritePushPromiseFrameHostExt as _,
     },
 };
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
@@ -100,8 +101,9 @@ fn a_length_that_does_not_fit_its_width_is_reported_before_any_byte() {
         .sync_write_payload_frame_unpin(type_field(0x00, VarIntWidth::One), VarIntWidth::One)
         .unwrap_err();
     assert!(
-        matches!(&error, WritePayloadFrameError::LengthWidth { source }
-            if source.value().get() == 64 && source.width() == VarIntWidth::One),
+        matches!(&error, WritePayloadFrameError::Length {
+            source: FrameLengthError::Width { source }
+        } if source.value().get() == 64 && source.width() == VarIntWidth::One),
         "{error:?}"
     );
     assert!(hosts.0.is_empty());
@@ -122,7 +124,9 @@ fn a_source_shorter_than_its_reported_length_is_reported() {
         .sync_write_payload_frame_unpin(type_field(0x00, VarIntWidth::One), VarIntWidth::One)
         .unwrap_err();
     assert!(
-        matches!(&error, WritePayloadFrameError::ShortSource { missing } if missing.get() == 6),
+        matches!(&error, WritePayloadFrameError::Payload {
+            source: CopyPayloadError::ShortSource { missing }
+        } if missing.get() == 6),
         "{error:?}"
     );
     // The stream is inside the frame: the head and what the source had.
@@ -183,7 +187,9 @@ fn push_promise_counts_the_push_id_in_the_length() {
         .sync_write_push_promise_frame_unpin(widths, push_id)
         .unwrap_err();
     assert!(
-        matches!(&error, WritePayloadFrameError::LengthWidth { source } if source.value().get() == 64),
+        matches!(&error, WritePushPromiseFrameError::Length {
+            source: FrameLengthError::Width { source }
+        } if source.value().get() == 64),
         "{error:?}"
     );
     assert!(hosts.0.is_empty());
@@ -197,8 +203,70 @@ fn push_promise_with_a_short_source_reports_what_is_missing() {
         .sync_write_push_promise_frame_unpin(FrameWidths::SHORTEST, push_id)
         .unwrap_err();
     assert!(
-        matches!(&error, WritePayloadFrameError::ShortSource { missing } if missing.get() == 3),
+        matches!(&error, WritePushPromiseFrameError::Section {
+            source: CopyPayloadError::ShortSource { missing }
+        } if missing.get() == 3),
         "{error:?}"
     );
     assert_eq!(hosts.0, [0x05, 6, 1, 9, 9]);
+}
+
+const HTTP2_TYPES: [(u32, Http2FrameType); 4] = [
+    (0x02, Http2FrameType::Priority),
+    (0x06, Http2FrameType::Ping),
+    (0x08, Http2FrameType::WindowUpdate),
+    (0x09, Http2FrameType::Continuation),
+];
+
+#[test]
+fn a_frame_head_of_a_type_of_http2_is_refused_before_any_byte() {
+    for (value, frame_type) in HTTP2_TYPES {
+        for width in VarIntWidth::ALL {
+            let mut written = Vec::new();
+            let error = written
+                .sync_write_frame_head_unpin(
+                    type_field(value, width),
+                    VarIntField::shortest(VarInt::from_u32(0)),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&error, WriteFrameHeadError::Http2Type { source } if source.frame_type() == frame_type),
+                "{error:?}"
+            );
+            assert!(written.is_empty(), "{value:#x} {width:?}");
+        }
+    }
+    // The types next to them are written.
+    for value in [0x01, 0x03, 0x07, 0x0a] {
+        let mut written = Vec::new();
+        written
+            .sync_write_frame_head_unpin(
+                type_field(value, VarIntWidth::One),
+                VarIntField::shortest(VarInt::from_u32(0)),
+            )
+            .unwrap();
+        assert_eq!(written, [value as u8, 0]);
+    }
+}
+
+#[test]
+fn a_payload_frame_of_a_type_of_http2_is_refused_before_any_byte() {
+    let payload = b"payload";
+    for (value, frame_type) in HTTP2_TYPES {
+        for width in VarIntWidth::ALL {
+            let mut hosts = (Vec::new(), &payload[..]);
+            let error = hosts
+                .sync_write_payload_frame_unpin(type_field(value, width), VarIntWidth::One)
+                .unwrap_err();
+            assert!(
+                matches!(&error, WritePayloadFrameError::Head {
+                    source: WriteFrameHeadError::Http2Type { source }
+                } if source.frame_type() == frame_type),
+                "{error:?}"
+            );
+            assert!(hosts.0.is_empty(), "{value:#x} {width:?}");
+            // The source was not read either.
+            assert_eq!(hosts.1, &payload[..]);
+        }
+    }
 }

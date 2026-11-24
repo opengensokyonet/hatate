@@ -118,3 +118,26 @@ impl nitori_io::ExactLen for Liar<'_> {
         host.get_pin_mut().get_mut().claimed
     }
 }
+
+/// The error of a [`Broken`] stream.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Boom;
+
+/// A stream whose every read fails.
+pub struct Broken;
+
+nitori_call::family_receiver!(impl [] for Broken);
+
+impl nitori_io::Read for Broken {
+    type Error = Boom;
+    fn poll_read<'visit, B: BufMut + ?Sized>(
+        _host: Pin<&mut Self::ReceiverView<'visit>>,
+        _cx: &mut Context<'_>,
+        _dst: &mut B,
+    ) -> Poll<Result<usize, Self::Error>>
+    where
+        Self: 'visit,
+    {
+        Poll::Ready(Err(Boom))
+    }
+}

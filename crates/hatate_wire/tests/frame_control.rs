@@ -2,13 +2,15 @@
 //! CANCEL_PUSH, GOAWAY and MAX_PUSH_ID (RFC 9114 §7.2.3, §7.2.6, §7.2.7).
 mod common;
 
-use common::{Dribble, run};
+use common::{Broken, Dribble, run};
 use core::marker::PhantomData;
 use frunk_core::{HList, coproduct::Coproduct};
 use hatate_wire::{
     error_code::ErrorCode,
     frame::{
-        FrameType, FrameWidths, Http3FrameType, PushId, codec::ReadFrameHeadExt as _, control::*,
+        FrameType, FrameWidths, Http3FrameType, PushId,
+        codec::ReadFrameHeadExt as _,
+        control::{codec::*, *},
         payload::PayloadError,
     },
 };
@@ -222,7 +224,7 @@ fn bytes_after_the_integer_are_a_frame_error() {
 }
 
 #[test]
-fn a_stream_that_ends_inside_the_payload_has_no_connection_error_of_its_own() {
+fn a_stream_that_ends_inside_the_payload_is_a_frame_error() {
     let error = (&[0x07, 0x02, 0x40][..])
         .sync_read_goaway_unpin()
         .unwrap_err();
@@ -234,7 +236,7 @@ fn a_stream_that_ends_inside_the_payload_has_no_connection_error_of_its_own() {
         ),
         "{error:?}"
     );
-    assert_eq!(error.error_code(), None);
+    assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
 }
 
 #[test]
@@ -272,7 +274,71 @@ fn a_pending_between_every_byte_changes_nothing() {
     assert!(host.rest().is_empty());
 }
 
+/// Reads the integer of a GOAWAY from a payload of the stream.
+#[call(sync)]
+async fn goaway_of<F: Read, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    payload: &mut hatate_wire::frame::payload::FramePayload,
+) -> Result<GoawayFrame, ReadIntegerFrameError<PayloadError<F::Error>>> {
+    let mut source = io.compose(payload);
+    source.read_goaway_frame(FrameWidths::SHORTEST).await
+}
+
 #[test]
-fn the_error_type_names_the_payload_failure() {
-    let _: fn(ReadIntegerFrameError<E>) -> Option<ErrorCode> = |error| error.error_code();
+fn the_error_code_follows_the_failure_of_the_payload() {
+    use hatate_wire::frame::payload::FramePayload;
+    // A failing stream has no code of its own, and neither has the read
+    // after it.
+    let mut host = Broken;
+    let mut payload = FramePayload::new(1);
+    let (result, _) = run(host.goaway_of_unpin(&mut payload));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            ReadIntegerFrameError::Field { source }
+                if matches!(source.host_error(), Some(PayloadError::Host { .. }))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.error_code(), None);
+    let (result, _) = run(host.goaway_of_unpin(&mut payload));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            ReadIntegerFrameError::Field { source }
+                if matches!(source.host_error(), Some(PayloadError::Failed))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.error_code(), None);
+    // Bytes after the integer are a frame error, however many are counted.
+    let error = ReadIntegerFrameError::<E>::Trailing { remaining: None };
+    assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
+}
+
+#[test]
+fn a_stream_that_ends_inside_the_integer_of_each_frame_is_a_frame_error() {
+    for (bytes, name) in [
+        (&[0x03, 0x02, 0x40][..], "CANCEL_PUSH"),
+        (&[0x07, 0x04, 0x80, 0x00, 0x00][..], "GOAWAY"),
+        (&[0x0d, 0x08, 0xc0][..], "MAX_PUSH_ID"),
+    ] {
+        let error = match name {
+            "CANCEL_PUSH" => (&bytes[..])
+                .sync_read_cancel_push_unpin()
+                .unwrap_err()
+                .error_code(),
+            "GOAWAY" => (&bytes[..])
+                .sync_read_goaway_unpin()
+                .unwrap_err()
+                .error_code(),
+            _ => (&bytes[..])
+                .sync_read_max_push_id_unpin()
+                .unwrap_err()
+                .error_code(),
+        };
+        assert_eq!(error, Some(ErrorCode::H3_FRAME_ERROR), "{name}");
+    }
 }

@@ -24,17 +24,18 @@ cargo test --locked --workspace --all-targets --all-features
 cargo test --locked --workspace --doc
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
 cargo build --locked -p hatate_qpack -p hatate_wire -p hatate_wire_qpack -p hatate_wire_datagram -p hatate_wire_extended_connect --target x86_64-unknown-none
+for package in hatate_qpack hatate_wire hatate_wire_qpack hatate_wire_datagram hatate_wire_extended_connect; do cargo clippy --locked -p "$package" --no-default-features --target x86_64-unknown-none -- -D warnings; done
 ```
 
 ## Fuzzing
 
-The separate [verification/qpack-fuzz](verification/qpack-fuzz) workspace exercises the public QPACK APIs with cargo-fuzz and libFuzzer. The `integer` target compares decoding and byte consumption with a 128-bit reference calculation. The `huffman` target checks accepted wire encodings, segmented input and output bounds. The `field_line` target reads arbitrary wire sequences and constructs valid field lines to exercise the writer. The `static_section` target compares complete field sections against single-line decoding and independent size accounting. The `decoder_instruction` target checks decoder-stream dispatch, cursor movement, and wire limits. The `encoder_instruction` target compares staged reads and writes with in-memory decoding and independently framed payloads under wire and decoded limits. The `wire_frames` target reads HTTP/3 frames from segmented input and checks that every frame it reads completely is written back to the same bytes. The regular test suite also exhausts one- and two-octet Huffman payloads against an independent canonical-code decoder.
+The separate [verification/qpack-fuzz](verification/qpack-fuzz) workspace exercises the public QPACK APIs with cargo-fuzz and libFuzzer. The `integer` target compares decoding and byte consumption with a 128-bit reference calculation. The `huffman` target checks accepted wire encodings, segmented input and output bounds. The `field_line` target reads arbitrary wire sequences and constructs valid field lines to exercise the writer. The `static_section` target compares complete field sections against single-line decoding and independent size accounting. The `decoder_instruction` target checks decoder-stream dispatch, cursor movement, and wire limits. The `encoder_instruction` target compares staged reads and writes with in-memory decoding and independently framed payloads under wire and decoded limits. The `wire_frames` target reads HTTP/3 frames from segmented input and checks that every frame it reads completely is written back to the same bytes, including DATA, HEADERS, unknown frames and PUSH_PROMISE. The `wire_streams` target reads the Stream Type of a unidirectional stream from segmented input, and HTTP/3 datagrams, and checks both against an independent decoding of the first integer and against their written-back bytes. The regular test suite also exhausts one- and two-octet Huffman payloads against an independent canonical-code decoder.
 
 Cargo generates the verification workspace’s lockfile locally. With cargo-fuzz installed, run from the repository root. Use a writable corpus directory first so the checked-in seeds remain available for repeat runs.
 
 ```sh
 fuzz_dir=verification/qpack-fuzz
-for target in integer huffman field_line static_section decoder_instruction encoder_instruction wire_frames; do
+for target in integer huffman field_line static_section decoder_instruction encoder_instruction wire_frames wire_streams; do
     mkdir -p "$fuzz_dir/corpus/$target"
     cargo fuzz run --fuzz-dir "$fuzz_dir" "$target" "$fuzz_dir/corpus/$target" "$fuzz_dir/seeds/$target" -- -max_total_time=60
 done

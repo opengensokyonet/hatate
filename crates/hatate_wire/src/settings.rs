@@ -15,6 +15,7 @@
 use crate::registry::ClaimedValues;
 use hatate_wire_qpack::QpackSettingIdentifier;
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
+use snafu::Snafu;
 
 #[allow(missing_docs)] // The call macro also generates operation and extension trait items.
 pub mod codec;
@@ -41,12 +42,21 @@ pub struct UnknownSetting {
 impl UnknownSetting {
     /// The setting with `identifier` and `value`.
     ///
-    /// `None` if the identifier is one that HTTP/2 left behind
-    /// ([`Http2SettingIdentifier`]), which must not be sent.
-    pub fn new(identifier: VarIntField<VarInt>, value: VarIntField<VarInt>) -> Option<Self> {
+    /// Whether a list of parts claims the identifier is checked where the
+    /// setting is put in a frame
+    /// ([`SettingsFrame::new`](codec::SettingsFrame::new)).
+    ///
+    /// # Errors
+    ///
+    /// [`Http2SettingIdentifierError`] if the identifier is one that HTTP/2
+    /// left behind, which must not be sent.
+    pub fn new(
+        identifier: VarIntField<VarInt>,
+        value: VarIntField<VarInt>,
+    ) -> Result<Self, Http2SettingIdentifierError> {
         match Http2SettingIdentifier::of(identifier.get()) {
-            Some(_) => None,
-            None => Some(Self { identifier, value }),
+            Some(identifier) => Err(Http2SettingIdentifierError { identifier }),
+            None => Ok(Self { identifier, value }),
         }
     }
 
@@ -102,6 +112,29 @@ impl Http2SettingIdentifier {
             0x05 => Some(Self::MaxFrameSize),
             _ => None,
         }
+    }
+}
+
+/// A setting identifier that HTTP/2 defines without a counterpart in
+/// HTTP/3, which must not be sent and is a connection error of type
+/// H3_SETTINGS_ERROR when received ([RFC 9114 §7.2.4.1]).
+///
+/// [RFC 9114 §7.2.4.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
+#[snafu(display("setting identifier {identifier:?} is one that HTTP/2 left behind"))]
+pub struct Http2SettingIdentifierError {
+    identifier: Http2SettingIdentifier,
+}
+
+impl Http2SettingIdentifierError {
+    /// The error for `identifier`.
+    pub const fn new(identifier: Http2SettingIdentifier) -> Self {
+        Self { identifier }
+    }
+
+    /// The identifier.
+    pub const fn identifier(&self) -> Http2SettingIdentifier {
+        self.identifier
     }
 }
 

@@ -3,10 +3,14 @@
 mod common;
 
 use bytes::{Buf, Bytes};
-use common::{Dribble, run};
+use common::{Boom, Broken, Dribble, run};
 use core::{future::poll_fn, num::NonZeroUsize, task::Poll};
-use hatate_wire::frame::payload::{
-    DiscardExt as _, DiscardHostExt as _, FramePayload, PayloadError,
+use hatate_wire::{
+    error_code::ErrorCode,
+    frame::{
+        codec::{DiscardExt as _, DiscardHostExt as _},
+        payload::{FramePayload, PayloadError, UnfinishedPayloadError},
+    },
 };
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::{Read, ReadChunk, prelude::*};
@@ -170,8 +174,10 @@ fn a_stream_that_ends_inside_the_payload_is_truncated_and_then_failed() {
     let error = input.sync_read_some_unpin(&mut payload, 8).unwrap_err();
     assert!(matches!(error, PayloadError::Failed), "{error:?}");
     let unfinished = payload.finish().unwrap_err();
-    assert_eq!(unfinished.remaining().map(|n| n.get()), Some(3));
-    assert!(unfinished.failed());
+    assert!(
+        matches!(unfinished, UnfinishedPayloadError::Failed { remaining } if remaining.get() == 3),
+        "{unfinished:?}"
+    );
 }
 
 #[test]
@@ -189,7 +195,10 @@ fn truncation_is_reported_for_chunks_with_the_missing_count() {
         .sync_read_chunks_all_unpin(&mut payload, 8)
         .unwrap_err();
     assert!(matches!(error, PayloadError::Failed), "{error:?}");
-    assert!(payload.finish().unwrap_err().failed());
+    assert!(matches!(
+        payload.finish().unwrap_err(),
+        UnfinishedPayloadError::Failed { .. }
+    ));
 }
 
 #[test]
@@ -208,12 +217,16 @@ fn finish_checks_that_the_payload_was_read_to_its_end() {
     let mut input = &[1, 2, 3, 4][..];
     let mut payload = FramePayload::new(4);
     let error = payload.finish().unwrap_err();
-    assert_eq!(error.remaining().map(|n| n.get()), Some(4));
-    assert!(!error.failed());
+    assert!(
+        matches!(error, UnfinishedPayloadError::Unconsumed { remaining } if remaining.get() == 4)
+    );
+    assert_eq!(error.remaining().get(), 4);
     input.sync_read_some_unpin(&mut payload, 3).unwrap();
     let error = payload.finish().unwrap_err();
-    assert_eq!(error.remaining().map(|n| n.get()), Some(1));
-    assert!(!error.failed());
+    assert!(
+        matches!(error, UnfinishedPayloadError::Unconsumed { remaining } if remaining.get() == 1)
+    );
+    assert_eq!(error.remaining().get(), 1);
     input.sync_read_some_unpin(&mut payload, 3).unwrap();
     payload.finish().unwrap();
 }
@@ -266,4 +279,77 @@ fn a_pending_between_every_byte_changes_nothing() {
         result,
         Err(PayloadError::Truncated { missing }) if missing.get() == 2
     ));
+}
+
+#[test]
+fn only_a_truncated_payload_calls_for_a_connection_error() {
+    // The stream ended inside the payload: H3_FRAME_ERROR (RFC 9114 §7.1).
+    let mut input = &[1, 2][..];
+    let mut payload = FramePayload::new(5);
+    let error = input.sync_read_all_unpin(&mut payload).unwrap_err();
+    assert!(matches!(error, PayloadError::Truncated { .. }), "{error:?}");
+    assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
+
+    // A read after that failure repeats it without a code of its own: the
+    // first failure was the one to report.
+    let error = input.sync_read_all_unpin(&mut payload).unwrap_err();
+    assert!(matches!(error, PayloadError::Failed), "{error:?}");
+    assert_eq!(error.error_code(), None);
+
+    // A failing stream is the stream's to report.
+    let mut payload = FramePayload::new(5);
+    let mut host = Broken;
+    let (result, _) = run(host.read_some_unpin(&mut payload, 4));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, PayloadError::Host { source: Boom }),
+        "{error:?}"
+    );
+    assert_eq!(error.error_code(), None);
+    let (result, _) = run(host.read_some_unpin(&mut payload, 4));
+    assert_eq!(result.unwrap_err().error_code(), None);
+}
+
+#[test]
+fn an_unfinished_payload_says_whether_it_failed() {
+    // Not read: Unconsumed, with the length.
+    let mut input = &[1, 2, 3, 4][..];
+    let mut payload = FramePayload::new(4);
+    input.sync_read_some_unpin(&mut payload, 1).unwrap();
+    let error = payload.finish().unwrap_err();
+    assert_eq!(
+        error,
+        UnfinishedPayloadError::Unconsumed {
+            remaining: 3.try_into().unwrap()
+        }
+    );
+    assert_eq!(error.remaining().get(), 3);
+    assert_eq!(
+        error.to_string(),
+        "frame payload left with 3 bytes unconsumed"
+    );
+
+    // A failure of the stream: Failed, whatever was read before it.
+    let mut host = Broken;
+    let mut payload = FramePayload::new(4);
+    let _ = run(host.read_some_unpin(&mut payload, 4));
+    let error = payload.finish().unwrap_err();
+    assert_eq!(
+        error,
+        UnfinishedPayloadError::Failed {
+            remaining: 4.try_into().unwrap()
+        }
+    );
+    assert_eq!(error.remaining().get(), 4);
+    assert_eq!(
+        error.to_string(),
+        "frame payload failed with 4 bytes unread"
+    );
+
+    // A failure after the payload's bytes were all read does not exist, so
+    // a finished payload is Ok.
+    let mut input = &[1][..];
+    let mut payload = FramePayload::new(1);
+    input.sync_read_all_unpin(&mut payload).unwrap();
+    payload.finish().unwrap();
 }

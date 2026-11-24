@@ -71,16 +71,18 @@ fn writing_to_a_buffer_without_room_panics_like_buf_mut_put() {
 fn an_empty_input_has_no_quarter_stream_id() {
     let error = read_datagram(&[][..]).unwrap_err();
     assert!(
-        matches!(error, ReadVarIntFieldError::VarInt { .. }),
+        matches!(error.read_error(), ReadVarIntFieldError::VarInt { .. }),
         "{error:?}"
     );
+    assert_eq!(error.error_code(), H3_DATAGRAM_ERROR);
     // A cut Quarter Stream ID is the same failure.
     for wire in [&[0x40][..], &[0x80, 0, 0], &[0xc0, 0, 0, 0, 0, 0, 0]] {
         let error = read_datagram(wire).unwrap_err();
         assert!(
-            matches!(error, ReadVarIntFieldError::VarInt { .. }),
+            matches!(error.read_error(), ReadVarIntFieldError::VarInt { .. }),
             "{error:?}"
         );
+        assert_eq!(error.error_code(), H3_DATAGRAM_ERROR);
     }
 }
 
@@ -88,7 +90,8 @@ fn an_empty_input_has_no_quarter_stream_id() {
 fn a_quarter_stream_id_of_two_to_the_sixty_is_refused() {
     let wire = [0xd0, 0, 0, 0, 0, 0, 0, 0, 0xaa];
     let error = read_datagram(&wire[..]).unwrap_err();
-    let ReadVarIntFieldError::Value { value, source } = &error else {
+    assert_eq!(error.error_code(), H3_DATAGRAM_ERROR);
+    let ReadVarIntFieldError::Value { value, source } = error.read_error() else {
         panic!("{error:?}");
     };
     assert_eq!(value.get(), 1 << 60);
@@ -105,9 +108,10 @@ fn a_quarter_stream_id_of_two_to_the_sixty_is_refused() {
     // And the largest variable-length integer is refused.
     let error = read_datagram(&[0xff; 8][..]).unwrap_err();
     assert!(
-        matches!(error, ReadVarIntFieldError::Value { .. }),
+        matches!(error.read_error(), ReadVarIntFieldError::Value { .. }),
         "{error:?}"
     );
+    assert_eq!(error.error_code(), H3_DATAGRAM_ERROR);
 }
 
 #[test]

@@ -6,6 +6,7 @@
 //! It passes on [`Read`] and [`ReadChunk`] and reports its exact remaining
 //! length ([`ExactLen`]). A stream that ends inside the payload is a
 //! truncated frame ([`PayloadError::Truncated`]), not an early EOF.
+use crate::error_code::ErrorCode;
 use bytes::{Buf, BufMut};
 use core::{
     marker::PhantomData,
@@ -13,8 +14,8 @@ use core::{
     pin::Pin,
     task::{Context, Poll, ready},
 };
-use nitori_call::{Compose, ReceiverAccess, ReceiverFamily, ViewLoan, call};
-use nitori_io::{ExactLen, Read, ReadChunk, prelude::*};
+use nitori_call::{Compose, ReceiverFamily, ViewLoan};
+use nitori_io::{ExactLen, Read, ReadChunk};
 use snafu::Snafu;
 
 /// The part of a frame's payload not yet consumed. Compose it onto the
@@ -48,10 +49,22 @@ impl FramePayload {
     /// [`UnfinishedPayloadError`] if bytes remain or reading the payload
     /// failed; the stream is then inside this frame.
     pub fn finish(&self) -> Result<(), UnfinishedPayloadError> {
-        match (self.failed, NonZeroU64::new(self.remaining)) {
-            (false, None) => Ok(()),
-            (failed, remaining) => Err(UnfinishedPayloadError { remaining, failed }),
+        match NonZeroU64::new(self.remaining) {
+            None => Ok(()),
+            Some(remaining) if self.failed => Err(UnfinishedPayloadError::Failed { remaining }),
+            Some(remaining) => Err(UnfinishedPayloadError::Unconsumed { remaining }),
         }
+    }
+
+    /// Takes `count` consumed bytes off the remaining length.
+    fn consume(&mut self, count: usize) {
+        // invariant: the parent's contract in `nitori_io` bounds a read by
+        // the room of the destination and a chunk by the requested maximum,
+        // and both were limited to the remaining length.
+        self.remaining = u64::try_from(count)
+            .ok()
+            .and_then(|count| self.remaining.checked_sub(count))
+            .expect("the parent delivered at most the remaining length");
     }
 
     fn poll<'v, F: Read + 'v, O: BufMut + ?Sized>(
@@ -79,8 +92,7 @@ impl FramePayload {
                 Poll::Ready(Err(PayloadError::Truncated { missing }))
             }
             Ok(count) => {
-                // invariant: the parent filled at most the limited destination.
-                self.remaining -= count as u64;
+                self.consume(count);
                 Poll::Ready(Ok(count))
             }
             Err(source) => {
@@ -93,21 +105,28 @@ impl FramePayload {
 
 /// The payload was left before its end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
-#[snafu(display("frame payload left unfinished"))]
-pub struct UnfinishedPayloadError {
-    remaining: Option<NonZeroU64>,
-    failed: bool,
+#[snafu(module)]
+pub enum UnfinishedPayloadError {
+    /// Bytes of the payload were not consumed.
+    #[snafu(display("frame payload left with {remaining} bytes unconsumed"))]
+    Unconsumed {
+        /// The bytes not consumed.
+        remaining: NonZeroU64,
+    },
+    /// Reading the payload failed before its end.
+    #[snafu(display("frame payload failed with {remaining} bytes unread"))]
+    Failed {
+        /// The bytes not read.
+        remaining: NonZeroU64,
+    },
 }
 
 impl UnfinishedPayloadError {
-    /// The bytes of the payload not consumed, if any.
-    pub const fn remaining(&self) -> Option<NonZeroU64> {
-        self.remaining
-    }
-
-    /// Whether reading the payload failed.
-    pub const fn failed(&self) -> bool {
-        self.failed
+    /// The bytes of the payload not consumed.
+    pub const fn remaining(&self) -> NonZeroU64 {
+        match *self {
+            Self::Unconsumed { remaining } | Self::Failed { remaining } => remaining,
+        }
     }
 }
 
@@ -132,6 +151,21 @@ pub enum PayloadError<E> {
     /// Reading this payload has already failed.
     #[snafu(display("frame payload has already failed"))]
     Failed,
+}
+
+impl<E> PayloadError<E> {
+    /// The connection error this failure calls for: H3_FRAME_ERROR when the
+    /// stream ended inside the payload ([RFC 9114 §7.1]). `None` when the
+    /// stream failed, and for a read after a failure, whose first failure
+    /// was already reported.
+    ///
+    /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+    pub fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Truncated { .. } => Some(ErrorCode::H3_FRAME_ERROR),
+            Self::Host { .. } | Self::Failed => None,
+        }
+    }
 }
 
 /// The receiver family of a [`FramePayload`] composed onto a parent stream.
@@ -224,8 +258,7 @@ impl<F: ReadChunk> ReadChunk for PayloadSource<F> {
         )));
         match result {
             Ok(Some(chunk)) => {
-                // invariant: a chunk holds at most the requested maximum.
-                state.remaining -= chunk.remaining() as u64;
+                state.consume(chunk.remaining());
                 Poll::Ready(Ok(Some(chunk)))
             }
             Ok(None) => {
@@ -237,24 +270,5 @@ impl<F: ReadChunk> ReadChunk for PayloadSource<F> {
                 Poll::Ready(Err(PayloadError::Host { source }))
             }
         }
-    }
-}
-
-/// Reads and discards the rest of a source, such as the payload of a frame
-/// of an unknown type, and returns how many bytes it discarded.
-///
-/// # Errors
-///
-/// The source's error; the bytes read before it stay consumed.
-#[call(sync)]
-pub async fn discard<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> Result<u64, F::Error> {
-    let mut buffer = [0; 256];
-    let mut discarded = 0u64;
-    loop {
-        let count = io.read(&mut &mut buffer[..]).await?;
-        if count == 0 {
-            return Ok(discarded);
-        }
-        discarded += count as u64;
     }
 }

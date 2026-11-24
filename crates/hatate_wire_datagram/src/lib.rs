@@ -29,7 +29,7 @@ use sakuya_var_int::{
     VarInt, VarIntField, VarIntWidth,
     codec::{ReadVarIntFieldError, read_var_int_field, write_var_int_field},
 };
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 /// H3_DATAGRAM_ERROR (0x33): a datagram is malformed ([RFC 9297 §2.1]).
 ///
@@ -43,9 +43,9 @@ pub struct Part;
 /// The identifier SETTINGS_H3_DATAGRAM (0x33), the only one this part
 /// claims.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct H3Datagram;
+pub struct H3DatagramSettingIdentifier;
 
-impl H3Datagram {
+impl H3DatagramSettingIdentifier {
     /// The identifier on the wire.
     pub const VALUE: VarInt = VarInt::from_u32(0x33);
 }
@@ -123,37 +123,39 @@ impl H3DatagramValueError {
 }
 
 impl SettingsPart for Part {
-    type Identifier = H3Datagram;
+    type Identifier = H3DatagramSettingIdentifier;
     type Setting = H3DatagramSetting;
     type ValueError = H3DatagramValueError;
     type Occurrences = bool;
-    const SETTING_IDENTIFIERS: &'static ClaimedValues =
-        &ClaimedValues::new(&[H3Datagram::VALUE..=H3Datagram::VALUE]);
+    const SETTING_IDENTIFIERS: &'static ClaimedValues = &ClaimedValues::new(&[
+        H3DatagramSettingIdentifier::VALUE..=H3DatagramSettingIdentifier::VALUE,
+    ]);
 
-    fn identifier_of(value: VarInt) -> Option<H3Datagram> {
-        (value == H3Datagram::VALUE).then_some(H3Datagram)
+    fn identifier_of(value: VarInt) -> Option<H3DatagramSettingIdentifier> {
+        (value == H3DatagramSettingIdentifier::VALUE).then_some(H3DatagramSettingIdentifier)
     }
 
     fn setting_of(
-        _identifier: H3Datagram,
+        _identifier: H3DatagramSettingIdentifier,
         identifier_width: VarIntWidth,
         value: VarIntField<VarInt>,
     ) -> Result<H3DatagramSetting, H3DatagramValueError> {
         H3DatagramSetting::with_widths(identifier_width, value)
     }
 
-    fn identifier(_setting: &H3DatagramSetting) -> H3Datagram {
-        H3Datagram
+    fn identifier(_setting: &H3DatagramSetting) -> H3DatagramSettingIdentifier {
+        H3DatagramSettingIdentifier
     }
 
     fn fields(setting: &H3DatagramSetting) -> (VarIntField<VarInt>, VarIntField<VarInt>) {
         // invariant: every width holds 0x33.
-        let identifier = VarIntField::new(H3Datagram::VALUE, setting.identifier_width)
-            .expect("every width holds the identifier 0x33");
+        let identifier =
+            VarIntField::new(H3DatagramSettingIdentifier::VALUE, setting.identifier_width)
+                .expect("every width holds the identifier 0x33");
         (identifier, setting.value)
     }
 
-    fn record(occurrences: &mut bool, _identifier: H3Datagram) -> bool {
+    fn record(occurrences: &mut bool, _identifier: H3DatagramSettingIdentifier) -> bool {
         !core::mem::replace(occurrences, true)
     }
 }
@@ -307,17 +309,37 @@ impl<D> Datagram<D> {
 ///
 /// # Errors
 ///
-/// [`ReadVarIntFieldError`]: the payload is too short for the Quarter
-/// Stream ID, or the value exceeds 2^60 − 1. Both are connection errors of
-/// type [`H3_DATAGRAM_ERROR`].
-pub fn read_datagram<S: Buf>(
-    mut source: S,
-) -> Result<Datagram<S>, ReadVarIntFieldError<QuarterStreamIdError>> {
-    let quarter_stream_id = read_var_int_field(&mut source)?;
+/// [`ReadDatagramError`]: the payload is too short for the Quarter Stream
+/// ID, or the value exceeds 2^60 − 1.
+pub fn read_datagram<S: Buf>(mut source: S) -> Result<Datagram<S>, ReadDatagramError> {
+    let quarter_stream_id = read_var_int_field(&mut source).context(ReadDatagramSnafu)?;
     Ok(Datagram {
         quarter_stream_id,
         payload: source,
     })
+}
+
+/// The Quarter Stream ID of a datagram could not be read: the payload is too
+/// short for it, or it exceeds 2^60 − 1. Either is a connection error of
+/// type [`H3_DATAGRAM_ERROR`] ([RFC 9297 §2.1]).
+///
+/// [RFC 9297 §2.1]: https://www.rfc-editor.org/rfc/rfc9297.html#section-2.1
+#[derive(Debug, Snafu)]
+#[snafu(display("malformed HTTP/3 datagram"))]
+pub struct ReadDatagramError {
+    source: ReadVarIntFieldError<QuarterStreamIdError>,
+}
+
+impl ReadDatagramError {
+    /// The failure of reading the Quarter Stream ID.
+    pub const fn read_error(&self) -> &ReadVarIntFieldError<QuarterStreamIdError> {
+        &self.source
+    }
+
+    /// The connection error this failure calls for: [`H3_DATAGRAM_ERROR`].
+    pub const fn error_code(&self) -> ErrorCode {
+        H3_DATAGRAM_ERROR
+    }
 }
 
 /// Writes `datagram`: the Quarter Stream ID at its width, then the payload.
