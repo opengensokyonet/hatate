@@ -1,4 +1,5 @@
 //! Failures that come from one part of a list of parts.
+use crate::error_code::ErrorCodeOf;
 use core::{error::Error, fmt};
 use frunk_core::coproduct::{CNil, Coproduct};
 
@@ -36,6 +37,13 @@ impl<C: ErrorSum> fmt::Display for PartsError<C> {
 impl<C: ErrorSum> Error for PartsError<C> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.0.error().source()
+    }
+}
+
+/// The code of the part's failure.
+impl<X, C: ErrorCodeOf<X>> ErrorCodeOf<X> for PartsError<C> {
+    fn error_code(&self) -> Option<X> {
+        self.0.error_code()
     }
 }
 

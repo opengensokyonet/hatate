@@ -5,7 +5,7 @@ use core::{convert::Infallible, marker::PhantomData};
 use frunk_core::{HList, coproduct::Coproduct};
 use hatate_wire::{
     defaults::RejectKnownDuplicates,
-    error_code::ErrorCode,
+    error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
         FrameType, FrameWidths, Http3FrameType,
         codec::{ReadFrameHeadExt as _, ReadFrameHeadHostExt as _},

@@ -6,7 +6,7 @@ use common::{Dribble, run};
 use core::marker::PhantomData;
 use frunk_core::{HList, coproduct::Coproduct};
 use hatate_wire::{
-    error_code::ErrorCode,
+    error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
         FrameType, FrameWidths, Http3FrameType, PushId,
         codec::{

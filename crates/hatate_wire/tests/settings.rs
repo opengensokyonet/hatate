@@ -8,7 +8,7 @@ use frunk_core::{HList, coproduct::Coproduct};
 use hatate_wire::{
     Part,
     defaults::RejectKnownDuplicates,
-    error_code::ErrorCode,
+    error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
         FrameType, FrameWidths, Http3FrameType, codec::ReadFrameHeadExt as _, payload::PayloadError,
     },

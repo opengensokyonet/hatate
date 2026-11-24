@@ -22,8 +22,11 @@
 use bytes::{Buf, BufMut};
 use frunk_core::coproduct::CNil;
 use hatate_wire::{
-    error_code::ErrorCode, frame::set::FramePart, registry::ClaimedValues,
-    settings::set::SettingsPart, stream_type::StreamTypePart,
+    error_code::{ErrorCode, ErrorCodeOf},
+    frame::set::FramePart,
+    registry::ClaimedValues,
+    settings::set::SettingsPart,
+    stream_type::StreamTypePart,
 };
 use sakuya_var_int::{
     VarInt, VarIntField, VarIntWidth,
@@ -335,10 +338,12 @@ impl ReadDatagramError {
     pub const fn read_error(&self) -> &ReadVarIntFieldError<QuarterStreamIdError> {
         &self.source
     }
+}
 
-    /// The connection error this failure calls for: [`H3_DATAGRAM_ERROR`].
-    pub const fn error_code(&self) -> ErrorCode {
-        H3_DATAGRAM_ERROR
+/// Always [`H3_DATAGRAM_ERROR`].
+impl ErrorCodeOf<ErrorCode> for ReadDatagramError {
+    fn error_code(&self) -> Option<ErrorCode> {
+        Some(H3_DATAGRAM_ERROR)
     }
 }
 

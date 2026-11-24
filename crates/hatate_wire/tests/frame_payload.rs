@@ -6,7 +6,7 @@ use bytes::{Buf, Bytes};
 use common::{Boom, Broken, Dribble, run};
 use core::{future::poll_fn, num::NonZeroUsize, task::Poll};
 use hatate_wire::{
-    error_code::ErrorCode,
+    error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
         codec::{DiscardExt as _, DiscardHostExt as _},
         payload::{FramePayload, PayloadError, UnfinishedPayloadError},

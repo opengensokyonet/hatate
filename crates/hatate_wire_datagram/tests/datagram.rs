@@ -1,5 +1,6 @@
 //! HTTP Datagrams on the wire (RFC 9297 §2.1).
 use bytes::Bytes;
+use hatate_wire::error_code::ErrorCodeOf as _;
 use hatate_wire_datagram::{
     Datagram, H3_DATAGRAM_ERROR, QuarterStreamId, QuarterStreamIdError, read_datagram,
     write_datagram,
@@ -74,7 +75,7 @@ fn an_empty_input_has_no_quarter_stream_id() {
         matches!(error.read_error(), ReadVarIntFieldError::VarInt { .. }),
         "{error:?}"
     );
-    assert_eq!(error.error_code(), H3_DATAGRAM_ERROR);
+    assert_eq!(error.error_code(), Some(H3_DATAGRAM_ERROR));
     // A cut Quarter Stream ID is the same failure.
     for wire in [&[0x40][..], &[0x80, 0, 0], &[0xc0, 0, 0, 0, 0, 0, 0]] {
         let error = read_datagram(wire).unwrap_err();
@@ -82,7 +83,7 @@ fn an_empty_input_has_no_quarter_stream_id() {
             matches!(error.read_error(), ReadVarIntFieldError::VarInt { .. }),
             "{error:?}"
         );
-        assert_eq!(error.error_code(), H3_DATAGRAM_ERROR);
+        assert_eq!(error.error_code(), Some(H3_DATAGRAM_ERROR));
     }
 }
 
@@ -90,7 +91,7 @@ fn an_empty_input_has_no_quarter_stream_id() {
 fn a_quarter_stream_id_of_two_to_the_sixty_is_refused() {
     let wire = [0xd0, 0, 0, 0, 0, 0, 0, 0, 0xaa];
     let error = read_datagram(&wire[..]).unwrap_err();
-    assert_eq!(error.error_code(), H3_DATAGRAM_ERROR);
+    assert_eq!(error.error_code(), Some(H3_DATAGRAM_ERROR));
     let ReadVarIntFieldError::Value { value, source } = error.read_error() else {
         panic!("{error:?}");
     };
@@ -111,7 +112,7 @@ fn a_quarter_stream_id_of_two_to_the_sixty_is_refused() {
         matches!(error.read_error(), ReadVarIntFieldError::Value { .. }),
         "{error:?}"
     );
-    assert_eq!(error.error_code(), H3_DATAGRAM_ERROR);
+    assert_eq!(error.error_code(), Some(H3_DATAGRAM_ERROR));
 }
 
 #[test]

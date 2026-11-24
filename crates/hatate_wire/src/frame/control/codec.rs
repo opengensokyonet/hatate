@@ -1,11 +1,10 @@
 //! Reading and writing CANCEL_PUSH, GOAWAY and MAX_PUSH_ID.
 use super::{CancelPushFrame, GoawayFrame, MaxPushIdFrame};
 use crate::{
-    error_code::ErrorCode,
+    error_code::{ErrorCode, ErrorCodeOf},
     frame::{
         FrameWidths, Http3FrameType,
         codec::{WriteFrameHeadError, WriteFrameHeadExt as _, payload_integer_error_code},
-        payload::PayloadError,
     },
 };
 use core::{future::poll_fn, num::NonZeroU64, task::Poll};
@@ -146,15 +145,15 @@ pub enum ReadIntegerFrameError<E> {
     },
 }
 
-impl<E> ReadIntegerFrameError<PayloadError<E>> {
-    /// The connection error this failure calls for, when the payload was
-    /// read through a [`FramePayload`](crate::frame::payload::FramePayload):
-    /// H3_FRAME_ERROR when the payload is shorter or longer than its
-    /// integer, or the stream ended inside the frame ([RFC 9114 §7.1]).
-    /// `None` when the stream failed.
-    ///
-    /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
-    pub fn error_code(&self) -> Option<ErrorCode> {
+/// H3_FRAME_ERROR when the payload is shorter or longer than its integer
+/// ([RFC 9114 §7.1]); otherwise the code of the source's failure, such as
+/// H3_FRAME_ERROR when the stream ended inside a frame read through a
+/// [`FramePayload`](crate::frame::payload::FramePayload). `None` when the
+/// stream failed.
+///
+/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadIntegerFrameError<E> {
+    fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Field { source } => payload_integer_error_code(source),
             Self::Trailing { .. } => Some(ErrorCode::H3_FRAME_ERROR),

@@ -3,14 +3,13 @@ use super::{
     Http2SettingIdentifier, Http2SettingIdentifierError, Setting, UnknownSetting, set::SettingsSet,
 };
 use crate::{
-    error_code::ErrorCode,
+    error_code::{ErrorCode, ErrorCodeOf},
     frame::{
         FrameWidths, Http3FrameType,
         codec::{
             FrameLengthError, WriteFrameHeadError, WriteFrameHeadExt as _, length_field,
             payload_integer_error_code,
         },
-        payload::PayloadError,
     },
     parts::PartsError,
 };
@@ -78,7 +77,7 @@ impl DuplicateSettingError {
 ///
 /// # Errors
 ///
-/// [`ReadSettingError`]; [`ReadSettingError::error_code`] gives the
+/// [`ReadSettingError`]; its [`ErrorCodeOf::error_code`] gives the
 /// connection error it calls for.
 #[call(sync)]
 pub async fn read_setting<
@@ -163,16 +162,17 @@ pub enum ReadSettingError<E, V> {
     },
 }
 
-impl<E, V> ReadSettingError<PayloadError<E>, V> {
-    /// The connection error this failure calls for, when the payload was
-    /// read through a [`FramePayload`](crate::frame::payload::FramePayload):
-    /// H3_FRAME_ERROR when the payload or the stream ends inside a setting
-    /// ([RFC 9114 §7.1]), H3_SETTINGS_ERROR for a setting that is not valid
-    /// ([RFC 9114 §7.2.4]). `None` when the stream failed.
-    ///
-    /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
-    /// [RFC 9114 §7.2.4]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4
-    pub fn error_code(&self) -> Option<ErrorCode> {
+/// H3_FRAME_ERROR when the payload ends inside a setting ([RFC 9114 §7.1]),
+/// H3_SETTINGS_ERROR for a setting that is not valid ([RFC 9114 §7.2.4]);
+/// otherwise the code of the source's failure, such as H3_FRAME_ERROR when
+/// the stream ended inside a frame read through a
+/// [`FramePayload`](crate::frame::payload::FramePayload). `None` when the
+/// stream failed.
+///
+/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+/// [RFC 9114 §7.2.4]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4
+impl<E: ErrorCodeOf<ErrorCode>, V> ErrorCodeOf<ErrorCode> for ReadSettingError<E, V> {
+    fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Identifier { source } | Self::Value { source } => {
                 payload_integer_error_code(source)

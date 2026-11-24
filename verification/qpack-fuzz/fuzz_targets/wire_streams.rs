@@ -22,6 +22,7 @@ use frunk_core::HList;
 use hatate_wire::stream_type::{
     StreamType, StreamTypeSet, codec::ReadStreamTypeHostExt as _,
 };
+use hatate_wire::error_code::ErrorCodeOf as _;
 use hatate_wire_datagram::{H3_DATAGRAM_ERROR, read_datagram, write_datagram};
 use libfuzzer_sys::fuzz_target;
 use nitori_io::Read;
@@ -155,7 +156,7 @@ fn datagram(payload: &[u8]) {
             assert_eq!(written, payload);
         }
         Err(error) => {
-            assert_eq!(error.error_code(), H3_DATAGRAM_ERROR);
+            assert_eq!(error.error_code(), Some(H3_DATAGRAM_ERROR));
             match expected {
                 Err(_) => {}
                 Ok((_, value)) => assert!(value >= 1 << 60),

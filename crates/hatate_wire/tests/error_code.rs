@@ -1,7 +1,60 @@
 //! HTTP/3 error codes (RFC 9114 §8.1) and those of QPACK (RFC 9204 §6).
-use hatate_wire::error_code::ErrorCode;
+use frunk_core::coproduct::{CNil, Coproduct};
+use hatate_wire::{
+    error_code::{ErrorCode, ErrorCodeOf},
+    frame::{FrameWidths, control::codec::ReadGoawayFrameHostExt as _},
+    parts::PartsError,
+};
 use hatate_wire_qpack::QpackErrorCode;
 use sakuya_var_int::VarInt;
+
+/// A failure that calls for H3_ID_ERROR.
+#[derive(Debug)]
+struct Coded;
+
+impl ErrorCodeOf<ErrorCode> for Coded {
+    fn error_code(&self) -> Option<ErrorCode> {
+        Some(ErrorCode::H3_ID_ERROR)
+    }
+}
+
+/// A failure that calls for no code.
+#[derive(Debug)]
+struct Uncoded;
+
+impl ErrorCodeOf<ErrorCode> for Uncoded {
+    fn error_code(&self) -> Option<ErrorCode> {
+        None
+    }
+}
+
+#[test]
+fn a_sum_and_its_wrapper_give_the_code_of_the_failure_they_hold() {
+    type Sum = Coproduct<Uncoded, Coproduct<Coded, CNil>>;
+    let uncoded: Sum = Coproduct::inject(Uncoded);
+    let coded: Sum = Coproduct::inject(Coded);
+    assert_eq!(uncoded.error_code(), None);
+    assert_eq!(coded.error_code(), Some(ErrorCode::H3_ID_ERROR));
+    assert_eq!(PartsError::new(uncoded).error_code(), None);
+    assert_eq!(
+        PartsError::new(coded).error_code(),
+        Some(ErrorCode::H3_ID_ERROR)
+    );
+}
+
+#[test]
+fn a_frame_read_from_a_source_that_cannot_fail_has_a_code_too() {
+    fn code_of<E: ErrorCodeOf<ErrorCode>>(error: &E) -> Option<ErrorCode> {
+        error.error_code()
+    }
+    // The payload of a GOAWAY, read directly from memory: a two-byte
+    // integer cut short.
+    let mut input = &[0x40][..];
+    let error = input
+        .sync_read_goaway_frame_unpin(FrameWidths::SHORTEST)
+        .unwrap_err();
+    assert_eq!(code_of(&error), Some(ErrorCode::H3_FRAME_ERROR));
+}
 
 #[test]
 fn the_constants_have_the_values_of_rfc_9114_section_8_1() {

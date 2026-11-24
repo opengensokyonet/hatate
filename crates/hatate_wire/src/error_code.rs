@@ -8,7 +8,8 @@
 //! [RFC 9114 §8.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-8.1
 //! [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9
 use crate::registry;
-use core::fmt;
+use core::{convert::Infallible, fmt};
+use frunk_core::coproduct::{CNil, Coproduct};
 use hatate_wire_qpack::QpackErrorCode;
 use sakuya_var_int::VarInt;
 
@@ -96,6 +97,42 @@ impl From<VarInt> for ErrorCode {
 impl From<ErrorCode> for VarInt {
     fn from(code: ErrorCode) -> Self {
         code.0
+    }
+}
+
+/// The error code that a failure calls for, in the error code space `C`:
+/// [`ErrorCode`] for the errors of HTTP/3.
+///
+/// `None` when the failure calls for no code of this space, as when the
+/// stream underneath failed: whoever owns the stream decides. A failure
+/// that wraps the failure of a source gives the code of its source where
+/// the source has one, so the sources an operation reads from implement it
+/// too: a [`FramePayload`](crate::frame::payload::FramePayload) composed
+/// onto a stream, and an in-memory source that cannot fail.
+pub trait ErrorCodeOf<C> {
+    /// The code this failure calls for, if any.
+    fn error_code(&self) -> Option<C>;
+}
+
+impl<C> ErrorCodeOf<C> for Infallible {
+    fn error_code(&self) -> Option<C> {
+        match *self {}
+    }
+}
+
+impl<C> ErrorCodeOf<C> for CNil {
+    fn error_code(&self) -> Option<C> {
+        match *self {}
+    }
+}
+
+/// The code of the failure the sum holds.
+impl<C, H: ErrorCodeOf<C>, T: ErrorCodeOf<C>> ErrorCodeOf<C> for Coproduct<H, T> {
+    fn error_code(&self) -> Option<C> {
+        match self {
+            Coproduct::Inl(error) => error.error_code(),
+            Coproduct::Inr(rest) => rest.error_code(),
+        }
     }
 }
 

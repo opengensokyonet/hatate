@@ -3,9 +3,9 @@
 //! payload.
 use super::{
     FrameHead, FrameType, FrameWidths, Http2FrameType, Http2FrameTypeError, Http3FrameType, PushId,
-    payload::PayloadError, set::FrameSet,
+    set::FrameSet,
 };
-use crate::error_code::ErrorCode;
+use crate::error_code::{ErrorCode, ErrorCodeOf};
 use core::{future::poll_fn, marker::PhantomData, num::NonZeroU64, task::Poll};
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::{ExactLen, calls::WriteAllError, prelude::*};
@@ -24,7 +24,7 @@ use snafu::{ResultExt, Snafu};
 ///
 /// # Errors
 ///
-/// [`ReadFrameHeadError`]; [`ReadFrameHeadError::error_code`] gives the
+/// [`ReadFrameHeadError`]; its [`ErrorCodeOf::error_code`] gives the
 /// connection error the failure calls for, if any.
 #[call(sync)]
 pub async fn read_frame_head<S: FrameSet, F: Read, A: ReceiverAccess<Family = F>>(
@@ -80,15 +80,15 @@ pub enum ReadFrameHeadError<E> {
     },
 }
 
-impl<E> ReadFrameHeadError<E> {
-    /// The connection error this failure calls for: H3_FRAME_ERROR when the
-    /// stream ends inside the head of a frame ([RFC 9114 §7.1]), on a stream
-    /// that ended cleanly; H3_FRAME_UNEXPECTED for an HTTP/2 type
-    /// ([RFC 9114 §7.2.8]). `None` when the stream itself failed.
-    ///
-    /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
-    /// [RFC 9114 §7.2.8]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
-    pub fn error_code(&self) -> Option<ErrorCode> {
+/// H3_FRAME_ERROR when the stream ends inside the head of a frame
+/// ([RFC 9114 §7.1]), on a stream that ended cleanly; H3_FRAME_UNEXPECTED
+/// for an HTTP/2 type ([RFC 9114 §7.2.8]). `None` when the stream itself
+/// failed.
+///
+/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+/// [RFC 9114 §7.2.8]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
+impl<E> ErrorCodeOf<ErrorCode> for ReadFrameHeadError<E> {
+    fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Type { source } | Self::Length { source } => {
                 source.is_incomplete().then_some(ErrorCode::H3_FRAME_ERROR)
@@ -403,8 +403,8 @@ async fn copy_payload<
 ///
 /// # Errors
 ///
-/// [`ReadPushPromisePushIdError`]; its `error_code` gives the connection
-/// error it calls for.
+/// [`ReadPushPromisePushIdError`]; its [`ErrorCodeOf::error_code`] gives
+/// the connection error it calls for.
 ///
 /// [RFC 9114 §7.2.5]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.5
 #[call(sync)]
@@ -431,26 +431,28 @@ impl<E> ReadPushPromisePushIdError<E> {
     }
 }
 
-impl<E> ReadPushPromisePushIdError<PayloadError<E>> {
-    /// The connection error this failure calls for: H3_FRAME_ERROR when the
-    /// payload is shorter than the Push ID, or the stream ended inside the
-    /// frame ([RFC 9114 §7.1]). `None` when the stream failed.
-    ///
-    /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
-    pub fn error_code(&self) -> Option<ErrorCode> {
+/// H3_FRAME_ERROR when the payload is shorter than the Push ID
+/// ([RFC 9114 §7.1]); otherwise the code of the source's failure, such as
+/// H3_FRAME_ERROR when the stream ended inside the frame. `None` when the
+/// stream failed.
+///
+/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadPushPromisePushIdError<E> {
+    fn error_code(&self) -> Option<ErrorCode> {
         payload_integer_error_code(&self.source)
     }
 }
 
 /// The connection error for a failure reading an integer from a frame
-/// payload: H3_FRAME_ERROR when the payload or the stream ended inside it.
-pub(crate) fn payload_integer_error_code<E>(
-    error: &ReadVarIntError<PayloadError<E>>,
+/// payload: H3_FRAME_ERROR when the payload ended inside it, otherwise the
+/// code of the source's failure.
+pub(crate) fn payload_integer_error_code<E: ErrorCodeOf<ErrorCode>>(
+    error: &ReadVarIntError<E>,
 ) -> Option<ErrorCode> {
     if error.is_incomplete() {
         return Some(ErrorCode::H3_FRAME_ERROR);
     }
-    error.host_error().and_then(PayloadError::error_code)
+    error.host_error().and_then(ErrorCodeOf::error_code)
 }
 
 /// Reads and discards the rest of a source, such as the payload of a frame

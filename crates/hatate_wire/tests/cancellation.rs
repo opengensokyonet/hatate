@@ -19,7 +19,7 @@ use core::{
 use frunk_core::HList;
 use hatate_wire::{
     defaults::RejectKnownDuplicates,
-    error_code::ErrorCode,
+    error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
         FrameWidths,
         codec::ReadFrameHeadExt as _,

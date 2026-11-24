@@ -6,7 +6,7 @@
 //! It passes on [`Read`] and [`ReadChunk`] and reports its exact remaining
 //! length ([`ExactLen`]). A stream that ends inside the payload is a
 //! truncated frame ([`PayloadError::Truncated`]), not an early EOF.
-use crate::error_code::ErrorCode;
+use crate::error_code::{ErrorCode, ErrorCodeOf};
 use bytes::{Buf, BufMut};
 use core::{
     marker::PhantomData,
@@ -153,14 +153,13 @@ pub enum PayloadError<E> {
     Failed,
 }
 
-impl<E> PayloadError<E> {
-    /// The connection error this failure calls for: H3_FRAME_ERROR when the
-    /// stream ended inside the payload ([RFC 9114 §7.1]). `None` when the
-    /// stream failed, and for a read after a failure, whose first failure
-    /// was already reported.
-    ///
-    /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
-    pub fn error_code(&self) -> Option<ErrorCode> {
+/// H3_FRAME_ERROR when the stream ended inside the payload
+/// ([RFC 9114 §7.1]). `None` when the stream failed, and for a read after a
+/// failure, whose first failure was already reported.
+///
+/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+impl<E> ErrorCodeOf<ErrorCode> for PayloadError<E> {
+    fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Truncated { .. } => Some(ErrorCode::H3_FRAME_ERROR),
             Self::Host { .. } | Self::Failed => None,
