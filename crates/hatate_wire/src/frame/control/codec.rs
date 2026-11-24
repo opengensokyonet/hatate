@@ -4,7 +4,7 @@ use crate::{
     error_code::{ErrorCode, ErrorCodeOf},
     frame::{
         FrameWidths, Http3FrameType,
-        codec::{WriteFrameHeadError, WriteFrameHeadExt as _, payload_integer_error_code},
+        codec::{WriteFrameHeadError, payload_integer_error_code, write_head},
     },
 };
 use core::{future::poll_fn, num::NonZeroU64, task::Poll};
@@ -123,7 +123,7 @@ where
         widths.length_width(),
     )
     .expect("every width holds a length of at most 8");
-    io.write_frame_head(type_field, length)
+    write_head(io, type_field, length)
         .await
         .context(write_integer_frame_error::HeadSnafu)?;
     io.write_var_int_field(field)

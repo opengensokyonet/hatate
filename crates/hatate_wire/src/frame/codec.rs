@@ -182,22 +182,10 @@ impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadFrameHeadError<E>
     }
 }
 
-/// Writes the Type and Length of a frame, each at its width.
-///
-/// The writers of the frames of RFC 9114 whose payload this crate
-/// structures (SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID and
-/// PUSH_PROMISE) compute the Length from it and write the head with this,
-/// and [`write_frame`] writes the head of a frame whose payload comes as a
-/// source, such as DATA and HEADERS. Use it directly for the frame of a
-/// part's own that has no writer. The payload must follow, of exactly
-/// `length` bytes.
-///
-/// # Errors
-///
-/// [`WriteFrameHeadError`]. A type of HTTP/2 is reported before anything
-/// is written; bytes accepted before a later failure stay written.
-#[call(sync)]
-pub async fn write_frame_head<F: Write, A: ReceiverAccess<Family = F>>(
+/// Writes the Type and Length of a frame, each at its width: the step every
+/// writer of a frame takes before its payload, which must follow, of exactly
+/// `length` bytes. A type of HTTP/2 is reported before anything is written.
+pub(crate) async fn write_head<F: Write, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     type_field: VarIntField<VarInt>,
     length: VarIntField<VarInt>,
@@ -215,7 +203,7 @@ pub async fn write_frame_head<F: Write, A: ReceiverAccess<Family = F>>(
         .context(write_frame_head_error::LengthSnafu)
 }
 
-/// Failures of [`write_frame_head`].
+/// Failures of writing the Type and Length of a frame.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum WriteFrameHeadError<E> {
@@ -288,7 +276,7 @@ where
             },
         });
     }
-    io.write_frame_head(r#type, length)
+    write_head(io, r#type, length)
         .await
         .context(write_frame_error::HeadSnafu)?;
     copy_payload(io, &mut payload, declared)
@@ -376,7 +364,7 @@ where
     .context(write_push_promise_frame_error::LengthSnafu)?;
     let type_field = VarIntField::new(Http3FrameType::PushPromise.value(), widths.type_width())
         .expect("every width holds the frame type 0x05");
-    io.write_frame_head(type_field, length_field)
+    write_head(io, type_field, length_field)
         .await
         .context(write_push_promise_frame_error::HeadSnafu)?;
     io.write_var_int_field(push_id)

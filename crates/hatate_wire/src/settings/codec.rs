@@ -8,8 +8,8 @@ use crate::{
     frame::{
         FrameWidths, Http3FrameType,
         codec::{
-            FrameLengthError, WriteFrameHeadError, WriteFrameHeadExt as _, length_field,
-            payload_integer_error_code,
+            FrameLengthError, WriteFrameHeadError, length_field, payload_integer_error_code,
+            write_head,
         },
     },
     parts::PartsError,
@@ -319,7 +319,7 @@ pub async fn write_settings_frame<L: SettingList, F: Write, A: ReceiverAccess<Fa
 ) -> Result<(), WriteSettingsFrameError<F::Error>> {
     let type_field = VarIntField::new(Http3FrameType::Settings.value(), frame.widths.type_width())
         .expect("every width holds the frame type 0x04");
-    io.write_frame_head(type_field, frame.length)
+    write_head(io, type_field, frame.length)
         .await
         .context(write_settings_frame_error::HeadSnafu)?;
     for (index, setting) in frame.settings.iter().enumerate() {

@@ -10,8 +10,7 @@ use hatate_wire::frame::{
     Frame, FrameWidths, Http2FrameType, PushId,
     codec::{
         CopyPayloadError, FrameLengthError, WriteFrameError, WriteFrameExt as _,
-        WriteFrameHeadError, WriteFrameHeadHostExt as _, WritePushPromiseFrameError,
-        WritePushPromiseFrameHostExt as _,
+        WriteFrameHeadError, WritePushPromiseFrameError, WritePushPromiseFrameHostExt as _,
     },
 };
 use hatate_wire::{
@@ -287,33 +286,38 @@ const HTTP2_TYPES: [(u32, Http2FrameType); 4] = [
 ];
 
 #[test]
-fn a_frame_head_of_a_type_of_http2_is_refused_before_any_byte() {
+fn a_frame_of_a_type_of_http2_is_refused_before_any_byte() {
     for (value, frame_type) in HTTP2_TYPES {
         for width in VarIntWidth::ALL {
-            let mut written = Vec::new();
-            let error = written
-                .sync_write_frame_head_unpin(
+            let mut hosts = (Vec::new(), &[][..]);
+            let error = hosts
+                .sync_write_payload_unpin(
                     type_field(value, width),
-                    VarIntField::shortest(VarInt::from_u32(0)),
+                    length_field(0, VarIntWidth::One),
                 )
                 .unwrap_err();
             assert!(
-                matches!(&error, WriteFrameHeadError::Http2Type { source } if source.frame_type() == frame_type),
+                matches!(
+                    &error,
+                    WriteFrameError::Head {
+                        source: WriteFrameHeadError::Http2Type { source }
+                    } if source.frame_type() == frame_type
+                ),
                 "{error:?}"
             );
-            assert!(written.is_empty(), "{value:#x} {width:?}");
+            assert!(hosts.0.is_empty(), "{value:#x} {width:?}");
         }
     }
     // The types next to them are written.
     for value in [0x01, 0x03, 0x07, 0x0a] {
-        let mut written = Vec::new();
-        written
-            .sync_write_frame_head_unpin(
+        let mut hosts = (Vec::new(), &[][..]);
+        hosts
+            .sync_write_payload_unpin(
                 type_field(value, VarIntWidth::One),
-                VarIntField::shortest(VarInt::from_u32(0)),
+                length_field(0, VarIntWidth::One),
             )
             .unwrap();
-        assert_eq!(written, [value as u8, 0]);
+        assert_eq!(hosts.0, [value as u8, 0]);
     }
 }
 

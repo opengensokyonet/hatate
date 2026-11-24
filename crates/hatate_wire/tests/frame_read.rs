@@ -14,10 +14,7 @@ use hatate_wire::{
     frame::{
         ControlFrameType, FrameType, FrameWidths, Http2FrameType, Http3FrameType, PushFrameType,
         RequestFrameType,
-        codec::{
-            ReadFrameError, ReadFrameHeadError, UnexpectedFrameTypeError,
-            WriteFrameHeadHostExt as _,
-        },
+        codec::{ReadFrameError, ReadFrameHeadError, UnexpectedFrameTypeError},
         set::FrameSetOn,
     },
     registry::{is_reserved, reserved},
@@ -419,15 +416,20 @@ fn a_stream_that_ends_inside_the_head_is_a_frame_error() {
     }
 }
 
+/// The bytes of a frame head with this Type and Length.
+fn head_bytes(type_field: VarIntField<VarInt>, length: VarIntField<VarInt>) -> Vec<u8> {
+    let (r#type, type_len) = type_field.to_encoding();
+    let (length, length_len) = length.to_encoding();
+    [&r#type[..type_len], &length[..length_len]].concat()
+}
+
 #[test]
-fn widths_of_type_and_length_are_kept_and_written_back() {
+fn widths_of_type_and_length_are_kept_and_encoded_back() {
     for type_width in VarIntWidth::ALL {
         for length_width in VarIntWidth::ALL {
             let type_field = VarIntField::new(VarInt::from_u32(0x04), type_width).unwrap();
             let length = VarIntField::new(VarInt::from_u32(0x0a), length_width).unwrap();
-            let mut wire = Vec::new();
-            wire.sync_write_frame_head_unpin(type_field, length)
-                .unwrap();
+            let wire = head_bytes(type_field, length);
             assert_eq!(
                 wire.len(),
                 type_width.encoded_len() + length_width.encoded_len()
@@ -440,11 +442,7 @@ fn widths_of_type_and_length_are_kept_and_written_back() {
             assert_eq!(head.length, length);
             assert_eq!(head.widths, FrameWidths::new(type_width, length_width));
             assert_eq!(head.remaining, 0x0a);
-            let mut again = Vec::new();
-            again
-                .sync_write_frame_head_unpin(head.type_field, head.length)
-                .unwrap();
-            assert_eq!(again, wire);
+            assert_eq!(head_bytes(head.type_field, head.length), wire);
         }
     }
 }
