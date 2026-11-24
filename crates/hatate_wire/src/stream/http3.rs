@@ -330,8 +330,42 @@ pub type ControlFrame<'s, L, I> = Frame<
 >;
 
 /// The failure of reading a [`ControlStream`] on `I`.
-pub type ControlStreamError<I> =
-    NextFrameError<<<Composed<I, CriticalStream> as ReceiverAccess>::Family as Read>::Error>;
+pub type ControlStreamErrorOf<I> =
+    ControlStreamError<<<Composed<I, CriticalStream> as ReceiverAccess>::Family as Read>::Error>;
+
+/// Failures of reading the frames of a [`ControlStream`] after the first,
+/// from a stream whose failures are `E`.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum ControlStreamError<E> {
+    /// The next frame could not be read.
+    #[snafu(display("could not read the next frame of the control stream"))]
+    Next {
+        /// The failure of reading it.
+        source: NextFrameError<E>,
+    },
+    /// A second SETTINGS frame ([RFC 9114 §7.2.4]).
+    ///
+    /// [RFC 9114 §7.2.4]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4
+    #[snafu(display("received a second SETTINGS frame on the control stream"))]
+    SecondSettings,
+}
+
+/// The code of the failure of reading the next frame; H3_FRAME_UNEXPECTED
+/// for a second SETTINGS frame.
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ControlStreamError<E> {
+    fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Next { source } => source.error_code(),
+            Self::SecondSettings => Some(ErrorCode::H3_FRAME_UNEXPECTED),
+        }
+    }
+}
+
+/// Whether the frame type is SETTINGS.
+fn is_settings<C: ClaimedValue>(frame_type: FrameType<C>) -> bool {
+    matches!(frame_type, FrameType::Known(known) if known.value() == Http3FrameType::Settings.value())
+}
 
 impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess> ControlStream<L, I>
 where
@@ -360,16 +394,25 @@ where
         >,
 {
     /// Moves to the next frame, as [`FrameStream::next_frame`] does. The
-    /// stream never ends: its end is a failure.
+    /// stream never ends: its end is a failure. The first frame was SETTINGS,
+    /// and no later frame may be.
     ///
     /// # Errors
     ///
-    /// [`NextFrameError`], whose failures of the stream are
+    /// [`ControlStreamError`], whose failures of the stream are
     /// [`CriticalStreamError`].
-    pub async fn next_frame(&mut self) -> Result<ControlFrame<'_, L, I>, ControlStreamError<I>> {
-        let frame = self.frames.next_frame().await?;
-        // invariant: a critical stream reports its end as a failure.
-        Ok(frame.expect("a critical stream does not end"))
+    pub async fn next_frame(&mut self) -> Result<ControlFrame<'_, L, I>, ControlStreamErrorOf<I>> {
+        let frame = self
+            .frames
+            .next_frame()
+            .await
+            .context(control_stream_error::NextSnafu)?
+            // invariant: a critical stream reports its end as a failure.
+            .expect("a critical stream does not end");
+        if is_settings(frame.frame_type()) {
+            return Err(ControlStreamError::SecondSettings);
+        }
+        Ok(frame)
     }
 
     /// Moves to the next frame of a known type, as
@@ -377,13 +420,21 @@ where
     ///
     /// # Errors
     ///
-    /// [`NextFrameError`], as for [`next_frame`](Self::next_frame).
+    /// [`ControlStreamError`], as for [`next_frame`](Self::next_frame).
     pub async fn next_known_frame(
         &mut self,
-    ) -> Result<ControlFrame<'_, L, I>, ControlStreamError<I>> {
-        let frame = self.frames.next_known_frame().await?;
-        // invariant: as for next_frame.
-        Ok(frame.expect("a critical stream does not end"))
+    ) -> Result<ControlFrame<'_, L, I>, ControlStreamErrorOf<I>> {
+        let frame = self
+            .frames
+            .next_known_frame()
+            .await
+            .context(control_stream_error::NextSnafu)?
+            // invariant: as for next_frame.
+            .expect("a critical stream does not end");
+        if is_settings(frame.frame_type()) {
+            return Err(ControlStreamError::SecondSettings);
+        }
+        Ok(frame)
     }
 }
 

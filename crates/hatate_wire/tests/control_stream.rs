@@ -1,6 +1,6 @@
 #![feature(impl_trait_in_assoc_type)]
 //! The control stream a connection reads: its first frame must be SETTINGS
-//! (RFC 9114 §6.2.1), and dropping a read of its next frame before the first
+//! (RFC 9114 §6.2.1) and no later one may be (§7.2.4), and dropping a read of its next frame before the first
 //! byte of the head leaves the stream where it was.
 mod common;
 
@@ -19,6 +19,7 @@ use hatate_wire::{
         NextFrameError, ReceivedStream,
         class::{ClientInitiatedUnidirectional, ServerInitiatedUnidirectional},
         codec::{ReadUnidirectionalStreamError, read_unidirectional_stream},
+        http3::ControlStreamError,
         http3::{Http3UnidirectionalStream, Http3UnidirectionalStreamError},
     },
 };
@@ -212,7 +213,9 @@ async fn drop_next<
     }
     let step = match control.next_frame().await {
         Ok(frame) => Step::Frame(frame.frame_type().value().get()),
-        Err(NextFrameError::Interrupted) => Step::Interrupted,
+        Err(ControlStreamError::Next {
+            source: NextFrameError::Interrupted,
+        }) => Step::Interrupted,
         Err(error) => {
             assert_eq!(
                 error.error_code(),
@@ -251,4 +254,70 @@ fn a_control_stream_read_dropped_before_the_first_byte_of_a_head_reads_the_next_
         }
     }
     assert!(at_boundary > 0 && interrupted > 0);
+}
+
+/// How reading the frames after the first ended: the types read, and the
+/// code of the failure.
+#[call(sync)]
+async fn frames_after_the_first<
+    F: Read<Error = Infallible> + Skip<Count = usize>,
+    A: ReceiverAccess<Family = F>,
+>(
+    io: &mut A,
+    known: bool,
+) -> (Vec<u64>, Option<ErrorCode>, bool) {
+    let stream = read_unidirectional_stream::<Parts, ClientInitiatedUnidirectional, _>(&mut *io)
+        .await
+        .unwrap()
+        .unwrap();
+    let ReceivedStream::Known(known_stream) = stream.transpose() else {
+        panic!("not a stream of a part");
+    };
+    let Coproduct::Inl(http3) = known_stream.transpose() else {
+        unreachable!("one part");
+    };
+    let Http3UnidirectionalStream::Control(control) = http3.transpose() else {
+        panic!("not a control stream");
+    };
+    let mut control = control.into_stream();
+    let mut types = Vec::new();
+    loop {
+        let next = if known {
+            control.next_known_frame().await
+        } else {
+            control.next_frame().await
+        };
+        match next {
+            Ok(frame) => types.push(frame.frame_type().value().get()),
+            Err(error) => {
+                let second = matches!(error, ControlStreamError::SecondSettings);
+                return (types, error.error_code(), second);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_second_settings_frame_is_h3_frame_unexpected() {
+    // SETTINGS, GOAWAY, a reserved frame, then SETTINGS again.
+    let wire = [0x00, 0x04, 0x00, 0x07, 0x01, 0x00, 0x21, 0x00, 0x04, 0x00];
+    for (known, types) in [(false, vec![0x07, 0x21]), (true, vec![0x07])] {
+        let mut input = &wire[..];
+        assert_eq!(
+            input.sync_frames_after_the_first_unpin(known),
+            (types, Some(ErrorCode::H3_FRAME_UNEXPECTED), true),
+            "{known}"
+        );
+    }
+    // Without a second SETTINGS, the stream ends as a critical stream does.
+    let wire = [0x00, 0x04, 0x00, 0x07, 0x01, 0x00];
+    let mut input = &wire[..];
+    assert_eq!(
+        input.sync_frames_after_the_first_unpin(false),
+        (
+            vec![0x07],
+            Some(ErrorCode::H3_CLOSED_CRITICAL_STREAM),
+            false
+        )
+    );
 }
