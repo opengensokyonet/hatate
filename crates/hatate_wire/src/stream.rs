@@ -11,7 +11,14 @@
 //!
 //! It composes either way: on an access in a call, `io.compose(stream)`
 //! or `Composed::new(io, stream)`, or on a receiver it stays with,
-//! `ComposedReceiver::new(receiver, stream)`. A request stream is
+//! `ComposedReceiver::new(receiver, stream)`.
+//!
+//! Finishing a frame skips, so a stream that only reads is given
+//! [`ReadSkip`](nitori_io::adapters::ReadSkip) or
+//! [`ReadChunkSkip`](nitori_io::adapters::ReadChunkSkip) as well, composed
+//! on either side of the [`FrameStream`]: `io.compose(stream).compose(ReadSkip)`
+//! or `io.compose(ReadSkip).compose(stream)`. Each passes on what the other
+//! gives, the skipping and the [`FrameStreamInfo`]. A request stream is
 //! [`FrameStream::request`]; a unidirectional stream starts with its type,
 //! which [`codec::read_unidirectional_stream`] reads.
 //!
@@ -32,7 +39,7 @@ use core::{
     task::{Context, Poll},
 };
 use nitori_call::{Compose, Composed, Lent, ReceiverFamily};
-use nitori_io::{ExactLen, Min, Read, ReadChunk, Skip, Write};
+use nitori_io::{ExactLen, Min, Read, ReadChunk, Skip, Write, adapters::Skippable};
 use sakuya_var_int::VarIntField;
 
 #[allow(missing_docs)] // The call macro also generates operation and extension trait items.
@@ -189,6 +196,21 @@ impl<F: FrameStreamInfo> FrameStreamInfo for Lent<F> {
     {
         host.get_mut()
             .with(|parent| F::frame_stream(parent.into_pin()))
+    }
+}
+
+/// The stream of the view that skips by reading, so that a stream that
+/// carries frames keeps the capability when
+/// [`ReadSkip`](nitori_io::adapters::ReadSkip) or
+/// [`ReadChunkSkip`](nitori_io::adapters::ReadChunkSkip) is composed after
+/// its [`FrameStream`].
+impl<F: FrameStreamInfo, S> FrameStreamInfo for Skippable<F, S> {
+    type Parts = F::Parts;
+    fn frame_stream<'v>(host: Pin<&mut Self::ReceiverView<'v>>) -> FrameStream<F::Parts>
+    where
+        Self: 'v,
+    {
+        F::frame_stream(host)
     }
 }
 

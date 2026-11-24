@@ -255,7 +255,8 @@ type PayloadReadError<I> = PayloadError<<<I as ReceiverAccess>::Family as Read>:
 /// The payload skips what is left of it on the stream, which therefore
 /// skips ([`Skip`]); compose [`ReadSkip`](nitori_io::adapters::ReadSkip)
 /// or [`ReadChunkSkip`](nitori_io::adapters::ReadChunkSkip) onto a stream
-/// that only reads.
+/// that only reads, below or above its
+/// [`FrameStream`](crate::stream::FrameStream).
 impl<I> Frame<Composed<I, FramePayload>>
 where
     I: ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>>>,

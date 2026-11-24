@@ -183,3 +183,119 @@ impl nitori_io::Skip for Broken {
         Poll::Ready(Err(Boom))
     }
 }
+
+/// A stream that can only read, by bytes or by chunks, never skip: at most
+/// `chunk` bytes per read, after one `Pending`.
+pub struct ReadOnly<'a> {
+    input: &'a [u8],
+    chunk: usize,
+    waiting: bool,
+}
+
+impl<'a> ReadOnly<'a> {
+    pub fn new(input: &'a [u8], chunk: usize) -> Self {
+        assert!(chunk > 0);
+        Self {
+            input,
+            chunk,
+            waiting: false,
+        }
+    }
+
+    /// The bytes not yet read.
+    pub fn rest(&self) -> &'a [u8] {
+        self.input
+    }
+
+    /// Answers `Pending` once before each read.
+    fn pause(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.waiting {
+            self.waiting = false;
+            return false;
+        }
+        self.waiting = true;
+        cx.waker().wake_by_ref();
+        true
+    }
+}
+
+nitori_call::family_receiver!(impl ['a] for ReadOnly<'a>);
+
+impl nitori_io::Read for ReadOnly<'_> {
+    type Error = Infallible;
+    fn poll_read<'visit, B: BufMut + ?Sized>(
+        host: Pin<&mut Self::ReceiverView<'visit>>,
+        cx: &mut Context<'_>,
+        dst: &mut B,
+    ) -> Poll<Result<usize, Self::Error>>
+    where
+        Self: 'visit,
+    {
+        let this = host.get_pin_mut().get_mut();
+        if this.pause(cx) {
+            return Poll::Pending;
+        }
+        let count = this.chunk.min(this.input.len()).min(dst.remaining_mut());
+        let (head, tail) = this.input.split_at(count);
+        dst.put_slice(head);
+        this.input = tail;
+        Poll::Ready(Ok(count))
+    }
+}
+
+impl nitori_io::ReadChunk for ReadOnly<'_> {
+    type Chunk = bytes::Bytes;
+    fn poll_read_chunk<'visit>(
+        host: Pin<&mut Self::ReceiverView<'visit>>,
+        cx: &mut Context<'_>,
+        maximum: core::num::NonZeroUsize,
+    ) -> Poll<Result<Option<bytes::Bytes>, Self::Error>>
+    where
+        Self: 'visit,
+    {
+        let this = host.get_pin_mut().get_mut();
+        if this.pause(cx) {
+            return Poll::Pending;
+        }
+        if this.input.is_empty() {
+            return Poll::Ready(Ok(None));
+        }
+        let count = this.chunk.min(this.input.len()).min(maximum.get());
+        let (head, tail) = this.input.split_at(count);
+        this.input = tail;
+        Poll::Ready(Ok(Some(bytes::Bytes::copy_from_slice(head))))
+    }
+}
+
+/// A stream whose skips report one byte more than they were allowed.
+pub struct Overskip;
+
+nitori_call::family_receiver!(impl [] for Overskip);
+
+impl nitori_io::Read for Overskip {
+    type Error = Infallible;
+    fn poll_read<'visit, B: BufMut + ?Sized>(
+        _host: Pin<&mut Self::ReceiverView<'visit>>,
+        _cx: &mut Context<'_>,
+        _dst: &mut B,
+    ) -> Poll<Result<usize, Self::Error>>
+    where
+        Self: 'visit,
+    {
+        Poll::Ready(Ok(0))
+    }
+}
+
+impl nitori_io::Skip for Overskip {
+    type Count = usize;
+    fn poll_skip<'visit, M: nitori_io::Min<usize, Output = usize> + Clone>(
+        _host: Pin<&mut Self::ReceiverView<'visit>>,
+        _cx: &mut Context<'_>,
+        maximum: M,
+    ) -> Poll<Result<Option<usize>, Self::Error>>
+    where
+        Self: 'visit,
+    {
+        Poll::Ready(Ok(Some(nitori_io::Min::min(maximum, 8) + 1)))
+    }
+}
