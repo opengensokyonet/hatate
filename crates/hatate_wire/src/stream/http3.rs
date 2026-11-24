@@ -22,9 +22,16 @@ use crate::{
     stream_type::Http3StreamType,
 };
 use frunk_core::coproduct::CNil;
+use hatate_qpack::{
+    decoder_instruction::codec::ReadError as DecoderInstructionError,
+    encoder_instruction::{
+        codec::{StartError, ValueError},
+        literal::{HuffmanReadError, InputError},
+    },
+};
 use hatate_wire_qpack::{
     QpackStreamType,
-    stream::{QpackDecoderStream, QpackEncoderStream, QpackStreamError},
+    stream::{CriticalStream, CriticalStreamError, QpackDecoderStream, QpackEncoderStream},
 };
 use nitori_call::{Composed, ReceiverAccess};
 use nitori_io::{Infinite, Min, Read, Skip};
@@ -113,26 +120,52 @@ impl<I> TypedStream for QpackDecoderStream<I> {
     }
 }
 
-/// H3_CLOSED_CRITICAL_STREAM for a QPACK stream that ended
-/// ([RFC 9204 §4.2]).
+/// H3_CLOSED_CRITICAL_STREAM for a critical stream that ended
+/// ([RFC 9114 §6.2.1], [RFC 9204 §4.2]); otherwise the code of the stream's
+/// own failure.
 ///
+/// [RFC 9114 §6.2.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
 /// [RFC 9204 §4.2]: https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
-impl<E> ErrorCodeOf<ErrorCode> for QpackStreamError<E> {
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for CriticalStreamError<E> {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Closed => Some(ErrorCode::H3_CLOSED_CRITICAL_STREAM),
-            Self::Instruction { .. } => None,
+            Self::Host { source } => source.error_code(),
         }
     }
 }
 
+macro_rules! qpack_error_code {
+    ($($error:ident),+) => {
+        $(
+            /// The code of the stream's own failure, such as
+            /// H3_CLOSED_CRITICAL_STREAM on a QPACK stream that ended inside
+            /// an instruction; `None` for a failure of the instruction itself.
+            impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for $error<E> {
+                fn error_code(&self) -> Option<ErrorCode> {
+                    self.host_error().and_then(ErrorCodeOf::error_code)
+                }
+            }
+        )+
+    };
+}
+
+qpack_error_code!(
+    StartError,
+    ValueError,
+    InputError,
+    HuffmanReadError,
+    DecoderInstructionError
+);
+
 /// A control stream of the peer ([RFC 9114 §6.2.1]), which is critical: it
-/// never ends, and a control stream that ends is a connection error of type
-/// H3_CLOSED_CRITICAL_STREAM ([`ControlStreamError::Closed`]).
+/// is read through [`CriticalStream`], so its end, at a frame boundary or
+/// inside a frame, is a failure of the stream with the code
+/// H3_CLOSED_CRITICAL_STREAM, and it has no last frame.
 ///
 /// [RFC 9114 §6.2.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
 pub struct ControlStream<L: FrameSetOn<ControlStreamKind>, I> {
-    frames: FrameStream<L, ControlStreamKind, I>,
+    frames: FrameStream<L, ControlStreamKind, Composed<I, CriticalStream>>,
 }
 
 impl<L: FrameSetOn<ControlStreamKind>, I> core::fmt::Debug for ControlStream<L, I>
@@ -146,40 +179,54 @@ where
     }
 }
 
-impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess<Family: Read>> ControlStream<L, I> {
+/// The frame a [`ControlStream`] on `I` gives.
+pub type ControlFrame<'s, L, I> = Frame<
+    FrameType<<L as FrameSetOn<ControlStreamKind>>::FrameType>,
+    Composed<&'s mut Composed<I, CriticalStream>, &'s mut FramePayload>,
+>;
+
+/// The failure of reading a [`ControlStream`] on `I`.
+pub type ControlStreamError<I> =
+    NextFrameError<<<Composed<I, CriticalStream> as ReceiverAccess>::Family as Read>::Error>;
+
+impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess> ControlStream<L, I>
+where
+    Composed<I, CriticalStream>: ReceiverAccess<Family: Read>,
+{
     /// The current frame, as [`FrameStream::frame`] gives it. The first one
     /// is required to be SETTINGS ([RFC 9114 §6.2.1]), which the connection
     /// checks.
     ///
     /// [RFC 9114 §6.2.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
-    pub fn frame(&mut self) -> Frame<FrameType<L::FrameType>, Composed<&mut I, &mut FramePayload>> {
+    pub fn frame(&mut self) -> ControlFrame<'_, L, I> {
         self.frames.frame()
     }
 }
 
-impl<L: FrameSetOn<ControlStreamKind>, I> ControlStream<L, I>
+impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess> ControlStream<L, I>
 where
-    I: ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>>>,
-    u64: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
-    Infinite: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
+    Composed<I, CriticalStream>:
+        ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>>>,
+    u64: Min<
+            <<Composed<I, CriticalStream> as ReceiverAccess>::Family as Skip>::Count,
+            Output = <<Composed<I, CriticalStream> as ReceiverAccess>::Family as Skip>::Count,
+        >,
+    Infinite: Min<
+            <<Composed<I, CriticalStream> as ReceiverAccess>::Family as Skip>::Count,
+            Output = <<Composed<I, CriticalStream> as ReceiverAccess>::Family as Skip>::Count,
+        >,
 {
-    /// Moves to the next frame, as [`FrameStream::next_frame`] does.
+    /// Moves to the next frame, as [`FrameStream::next_frame`] does. The
+    /// stream never ends: its end is a failure.
     ///
     /// # Errors
     ///
-    /// [`ControlStreamError`]: the stream ended, or the frame could not be
-    /// read.
-    pub async fn next_frame(
-        &mut self,
-    ) -> Result<
-        Frame<FrameType<L::FrameType>, Composed<&mut I, &mut FramePayload>>,
-        ControlStreamError<<I::Family as Read>::Error>,
-    > {
-        match self.frames.next_frame().await {
-            Ok(Some(frame)) => Ok(frame),
-            Ok(None) => Err(ControlStreamError::Closed),
-            Err(source) => Err(ControlStreamError::Frame { source }),
-        }
+    /// [`NextFrameError`], whose failures of the stream are
+    /// [`CriticalStreamError`].
+    pub async fn next_frame(&mut self) -> Result<ControlFrame<'_, L, I>, ControlStreamError<I>> {
+        let frame = self.frames.next_frame().await?;
+        // invariant: a critical stream reports its end as a failure.
+        Ok(frame.expect("a critical stream does not end"))
     }
 
     /// Moves to the next frame of a known type, as
@@ -187,58 +234,26 @@ where
     ///
     /// # Errors
     ///
-    /// [`ControlStreamError`], as for [`next_frame`](Self::next_frame).
+    /// [`NextFrameError`], as for [`next_frame`](Self::next_frame).
     pub async fn next_known_frame(
         &mut self,
-    ) -> Result<
-        Frame<FrameType<L::FrameType>, Composed<&mut I, &mut FramePayload>>,
-        ControlStreamError<<I::Family as Read>::Error>,
-    > {
-        match self.frames.next_known_frame().await {
-            Ok(Some(frame)) => Ok(frame),
-            Ok(None) => Err(ControlStreamError::Closed),
-            Err(source) => Err(ControlStreamError::Frame { source }),
-        }
+    ) -> Result<ControlFrame<'_, L, I>, ControlStreamError<I>> {
+        let frame = self.frames.next_known_frame().await?;
+        // invariant: as for next_frame.
+        Ok(frame.expect("a critical stream does not end"))
     }
 }
 
-impl<L: FrameSetOn<ControlStreamKind>, I> ControlStream<L, I> {
-    /// The stream of frames, giving up that it is critical.
-    pub fn into_frames(self) -> FrameStream<L, ControlStreamKind, I> {
-        self.frames
+impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess> ControlStream<L, I> {
+    /// The access, giving up the stream.
+    pub fn into_io(self) -> I {
+        self.frames.into_io().into_parts().0
     }
 }
 
 impl<L: FrameSetOn<ControlStreamKind>, I> TypedStream for ControlStream<L, I> {
     fn stream_type(&self) -> VarInt {
         Http3StreamType::Control.value()
-    }
-}
-
-/// Failures of reading a control stream.
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum ControlStreamError<E> {
-    /// The stream ended, which a control stream may not
-    /// ([RFC 9114 §6.2.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1)).
-    #[snafu(display("the control stream was closed"))]
-    Closed,
-    /// The next frame could not be read.
-    #[snafu(display("could not read a frame of the control stream"))]
-    Frame {
-        /// The failure of reading it.
-        source: NextFrameError<E>,
-    },
-}
-
-/// H3_CLOSED_CRITICAL_STREAM for a control stream that ended; otherwise the
-/// code of the failure of reading the frame.
-impl<E> ErrorCodeOf<ErrorCode> for ControlStreamError<E> {
-    fn error_code(&self) -> Option<ErrorCode> {
-        match self {
-            Self::Closed => Some(ErrorCode::H3_CLOSED_CRITICAL_STREAM),
-            Self::Frame { source } => source.error_code(),
-        }
     }
 }
 
@@ -294,12 +309,10 @@ pub enum Http3UnidirectionalStreamError<E> {
     /// The first frame of a control stream could not be read.
     #[snafu(display("could not read the first frame of a control stream"))]
     Control {
-        /// The failure of reading its head.
-        source: ReadFrameHeadError<E>,
+        /// The failure of reading its head; the end of the stream is a
+        /// failure of the stream, [`CriticalStreamError::Closed`].
+        source: ReadFrameHeadError<CriticalStreamError<E>>,
     },
-    /// A control stream ended before its first frame.
-    #[snafu(display("the control stream was closed before its first frame"))]
-    ControlClosed,
     /// The Push ID of a push stream could not be read.
     #[snafu(display("could not read the push ID of a push stream"))]
     PushId {
@@ -320,12 +333,13 @@ pub enum Http3UnidirectionalStreamError<E> {
 /// H3_CLOSED_CRITICAL_STREAM for a control stream that ended; the code of a
 /// frame head that was rejected or cut short. `None` when the stream fails,
 /// or a push stream ends before its frames, which a receiver tolerates.
-impl<E> ErrorCodeOf<ErrorCode> for Http3UnidirectionalStreamError<E> {
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for Http3UnidirectionalStreamError<E> {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
-            Self::Control { source } | Self::Push { source } => source.error_code(),
-            Self::ControlClosed => Some(ErrorCode::H3_CLOSED_CRITICAL_STREAM),
-            Self::PushId { .. } | Self::PushEnded => None,
+            Self::Control { source } => source.error_code(),
+            Self::Push { source } => source.error_code(),
+            Self::PushId { source } => source.host_error().and_then(ErrorCodeOf::error_code),
+            Self::PushEnded => None,
         }
     }
 }
@@ -347,10 +361,11 @@ where
     use http3_unidirectional_stream_error::{ControlSnafu, PushIdSnafu, PushSnafu};
     Ok(match stream_type {
         Http3StreamType::Control => Http3UnidirectionalStream::Control(ControlStream {
-            frames: FrameStream::read(io, role)
+            // invariant: a critical stream reports its end as a failure.
+            frames: FrameStream::read(Composed::new(io, CriticalStream), role)
                 .await
                 .context(ControlSnafu)?
-                .ok_or(Http3UnidirectionalStreamError::ControlClosed)?,
+                .expect("a critical stream does not end"),
         }),
         Http3StreamType::Push => {
             let push_id = io

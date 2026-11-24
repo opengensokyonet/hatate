@@ -66,7 +66,8 @@ async fn read_settings<
     settings: &mut Settings<L>,
 ) -> Result<Vec<Setting<L::Setting>>, ReadSettingError<PayloadError<F::Error>, L::ValueErrors>>
 where
-    <F as Read>::Error: core::fmt::Debug,
+    <F as Read>::Error:
+        core::fmt::Debug + hatate_wire::error_code::ErrorCodeOf<hatate_wire::error_code::ErrorCode>,
 {
     let Ok(Some(mut stream)) =
         FrameStream::<All, ControlStreamKind, _>::read(&mut *io, Role::Server).await
@@ -114,7 +115,8 @@ macro_rules! streams {
             io: &mut A,
         ) -> Started
         where
-            <F as Read>::Error: core::fmt::Debug,
+            <F as Read>::Error: core::fmt::Debug
+                + hatate_wire::error_code::ErrorCodeOf<hatate_wire::error_code::ErrorCode>,
         {
             match read_bidirectional_stream::<$list, ClientInitiatedBidirectional, _>(&mut *io)
                 .await
@@ -139,7 +141,8 @@ macro_rules! streams {
             server: bool,
         ) -> Started
         where
-            <F as Read>::Error: core::fmt::Debug,
+            <F as Read>::Error: core::fmt::Debug
+                + hatate_wire::error_code::ErrorCodeOf<hatate_wire::error_code::ErrorCode>,
         {
             let stream = if server {
                 read_unidirectional_stream::<$list, ServerInitiatedUnidirectional, _>(&mut *io)

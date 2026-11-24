@@ -123,7 +123,10 @@ enum Failed {
     Part(Option<ErrorCode>),
 }
 
-fn failed<E, P: hatate_wire::error_code::ErrorCodeOf<ErrorCode>>(
+fn failed<
+    E: hatate_wire::error_code::ErrorCodeOf<ErrorCode>,
+    P: hatate_wire::error_code::ErrorCodeOf<ErrorCode>,
+>(
     error: &ReadBidirectionalStreamError<E, P>,
 ) -> Failed {
     let code = error.error_code();

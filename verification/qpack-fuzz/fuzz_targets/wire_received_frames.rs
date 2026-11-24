@@ -28,7 +28,7 @@ use core::{
 use frunk_core::HList;
 use hatate_wire::{
     Role,
-    error_code::{ErrorCode, ErrorCodeOf as _},
+    error_code::{ErrorCode, ErrorCodeOf},
     frame::codec::{ReadFrameError, ReadFrameHeadError, WriteFrameError, WriteFrameExt as _},
     stream::{
         FrameStream, NextFrameError,
@@ -155,7 +155,7 @@ impl Failure {
 /// it ended.
 type Outcome = (Vec<(u64, Vec<u8>)>, Option<Failure>);
 
-fn head_failure<E>(error: &ReadFrameHeadError<E>) -> Failure {
+fn head_failure<E: ErrorCodeOf<ErrorCode>>(error: &ReadFrameHeadError<E>) -> Failure {
     let failure = match error {
         ReadFrameHeadError::Frame {
             source: ReadFrameError::Type { .. } | ReadFrameError::Length { .. },
@@ -168,7 +168,7 @@ fn head_failure<E>(error: &ReadFrameHeadError<E>) -> Failure {
     failure
 }
 
-fn next_failure<E>(error: &NextFrameError<E>) -> Failure {
+fn next_failure<E: ErrorCodeOf<ErrorCode>>(error: &NextFrameError<E>) -> Failure {
     match error {
         NextFrameError::Skip { source } => {
             assert_eq!(source.error_code(), Some(ErrorCode::H3_FRAME_ERROR));

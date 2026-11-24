@@ -57,15 +57,19 @@ pub enum ReadFrameError<E> {
 }
 
 /// H3_FRAME_ERROR when the stream ends inside the head of a frame
-/// ([RFC 9114 §7.1]), on a stream that ended cleanly. `None` when the
-/// stream itself failed.
+/// ([RFC 9114 §7.1]), on a stream that ended cleanly; otherwise the code of
+/// the stream's own failure, such as H3_CLOSED_CRITICAL_STREAM on a critical
+/// stream.
 ///
 /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
-impl<E> ErrorCodeOf<ErrorCode> for ReadFrameError<E> {
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadFrameError<E> {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Type { source } | Self::Length { source } => {
-                source.is_incomplete().then_some(ErrorCode::H3_FRAME_ERROR)
+                if source.is_incomplete() {
+                    return Some(ErrorCode::H3_FRAME_ERROR);
+                }
+                source.host_error().and_then(ErrorCodeOf::error_code)
             }
         }
     }
@@ -150,7 +154,7 @@ pub enum ReadFrameHeadError<E> {
 ///
 /// [RFC 9114 §7.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2
 /// [RFC 9114 §7.2.8]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
-impl<E> ErrorCodeOf<ErrorCode> for ReadFrameHeadError<E> {
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadFrameHeadError<E> {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Frame { source } => source.error_code(),

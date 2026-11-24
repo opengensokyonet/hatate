@@ -421,3 +421,23 @@ pub enum FinishError {
         source: huffman::DecodeError,
     },
 }
+
+impl<E> InputError<E> {
+    /// The error of the stream itself, if the failure came from the stream.
+    pub fn host_error(&self) -> Option<&E> {
+        match self {
+            Self::Host { source } => Some(source),
+            Self::Truncated { .. } | Self::Failed => None,
+        }
+    }
+}
+
+impl<E> HuffmanReadError<E> {
+    /// The error of the stream itself, if the failure came from the stream.
+    pub fn host_error(&self) -> Option<&E> {
+        match self {
+            Self::Input { source } => source.host_error(),
+            Self::Coding { .. } | Self::Failed => None,
+        }
+    }
+}

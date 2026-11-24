@@ -108,15 +108,17 @@ pub enum PayloadError<E> {
 }
 
 /// H3_FRAME_ERROR when the stream ended inside the payload
-/// ([RFC 9114 §7.1]). `None` when the stream failed, and for a read after a
+/// ([RFC 9114 §7.1]); the code of the stream's own failure, such as
+/// H3_CLOSED_CRITICAL_STREAM on a critical stream. `None` for a read after a
 /// failure, whose first failure was already reported.
 ///
 /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
-impl<E> ErrorCodeOf<ErrorCode> for PayloadError<E> {
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for PayloadError<E> {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Truncated { .. } => Some(ErrorCode::H3_FRAME_ERROR),
-            Self::Host { .. } | Self::Failed => None,
+            Self::Host { source } => source.error_code(),
+            Self::Failed => None,
         }
     }
 }

@@ -180,3 +180,37 @@ pub(crate) async fn read_value_header<F: Read, A: ReceiverAccess<Family = F>>(
         .context(value_error::ValueSnafu)?;
     literal_payload::<7, _>(budget, first, length, decoded_left).context(value_error::ValueSnafu)
 }
+
+impl<E> LiteralHeaderError<E> {
+    /// The error of the stream itself, if the failure came from the stream.
+    pub fn host_error(&self) -> Option<&E> {
+        match self {
+            Self::Length { source } => source.host_error(),
+            Self::WireLimit { .. } | Self::DecodedLength { .. } => None,
+        }
+    }
+}
+
+impl<E> StartError<E> {
+    /// The error of the stream itself, if the failure came from the stream.
+    pub fn host_error(&self) -> Option<&E> {
+        match self {
+            Self::Prefix { source } => source.host_error(),
+            Self::Capacity { source } | Self::Duplicate { source } | Self::NameIndex { source } => {
+                source.host_error()
+            }
+            Self::Name { source } => source.host_error(),
+            Self::WireLimit { .. } | Self::Interrupted | Self::StaticName { .. } => None,
+        }
+    }
+}
+
+impl<E> ValueError<E> {
+    /// The error of the stream itself, if the failure came from the stream.
+    pub fn host_error(&self) -> Option<&E> {
+        match self {
+            Self::Prefix { source } => source.host_error(),
+            Self::Value { source } => source.host_error(),
+        }
+    }
+}

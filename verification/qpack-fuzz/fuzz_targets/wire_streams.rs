@@ -212,7 +212,7 @@ struct Failed {
 
 type Outcome = Result<Option<Started>, Failed>;
 
-fn unidirectional_failed<E, P: ErrorCodeOf<ErrorCode>>(
+fn unidirectional_failed<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>>(
     error: &ReadUnidirectionalStreamError<E, P>,
 ) -> Failed {
     let kind = match error {
@@ -229,7 +229,7 @@ fn unidirectional_failed<E, P: ErrorCodeOf<ErrorCode>>(
     }
 }
 
-fn bidirectional_failed<E, P: ErrorCodeOf<ErrorCode>>(
+fn bidirectional_failed<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>>(
     error: &ReadBidirectionalStreamError<E, P>,
 ) -> Failed {
     let kind = match error {
@@ -385,14 +385,21 @@ fn placement(frame_type: u64, kind: u8, role: Role) -> Option<ErrorCode> {
 /// an endpoint of this role: how many bytes it takes and the frame, or the
 /// code of the failure.
 fn head(wire: &[u8], kind: u8, role: Role) -> Result<(usize, First), Option<ErrorCode>> {
+    // A control stream is critical: its end, inside a head too, is a failure
+    // of the stream.
+    let cut = Some(if kind == 1 {
+        ErrorCode::H3_CLOSED_CRITICAL_STREAM
+    } else {
+        ErrorCode::H3_FRAME_ERROR
+    });
     let Some((type_length, frame_type)) = integer_at(wire) else {
-        return Err(Some(ErrorCode::H3_FRAME_ERROR));
+        return Err(cut);
     };
     if let Some(code) = placement(frame_type, kind, role) {
         return Err(Some(code));
     }
     let Some((length_length, length)) = integer_at(&wire[type_length..]) else {
-        return Err(Some(ErrorCode::H3_FRAME_ERROR));
+        return Err(cut);
     };
     Ok((
         type_length + length_length,

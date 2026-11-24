@@ -101,3 +101,19 @@ pub enum WriteError<E> {
     #[snafu(display("could not write decoder instruction"))]
     Send { source: WriteAllError<E> },
 }
+
+impl<E> ReadError<E> {
+    /// The error of the stream itself, if the failure came from the stream.
+    pub fn host_error(&self) -> Option<&E> {
+        match self {
+            Self::Prefix { source } => source.host_error(),
+            Self::AcknowledgmentNumber { source }
+            | Self::CancellationNumber { source }
+            | Self::IncrementNumber { source } => source.host_error(),
+            Self::AcknowledgmentStream { .. }
+            | Self::CancellationStream { .. }
+            | Self::ZeroIncrement
+            | Self::Interrupted => None,
+        }
+    }
+}

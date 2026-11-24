@@ -164,3 +164,23 @@ impl EncodedInteger {
         &self.bytes[..self.len]
     }
 }
+
+impl<E> OctetError<E> {
+    /// The error of the stream itself, if the failure came from the stream.
+    pub fn host_error(&self) -> Option<&E> {
+        match self {
+            Self::Read { source } => source.host_error(),
+            Self::WireLimit { .. } => None,
+        }
+    }
+}
+
+impl<E> NumberError<E> {
+    /// The error of the stream itself, if the failure came from the stream.
+    pub fn host_error(&self) -> Option<&E> {
+        match self {
+            Self::Continuation { source } => source.host_error(),
+            Self::Integer { .. } => None,
+        }
+    }
+}

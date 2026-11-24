@@ -9,6 +9,7 @@ description = "HTTP/3 frames, settings and unidirectional stream types, composed
 [dependencies]
 bytes.workspace = true
 frunk_core.workspace = true
+hatate_qpack.workspace = true
 hatate_wire_qpack.workspace = true
 nitori_call.workspace = true
 nitori_io.workspace = true

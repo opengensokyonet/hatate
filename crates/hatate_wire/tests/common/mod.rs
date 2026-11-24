@@ -157,6 +157,12 @@ impl nitori_io::ExactLen for Liar<'_> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Boom;
 
+impl hatate_wire::error_code::ErrorCodeOf<hatate_wire::error_code::ErrorCode> for Boom {
+    fn error_code(&self) -> Option<hatate_wire::error_code::ErrorCode> {
+        None
+    }
+}
+
 /// A stream whose every read fails.
 pub struct Broken;
 
@@ -169,6 +175,20 @@ impl nitori_io::Read for Broken {
         _cx: &mut Context<'_>,
         _dst: &mut B,
     ) -> Poll<Result<usize, Self::Error>>
+    where
+        Self: 'visit,
+    {
+        Poll::Ready(Err(Boom))
+    }
+}
+
+impl nitori_io::ReadChunk for Broken {
+    type Chunk = bytes::Bytes;
+    fn poll_read_chunk<'visit>(
+        _host: Pin<&mut Self::ReceiverView<'visit>>,
+        _cx: &mut Context<'_>,
+        _maximum: core::num::NonZeroUsize,
+    ) -> Poll<Result<Option<bytes::Bytes>, Self::Error>>
     where
         Self: 'visit,
     {

@@ -321,7 +321,7 @@ pub enum NextFrameError<E> {
 
 /// The code of the failure of skipping or reading; `None` for an
 /// interrupted stream, whose failure was reported before.
-impl<E> ErrorCodeOf<ErrorCode> for NextFrameError<E> {
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for NextFrameError<E> {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Skip { source } => source.error_code(),

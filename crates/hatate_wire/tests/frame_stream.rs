@@ -82,7 +82,9 @@ fn head_failure<E>(error: &ReadFrameHeadError<E>) -> Failure {
     }
 }
 
-fn next_failure<E>(error: &NextFrameError<E>) -> End {
+fn next_failure<E: hatate_wire::error_code::ErrorCodeOf<ErrorCode>>(
+    error: &NextFrameError<E>,
+) -> End {
     match error {
         NextFrameError::Skip { source } => End::Failed(source.error_code(), Failure::Payload),
         NextFrameError::Head { source } => End::Failed(source.error_code(), head_failure(source)),

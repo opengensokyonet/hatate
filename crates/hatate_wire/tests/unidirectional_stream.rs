@@ -16,13 +16,13 @@ use hatate_wire::{
             ServerInitiatedBidirectional, ServerInitiatedUnidirectional, StreamClass as _,
         },
         codec::{ReadUnidirectionalStreamError, read_unidirectional_stream},
-        http3::{ControlStreamError, Http3UnidirectionalStream},
+        http3::Http3UnidirectionalStream,
     },
     stream_type::{Http3StreamType, StreamTypeKind as _},
 };
 use hatate_wire_qpack::{
     QpackStreamType,
-    stream::{QpackDecoderStream, QpackEncoderStream, QpackStreamError},
+    stream::{QpackDecoderStream, QpackEncoderStream},
 };
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::{Read, Skip, prelude::*};
@@ -81,7 +81,10 @@ enum Failed {
     },
 }
 
-fn failed<E, P: hatate_wire::error_code::ErrorCodeOf<ErrorCode> + core::fmt::Debug>(
+fn failed<
+    E: hatate_wire::error_code::ErrorCodeOf<ErrorCode>,
+    P: hatate_wire::error_code::ErrorCodeOf<ErrorCode> + core::fmt::Debug,
+>(
     error: &ReadUnidirectionalStreamError<E, P>,
 ) -> Failed {
     match error {
@@ -413,7 +416,7 @@ fn a_control_stream_that_ends_before_its_first_frame_is_a_closed_critical_stream
             panic!("not a failure of the part");
         };
         assert_eq!(code, Some(ErrorCode::H3_CLOSED_CRITICAL_STREAM));
-        assert!(name.contains("ControlClosed"), "{name}");
+        assert!(name.contains("Control"), "{name}");
     }
 }
 
@@ -431,9 +434,13 @@ fn the_first_frame_of_a_control_stream_is_checked_for_the_stream_and_the_receive
             Some(ErrorCode::H3_FRAME_UNEXPECTED),
         ),
         // A head cut inside the Type or the Length.
-        (&[0x00, 0x40], Some(ErrorCode::H3_FRAME_ERROR)),
-        (&[0x00, 0x04], Some(ErrorCode::H3_FRAME_ERROR)),
-        (&[0x00, 0x04, 0x40], Some(ErrorCode::H3_FRAME_ERROR)),
+        // The control stream is critical: the end is H3_CLOSED_CRITICAL_STREAM.
+        (&[0x00, 0x40], Some(ErrorCode::H3_CLOSED_CRITICAL_STREAM)),
+        (&[0x00, 0x04], Some(ErrorCode::H3_CLOSED_CRITICAL_STREAM)),
+        (
+            &[0x00, 0x04, 0x40],
+            Some(ErrorCode::H3_CLOSED_CRITICAL_STREAM),
+        ),
     ];
     for (wire, code) in cases {
         for read in [read_from_client, read_from_server] {
@@ -588,10 +595,19 @@ fn a_push_stream_is_not_critical_and_the_others_are_critical_and_single() {
 /// How reading a critical stream ended.
 #[derive(Debug, PartialEq, Eq)]
 enum End {
-    /// The stream ended, which a critical stream may not.
+    /// The stream ended, at a boundary or inside a frame or instruction:
+    /// H3_CLOSED_CRITICAL_STREAM.
     Closed,
     /// Another failure, with its code.
     Failed(Option<ErrorCode>),
+}
+
+fn ended(code: Option<ErrorCode>) -> End {
+    if code == Some(ErrorCode::H3_CLOSED_CRITICAL_STREAM) {
+        End::Closed
+    } else {
+        End::Failed(code)
+    }
 }
 
 /// Reads the frames of a control stream a server opened, the first and then
@@ -628,8 +644,7 @@ async fn control_frames<
         };
         match next {
             Ok(frame) => types.push(frame.frame_type().value().get()),
-            Err(ControlStreamError::Closed) => return (types, End::Closed),
-            Err(error) => return (types, End::Failed(error.error_code())),
+            Err(error) => return (types, ended(error.error_code())),
         }
     }
 }
@@ -643,10 +658,6 @@ fn a_control_stream_that_ends_after_a_frame_is_a_closed_critical_stream() {
     let (types, end) = input.sync_control_frames_unpin(false);
     assert_eq!(types, [0x04, 0x21, 0x33, 0x07]);
     assert_eq!(end, End::Closed);
-    assert_eq!(
-        hatate_wire::stream::http3::ControlStreamError::<Infallible>::Closed.error_code(),
-        Some(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
-    );
 
     // Skipping the reserved and unknown frames after the first.
     let mut input = &wire[..];
@@ -663,7 +674,7 @@ fn a_control_stream_that_ends_after_a_frame_is_a_closed_critical_stream() {
 }
 
 #[test]
-fn a_control_stream_cut_inside_a_frame_is_a_failure_of_the_frame() {
+fn a_control_stream_cut_inside_a_frame_is_a_closed_critical_stream() {
     // Inside the payload of the first frame, which is skipped to get to the
     // next, and inside the head of the next.
     for wire in [
@@ -674,10 +685,7 @@ fn a_control_stream_cut_inside_a_frame_is_a_failure_of_the_frame() {
         let mut input = wire;
         let (types, end) = input.sync_control_frames_unpin(false);
         assert_eq!(types, [0x04], "{wire:?}");
-        assert!(
-            matches!(end, End::Failed(Some(code)) if code == ErrorCode::H3_FRAME_ERROR),
-            "{wire:?}: {end:?}"
-        );
+        assert_eq!(end, End::Closed, "{wire:?}");
     }
 }
 
@@ -711,8 +719,7 @@ async fn qpack_instructions<
                         drop(started);
                         seen.push("instruction".to_string());
                     }
-                    Err(QpackStreamError::Closed) => return (seen, End::Closed),
-                    Err(error) => return (seen, End::Failed(error.error_code())),
+                    Err(error) => return (seen, ended(error.error_code())),
                 }
             }
         }
@@ -721,8 +728,7 @@ async fn qpack_instructions<
             loop {
                 match stream.next_instruction(1000).await {
                     Ok(instruction) => seen.push(format!("{instruction:?}")),
-                    Err(QpackStreamError::Closed) => return (seen, End::Closed),
-                    Err(error) => return (seen, End::Failed(error.error_code())),
+                    Err(error) => return (seen, ended(error.error_code())),
                 }
             }
         }
@@ -751,20 +757,15 @@ fn the_two_qpack_streams_end_only_as_a_closed_critical_stream() {
     assert_eq!(end, End::Closed);
     let mut input = &[0x03][..];
     assert_eq!(input.sync_qpack_instructions_unpin(), (vec![], End::Closed));
-    assert_eq!(
-        QpackStreamError::<Infallible>::Closed.error_code(),
-        Some(ErrorCode::H3_CLOSED_CRITICAL_STREAM)
-    );
 }
 
 #[test]
-fn a_qpack_instruction_cut_in_the_middle_is_not_a_clean_close() {
-    // The first byte of an integer that goes on, then the end. The design
-    // maps this to H3_CLOSED_CRITICAL_STREAM too; see the progress file.
+fn a_qpack_instruction_cut_in_the_middle_is_a_closed_critical_stream() {
+    // The first byte of an integer that goes on, then the end.
     for wire in [&[0x02, 0x3f][..], &[0x03, 0x3f]] {
         let mut input = wire;
         let (seen, end) = input.sync_qpack_instructions_unpin();
         assert!(seen.is_empty(), "{wire:?}");
-        assert!(matches!(end, End::Failed(_)), "{wire:?}: {end:?}");
+        assert_eq!(end, End::Closed, "{wire:?}");
     }
 }

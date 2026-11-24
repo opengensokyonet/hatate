@@ -54,6 +54,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "frunk_core",
+ "hatate_qpack",
  "hatate_wire_qpack",
  "nitori_call",
  "nitori_io",
@@ -93,9 +94,11 @@ dependencies = [
 name = "hatate_wire_qpack"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "hatate_qpack",
  "nitori_call",
  "nitori_io",
+ "pin-project-lite",
  "sakuya_var_int",
  "snafu",
 ]

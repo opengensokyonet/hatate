@@ -125,15 +125,17 @@ pub enum ReadUnidirectionalStreamError<E, P> {
     },
 }
 
-/// The code of the rejection, or of the part's failure. `None` when the
-/// stream fails or ends inside its type, which a receiver tolerates
-/// ([RFC 9114 §6.2]).
+/// The code of the rejection, or of the part's failure, or of the stream's
+/// own failure. `None` when the stream ends inside its type, which a
+/// receiver tolerates ([RFC 9114 §6.2]).
 ///
 /// [RFC 9114 §6.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2
-impl<E, P: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadUnidirectionalStreamError<E, P> {
+impl<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode>
+    for ReadUnidirectionalStreamError<E, P>
+{
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
-            Self::Type { .. } => None,
+            Self::Type { source } => source.host_error().and_then(ErrorCodeOf::error_code),
             Self::Rejected { code, .. } => Some(*code),
             Self::Part { source } => source.error_code(),
         }
@@ -246,7 +248,9 @@ pub enum ReadBidirectionalStreamError<E, P> {
 }
 
 /// The code of the failure, the rejection, or the part's failure.
-impl<E, P: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadBidirectionalStreamError<E, P> {
+impl<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode>
+    for ReadBidirectionalStreamError<E, P>
+{
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Head { source } => source.error_code(),
