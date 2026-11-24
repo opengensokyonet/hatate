@@ -632,3 +632,95 @@ fn a_frame_read_writes_back_to_the_same_bytes() {
     assert!(hosts.0.is_empty());
     assert_eq!(hosts.1, input);
 }
+
+/// Reads CANCEL_PUSH and MAX_PUSH_ID of a control stream with their
+/// readers, through the payload of the frame read from the stream.
+#[call(sync)]
+async fn cancel_push_and_max_push_id<F: Skip<Count = usize> + Read<Error = Infallible>>(
+    io: &mut impl ReceiverAccess<Family = F>,
+) -> (u64, usize, u64, usize) {
+    use hatate_wire::frame::control::codec::{
+        ReadCancelPushFrameExt as _, ReadMaxPushIdFrameExt as _,
+    };
+    let Ok(Some(UnidirectionalStream::Control { stream, .. })) =
+        read_unidirectional_stream::<Parts, _>(&mut *io, Role::Server).await
+    else {
+        panic!("not a control stream");
+    };
+    let mut frame = read_received_frame(stream).await.unwrap().unwrap();
+    assert_eq!(frame.frame_type(), h3(Http3FrameType::CancelPush));
+    let widths = frame.frame().widths();
+    let cancel = frame
+        .payload()
+        .read_cancel_push_frame(widths)
+        .await
+        .unwrap();
+    let mut frame = frame.next().await.unwrap().unwrap();
+    assert_eq!(frame.frame_type(), h3(Http3FrameType::MaxPushId));
+    let widths = frame.frame().widths();
+    let max = frame
+        .payload()
+        .read_max_push_id_frame(widths)
+        .await
+        .unwrap();
+    assert!(frame.next().await.unwrap().is_none());
+    (
+        cancel.push_id().get().get().get(),
+        cancel.push_id().encoded_len(),
+        max.push_id().get().get().get(),
+        max.push_id().encoded_len(),
+    )
+}
+
+#[test]
+fn cancel_push_and_max_push_id_read_through_the_payload_of_a_received_frame() {
+    // CANCEL_PUSH with the Push ID 7 in two bytes, MAX_PUSH_ID with 9.
+    let mut input = &[0x00, 0x03, 0x02, 0x40, 0x07, 0x0d, 0x01, 0x09][..];
+    assert_eq!(input.sync_cancel_push_and_max_push_id_unpin(), (7, 2, 9, 1));
+}
+
+/// Reads PUSH_PROMISE of a request stream with its reader, through the
+/// payload of the frame read from the stream: the Push ID, the rest of the
+/// payload, and what follows.
+#[call(sync)]
+async fn push_promise<
+    F: Skip<Count = usize> + Read<Error = Infallible> + FrameStreamInfo<Parts = Parts>,
+>(
+    io: &mut impl ReceiverAccess<Family = F>,
+) -> (u64, Vec<u8>, bool) {
+    use hatate_wire::frame::codec::ReadPushPromisePushIdExt as _;
+    let mut frame = read_received_frame(&mut *io).await.unwrap().unwrap();
+    assert_eq!(frame.frame_type(), h3(Http3FrameType::PushPromise));
+    let push_id = frame.payload().read_push_promise_push_id().await.unwrap();
+    let section = read_some(frame.payload(), 100).await.unwrap();
+    let next = frame.next().await.unwrap();
+    (push_id.get().get().get(), section, next.is_none())
+}
+
+#[call(sync)]
+async fn client_push_promise<F: Skip<Count = usize> + Read<Error = Infallible>>(
+    io: &mut impl ReceiverAccess<Family = F>,
+) -> (u64, Vec<u8>, bool) {
+    io.compose(FrameStream::<Parts>::request(Role::Client))
+        .push_promise()
+        .await
+}
+
+#[test]
+fn push_promise_reads_its_push_id_through_the_payload_of_a_received_frame() {
+    // Push ID 7, then a field section of two bytes.
+    let mut input = &[0x05, 0x03, 0x07, 0xaa, 0xbb][..];
+    assert_eq!(
+        input.sync_client_push_promise_unpin(),
+        (7, vec![0xaa, 0xbb], true)
+    );
+    let receiver = ComposedReceiver::new(
+        &[0x05, 0x03, 0x07, 0xaa, 0xbb][..],
+        FrameStream::<Parts>::request(Role::Client),
+    );
+    let mut receiver = receiver;
+    assert_eq!(
+        receiver.sync_push_promise_unpin(),
+        (7, vec![0xaa, 0xbb], true)
+    );
+}

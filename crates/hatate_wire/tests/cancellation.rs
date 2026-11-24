@@ -16,11 +16,13 @@ use core::{
     task::{Context, Poll, Waker},
 };
 use frunk_core::HList;
+use hatate_wire::stream::FrameStream;
 use hatate_wire::{
+    Role,
     error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
         FrameWidths,
-        codec::read_frame,
+        codec::{read_frame, read_received_frame},
         control::{GoawayFrame, codec::*},
         payload::{FramePayload, PayloadError},
     },
@@ -31,7 +33,7 @@ use hatate_wire::{
     },
 };
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::Read;
+use nitori_io::{Read, Skip, prelude::*};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
 type Parts = HList![hatate_wire::Part];
@@ -220,5 +222,162 @@ fn a_settings_frame_dropped_in_the_middle_keeps_the_count_exact() {
             );
         }
         assert_eq!(payload.remaining(), 0, "{results:?}");
+    }
+}
+
+/// Skips the rest of the payload.
+#[call(sync)]
+async fn skip_payload<F: Skip<Count = usize>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    payload: &mut FramePayload,
+) -> Result<(), PayloadError<F::Error>> {
+    let mut source = io.compose(payload);
+    source.skip_to_end().await
+}
+
+/// DATA with a payload of six bytes, then HEADERS with two, then a byte
+/// that no frame owns.
+const FRAMES: [u8; 13] = [0x00, 0x06, 1, 2, 3, 4, 5, 6, 0x01, 0x02, 0xaa, 0xbb, 0xcc];
+/// The bytes up to the end of the first frame, and up to the end of the
+/// head of the second.
+const FIRST_END: usize = 8;
+const SECOND_HEAD_END: usize = 10;
+
+/// Reads the head of the first frame and finishes it.
+#[call(sync)]
+async fn finish_first<
+    F: Skip<Count = usize> + Read<Error = core::convert::Infallible>,
+    A: ReceiverAccess<Family = F>,
+>(
+    io: &mut A,
+) {
+    let frame = read_frame(&mut *io).await.unwrap().unwrap();
+    let _ = frame.finish().await.unwrap();
+}
+
+/// Reads the head of the first frame, finishes it, and reads the next.
+#[call(sync)]
+async fn next_first<
+    F: Skip<Count = usize> + Read<Error = core::convert::Infallible>,
+    A: ReceiverAccess<Family = F>,
+>(
+    io: &mut A,
+) -> u64 {
+    let frame = read_frame(&mut *io).await.unwrap().unwrap();
+    let next = frame.next().await.unwrap().unwrap();
+    next.r#type().get().get()
+}
+
+/// [`finish_first`] for a frame of a stream that carries frames.
+#[call(sync)]
+async fn finish_first_received<
+    F: Skip<Count = usize> + Read<Error = core::convert::Infallible>,
+    A: ReceiverAccess<Family = F>,
+>(
+    io: &mut A,
+) {
+    let mut stream = io.compose(FrameStream::<Parts>::request(Role::Server));
+    let frame = read_received_frame(&mut stream).await.unwrap().unwrap();
+    let _ = frame.finish().await.unwrap();
+}
+
+/// [`next_first`] for a frame of a stream that carries frames.
+#[call(sync)]
+async fn next_first_received<
+    F: Skip<Count = usize> + Read<Error = core::convert::Infallible>,
+    A: ReceiverAccess<Family = F>,
+>(
+    io: &mut A,
+) -> u64 {
+    let mut stream = io.compose(FrameStream::<Parts>::request(Role::Server));
+    let frame = read_received_frame(&mut stream).await.unwrap().unwrap();
+    let next = frame.next().await.unwrap().unwrap();
+    next.frame().r#type().get().get()
+}
+
+/// Drops `finish` and `next` after every number of polls: the stream is
+/// never read past what the call had reached, which is inside the first
+/// frame while finishing, and inside the head of the second while reading
+/// it; and a call that completes leaves the stream at the next frame, or
+/// after its head.
+macro_rules! drop_in_the_middle {
+    ($name:ident, $finish:ident, $next:ident) => {
+        #[test]
+        fn $name() {
+            let mut consumed_before = 0;
+            for polls in 0..40 {
+                let mut host = Dribble::new(&FRAMES, 1);
+                let done = poll_then_drop(host.$finish(), polls);
+                let consumed = FRAMES.len() - host.rest().len();
+                assert!(consumed <= FIRST_END, "polls {polls}: {consumed}");
+                assert!(consumed <= polls, "polls {polls}: {consumed}");
+                assert!(consumed >= consumed_before, "polls {polls}");
+                consumed_before = consumed;
+                // The last skip completes the call: it is done exactly
+                // when the first frame is, and then the stream is at the
+                // second.
+                assert_eq!(done, consumed == FIRST_END, "polls {polls}");
+                if done {
+                    assert_eq!(host.rest(), &FRAMES[FIRST_END..]);
+                }
+            }
+            assert_eq!(consumed_before, FIRST_END);
+
+            let mut consumed_before = 0;
+            for polls in 0..40 {
+                let mut host = Dribble::new(&FRAMES, 1);
+                let done = poll_then_drop(host.$next(), polls);
+                let consumed = FRAMES.len() - host.rest().len();
+                assert!(consumed <= SECOND_HEAD_END, "polls {polls}: {consumed}");
+                assert!(consumed >= consumed_before, "polls {polls}");
+                consumed_before = consumed;
+                assert_eq!(done, consumed == SECOND_HEAD_END, "polls {polls}");
+                if done {
+                    // The head of the second frame is read, and its
+                    // payload is next on the stream.
+                    assert_eq!(host.rest(), &FRAMES[SECOND_HEAD_END..]);
+                }
+            }
+            assert_eq!(consumed_before, SECOND_HEAD_END);
+        }
+    };
+}
+
+drop_in_the_middle!(
+    a_frame_finished_or_moved_past_and_dropped_never_passes_what_it_reached,
+    finish_first_unpin,
+    next_first_unpin
+);
+drop_in_the_middle!(
+    a_received_frame_finished_or_moved_past_and_dropped_never_passes_what_it_reached,
+    finish_first_received_unpin,
+    next_first_received_unpin
+);
+
+#[test]
+fn a_payload_skipped_in_part_and_dropped_keeps_the_count_exact() {
+    for polls in 0..20 {
+        let mut host = Dribble::new(&FRAMES, 1);
+        let mut payload = {
+            let mut future = pin!(host.payload_of_unpin());
+            let mut cx = Context::from_waker(Waker::noop());
+            loop {
+                if let Poll::Ready(payload) = future.as_mut().poll(&mut cx) {
+                    break payload;
+                }
+            }
+        };
+        assert_eq!(payload.remaining(), 6);
+        let done = poll_then_drop(host.skip_payload_unpin(&mut payload), polls);
+        let consumed = FRAMES.len() - host.rest().len() - 2;
+        // The payload counts every byte skipped, so skipping again takes
+        // exactly what is left and stops at the end of the frame.
+        assert_eq!(payload.remaining(), 6 - consumed as u64, "polls {polls}");
+        assert_eq!(done, payload.remaining() == 0, "polls {polls}");
+        common::run(host.skip_payload_unpin(&mut payload))
+            .0
+            .unwrap();
+        assert_eq!(payload.remaining(), 0);
+        assert_eq!(host.rest(), &FRAMES[FIRST_END..], "polls {polls}");
     }
 }
