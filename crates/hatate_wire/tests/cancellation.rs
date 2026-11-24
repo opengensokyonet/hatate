@@ -135,7 +135,7 @@ fn a_goaway_dropped_in_the_middle_keeps_the_count_exact() {
         // except when only the last byte is left, which reads as a small
         // integer without any error.
         match (consumed, again) {
-            (0, Ok(frame)) => assert_eq!(frame.id().get().get(), 0x0102_0304),
+            (0, Ok(frame)) => assert_eq!(frame.id().get().get().get(), 0x0102_0304),
             (1..=6, Err(error)) => {
                 assert!(
                     matches!(error, ReadIntegerFrameError::Trailing { .. }),
@@ -146,7 +146,7 @@ fn a_goaway_dropped_in_the_middle_keeps_the_count_exact() {
             }
             (7, Ok(frame)) => {
                 // The last byte of the integer, 0x04, read as an integer.
-                assert_eq!(frame.id().get().get(), 0x04);
+                assert_eq!(frame.id().get().get().get(), 0x04);
                 assert_eq!(payload.remaining(), 0);
             }
             (consumed, again) => panic!("{consumed} bytes consumed: {again:?}"),

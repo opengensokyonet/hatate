@@ -8,7 +8,7 @@ use frunk_core::{HList, coproduct::Coproduct};
 use hatate_wire::{
     error_code::ErrorCode,
     frame::{
-        FrameType, FrameWidths, Http3FrameType, PushId,
+        FrameType, FrameWidths, GoawayId, Http3FrameType, PushId,
         codec::ReadFrameHeadExt as _,
         control::{codec::*, *},
         payload::PayloadError,
@@ -93,7 +93,7 @@ fn goaway_keeps_every_width() {
                 let bytes = wire(Http3FrameType::Goaway, widths, 4, width);
                 let frame = (&bytes[..]).sync_read_goaway_unpin().unwrap();
                 assert_eq!(frame.widths(), widths);
-                assert_eq!(frame.id().get().get(), 4);
+                assert_eq!(frame.id().get().get().get(), 4);
                 assert_eq!(frame.id().width(), width);
                 assert_eq!(frame.encoded_len(), bytes.len());
                 let mut written = Vec::new();
@@ -133,7 +133,7 @@ fn cancel_push_and_max_push_id_keep_their_widths() {
 #[test]
 fn new_writes_the_shortest_widths() {
     let mut out = Vec::new();
-    let frame = GoawayFrame::new(VarIntField::shortest(VarInt::from_u32(300)));
+    let frame = GoawayFrame::new(VarIntField::shortest(GoawayId::new(VarInt::from_u32(300))));
     assert_eq!(frame.widths(), FrameWidths::SHORTEST);
     assert_eq!(frame.encoded_len(), 4);
     out.sync_write_goaway_frame_unpin(frame).unwrap();
@@ -242,7 +242,16 @@ fn a_stream_that_ends_inside_the_payload_is_a_frame_error() {
 #[test]
 fn the_next_frame_is_left_unread() {
     let mut input = &[0x07, 0x01, 0x04, 0x0d, 0x01, 0x08][..];
-    assert_eq!(input.sync_read_goaway_unpin().unwrap().id().get().get(), 4);
+    assert_eq!(
+        input
+            .sync_read_goaway_unpin()
+            .unwrap()
+            .id()
+            .get()
+            .get()
+            .get(),
+        4
+    );
     assert_eq!(input, [0x0d, 0x01, 0x08]);
     assert_eq!(
         input
@@ -268,7 +277,7 @@ fn a_pending_between_every_byte_changes_nothing() {
     let mut host = Dribble::new(&bytes, 1);
     let (frame, pending) = run(host.read_goaway_unpin());
     let frame = frame.unwrap();
-    assert_eq!(frame.id().get().get(), 1 << 30);
+    assert_eq!(frame.id().get().get().get(), 1 << 30);
     assert_eq!(frame.id().width(), VarIntWidth::Eight);
     assert!(pending >= bytes.len(), "{pending}");
     assert!(host.rest().is_empty());

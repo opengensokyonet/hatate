@@ -9,8 +9,8 @@
 //!
 //! [`FramePayload`]: super::payload::FramePayload
 //! [RFC 9114 §7.2.3, §7.2.6, §7.2.7]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.3
-use super::{FrameWidths, PushId};
-use sakuya_var_int::{VarInt, VarIntField};
+use super::{FrameWidths, GoawayId, PushId};
+use sakuya_var_int::VarIntField;
 
 #[allow(missing_docs)] // The call macro also generates operation and extension trait items.
 pub mod codec;
@@ -68,12 +68,11 @@ integer_frame! {
 }
 
 integer_frame! {
-    /// A GOAWAY frame (type 0x07, [RFC 9114 §7.2.6]). From a server the ID
-    /// is a client-initiated bidirectional stream ID; from a client, a push
-    /// ID. Which one it is, and whether it is valid, depends on the sender.
+    /// A GOAWAY frame (type 0x07, [RFC 9114 §7.2.6]): the sender begins to
+    /// shut the connection down, up to the [`GoawayId`].
     ///
     /// [RFC 9114 §7.2.6]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.6
-    GoawayFrame, id: VarInt
+    GoawayFrame, id: GoawayId
 }
 
 integer_frame! {

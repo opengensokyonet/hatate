@@ -53,7 +53,7 @@ where
         source.read_goaway_frame(head.widths()).await.unwrap()
     };
     payload.finish().unwrap();
-    (count, goaway.id().get().get())
+    (count, goaway.id().get().get().get())
 }
 
 #[test]

@@ -224,6 +224,39 @@ impl From<PushId> for VarInt {
     }
 }
 
+/// The ID of a GOAWAY frame ([RFC 9114 §7.2.6]): from a server, a
+/// client-initiated bidirectional stream ID; from a client, a push ID. Which
+/// one it is, and whether it is valid, is a question for the connection,
+/// which knows who sent the frame.
+///
+/// [RFC 9114 §7.2.6]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.6
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GoawayId(VarInt);
+
+impl GoawayId {
+    /// The ID `value`.
+    pub const fn new(value: VarInt) -> Self {
+        Self(value)
+    }
+
+    /// The value.
+    pub const fn get(self) -> VarInt {
+        self.0
+    }
+}
+
+impl From<VarInt> for GoawayId {
+    fn from(value: VarInt) -> Self {
+        Self(value)
+    }
+}
+
+impl From<GoawayId> for VarInt {
+    fn from(id: GoawayId) -> Self {
+        id.0
+    }
+}
+
 /// The widths of the Type and Length of a frame whose Length the payload
 /// determines. Every width holds the Type of a frame of RFC 9114 and the
 /// Length of a CANCEL_PUSH, GOAWAY or MAX_PUSH_ID; the Length of a SETTINGS
