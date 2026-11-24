@@ -68,6 +68,7 @@ dependencies = [
  "frunk_core",
  "hatate_wire",
  "hatate_wire_extended_connect",
+ "hatate_wire_qpack",
  "nitori_call",
  "nitori_io",
  "sakuya_var_int",

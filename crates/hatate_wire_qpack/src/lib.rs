@@ -16,48 +16,73 @@
     clippy::alloc_instead_of_core
 )]
 
-use sakuya_var_int::VarInt;
+use sakuya_var_int::{VarInt, VarIntField};
 
-/// A setting that QPACK defines ([RFC 9204 §5]).
+/// SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x01): the largest dynamic table
+/// capacity the encoder may set ([RFC 9204 §5]). Every value is valid.
 ///
-/// Both default to 0: without them the peer has no dynamic table and no
-/// stream may be blocked.
+/// It defaults to 0: without it the peer has no dynamic table.
 ///
 /// [RFC 9204 §5]: https://www.rfc-editor.org/rfc/rfc9204.html#section-5
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum QpackSettingIdentifier {
-    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x01): the largest dynamic table
-    /// capacity the encoder may set.
-    MaxTableCapacity,
-    /// SETTINGS_QPACK_BLOCKED_STREAMS (0x07): how many streams may be
-    /// blocked waiting for encoder instructions.
-    BlockedStreams,
+pub struct QpackMaxTableCapacity {
+    value: VarIntField<VarInt>,
 }
 
-impl QpackSettingIdentifier {
-    /// Both identifiers.
-    pub const ALL: [Self; 2] = [Self::MaxTableCapacity, Self::BlockedStreams];
-
+impl QpackMaxTableCapacity {
     /// The setting identifier on the wire.
-    pub const fn value(self) -> VarInt {
-        VarInt::from_u32(match self {
-            Self::MaxTableCapacity => 0x01,
-            Self::BlockedStreams => 0x07,
-        })
+    pub const IDENTIFIER: VarInt = VarInt::from_u32(0x01);
+
+    /// The setting with `value`.
+    pub const fn new(value: VarIntField<VarInt>) -> Self {
+        Self { value }
     }
 
-    /// The setting with the identifier `value`, if QPACK defines it.
-    pub const fn of(value: VarInt) -> Option<Self> {
-        match value.get() {
-            0x01 => Some(Self::MaxTableCapacity),
-            0x07 => Some(Self::BlockedStreams),
-            _ => None,
-        }
+    /// The value.
+    pub const fn value(&self) -> VarIntField<VarInt> {
+        self.value
+    }
+}
+
+/// The value that applies until the peer's SETTINGS frame states one: 0,
+/// in its shortest encoding.
+impl Default for QpackMaxTableCapacity {
+    fn default() -> Self {
+        Self::new(VarIntField::shortest(VarInt::ZERO))
+    }
+}
+
+/// SETTINGS_QPACK_BLOCKED_STREAMS (0x07): how many streams may be blocked
+/// waiting for encoder instructions ([RFC 9204 §5]). Every value is valid.
+///
+/// It defaults to 0: without it no stream may be blocked.
+///
+/// [RFC 9204 §5]: https://www.rfc-editor.org/rfc/rfc9204.html#section-5
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct QpackBlockedStreams {
+    value: VarIntField<VarInt>,
+}
+
+impl QpackBlockedStreams {
+    /// The setting identifier on the wire.
+    pub const IDENTIFIER: VarInt = VarInt::from_u32(0x07);
+
+    /// The setting with `value`.
+    pub const fn new(value: VarIntField<VarInt>) -> Self {
+        Self { value }
     }
 
-    /// The value that applies until the peer's SETTINGS frame states one.
-    pub const fn default_value(self) -> VarInt {
-        VarInt::ZERO
+    /// The value.
+    pub const fn value(&self) -> VarIntField<VarInt> {
+        self.value
+    }
+}
+
+/// The value that applies until the peer's SETTINGS frame states one: 0,
+/// in its shortest encoding.
+impl Default for QpackBlockedStreams {
+    fn default() -> Self {
+        Self::new(VarIntField::shortest(VarInt::ZERO))
     }
 }
 
@@ -148,17 +173,16 @@ mod tests {
 
     #[test]
     fn values_map_back() {
-        for id in QpackSettingIdentifier::ALL {
-            assert_eq!(QpackSettingIdentifier::of(id.value()), Some(id));
-            assert_eq!(id.default_value(), VarInt::ZERO);
-        }
+        assert_eq!(QpackMaxTableCapacity::IDENTIFIER.get(), 0x01);
+        assert_eq!(QpackBlockedStreams::IDENTIFIER.get(), 0x07);
+        assert_eq!(QpackMaxTableCapacity::default().value().get(), VarInt::ZERO);
+        assert_eq!(QpackBlockedStreams::default().value().get(), VarInt::ZERO);
         for kind in QpackStreamType::ALL {
             assert_eq!(QpackStreamType::of(kind.value()), Some(kind));
         }
         for code in QpackErrorCode::ALL {
             assert_eq!(QpackErrorCode::of(code.value()), Some(code));
         }
-        assert_eq!(QpackSettingIdentifier::of(VarInt::from_u32(0x06)), None);
         assert_eq!(QpackStreamType::of(VarInt::from_u32(0x00)), None);
         assert_eq!(QpackErrorCode::of(VarInt::from_u32(0x0203)), None);
     }

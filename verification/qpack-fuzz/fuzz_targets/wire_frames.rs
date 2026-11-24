@@ -20,7 +20,6 @@ use core::{
 };
 use frunk_core::{HList, coproduct::Coproduct};
 use hatate_wire::{
-    defaults::RejectKnownDuplicates,
     frame::{
         FrameType, Http3FrameType,
         codec::ReadFrameHeadExt as _,
@@ -33,8 +32,11 @@ use hatate_wire::{
             WriteCancelPushFrameExt as _, WriteGoawayFrameExt as _, WriteMaxPushIdFrameExt as _,
         },
     },
-    settings::codec::{
-        ReadSettingExt as _, SettingsFrame, SettingsFrameError, WriteSettingsFrameExt as _,
+    settings::{
+        codec::{
+            ReadSettingExt as _, SettingsFrame, SettingsFrameError, WriteSettingsFrameExt as _,
+        },
+        set::{Settings, SettingsOf},
     },
 };
 use libfuzzer_sys::fuzz_target;
@@ -149,23 +151,22 @@ async fn walk<
         let mut whole = false;
         match head.frame_type() {
             FrameType::Known(Coproduct::Inl(Http3FrameType::Settings)) => {
-                let mut policy = RejectKnownDuplicates::<Parts>::new();
+                let mut slots = Settings::<<Parts as SettingsOf>::Settings>::new();
                 let mut settings = Vec::new();
                 {
                     let mut source = io.compose(&mut payload);
                     loop {
-                        match source.read_setting(&mut policy).await {
+                        match source.read_setting(&mut slots).await {
                             Ok(Some(setting)) => settings.push(setting),
                             Ok(None) => break,
                             Err(_) => return,
                         }
                     }
                 }
-                match SettingsFrame::new::<Parts>(settings, widths) {
+                match SettingsFrame::<<Parts as SettingsOf>::Settings>::new(settings, widths) {
                     Ok(frame) => {
                         assert_eq!(frame.payload_len(), length);
-                        let Ok(()) = out.write_settings_frame(&frame, PhantomData::<Parts>).await
-                        else {
+                        let Ok(()) = out.write_settings_frame(&frame).await else {
                             panic!("a SETTINGS frame was not written");
                         };
                         whole = true;

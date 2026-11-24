@@ -1,201 +1,295 @@
-//! The setting identifiers of a list of parts.
-use super::RESERVED_SETTING_IDENTIFIERS;
-use crate::registry::ClaimedValues;
-use core::error::Error;
+//! The setting types of a list of parts, and the settings read with them.
+use super::{Keyed, KeyedSetting, RESERVED_SETTING_IDENTIFIERS};
+use crate::registry::is_reserved;
+use core::{fmt, ops::Add};
 use frunk_core::{
     coproduct::{CNil, Coproduct},
-    hlist::{HCons, HNil},
+    hlist::{HCons, HNil, Selector},
 };
-use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
+use sakuya_var_int::{VarInt, VarIntField};
 
 /// One part of the settings of a connection: those RFC 9114 and QPACK
 /// define, or those of one extension.
 ///
 /// It is implemented by the marker type of each part. A list of parts
-/// implements [`SettingsSet`], which [`read_setting`](super::codec::read_setting)
-/// reads with.
+/// implements [`SettingsOf`], which joins the lists of its parts.
 pub trait SettingsPart {
-    /// A setting identifier this part claims, in the form of this part:
-    /// obtained only from [`identifier_of`](Self::identifier_of).
-    type Identifier: Copy + Eq;
-
-    /// A setting of this part: an identifier, a valid value, and the widths
-    /// of both on the wire.
-    type Setting;
-
-    /// The failures of a value that this part rejects. Each is a connection
-    /// error of type H3_SETTINGS_ERROR.
-    type ValueError: Error + 'static;
-
-    /// Which identifiers of this part have occurred, for a
-    /// [`DuplicateSettingPolicy`](super::codec::DuplicateSettingPolicy):
-    /// none by default.
-    type Occurrences: Default;
-
-    /// The identifiers this part claims.
-    const SETTING_IDENTIFIERS: &'static ClaimedValues;
-
-    /// The identifier `value` in the form of this part, or `None` for one
-    /// this part does not claim.
-    fn identifier_of(value: VarInt) -> Option<Self::Identifier>;
-
-    /// The setting `identifier`, at `identifier_width`, with `value`.
-    ///
-    /// # Errors
-    ///
-    /// [`ValueError`](Self::ValueError) if the value is not valid for the
-    /// setting.
-    fn setting_of(
-        identifier: Self::Identifier,
-        identifier_width: VarIntWidth,
-        value: VarIntField<VarInt>,
-    ) -> Result<Self::Setting, Self::ValueError>;
-
-    /// The identifier of `setting`.
-    fn identifier(setting: &Self::Setting) -> Self::Identifier;
-
-    /// The identifier and value of `setting` as they are on the wire.
-    fn fields(setting: &Self::Setting) -> (VarIntField<VarInt>, VarIntField<VarInt>);
-
-    /// Records that `identifier` occurred; `false` if it had already.
-    fn record(occurrences: &mut Self::Occurrences, identifier: Self::Identifier) -> bool;
+    /// The setting types of the part, as a list used as a type only, such
+    /// as `HList![QpackMaxTableCapacity, MaxFieldSectionSize]`.
+    type Settings: SettingList;
 }
 
-/// The settings of a list of parts, `HNil` or `HCons<P, Ps>`. An
-/// identifier, setting or value failure of the list is a `Coproduct` of
-/// those of the parts, in the order of the list, ending in `CNil`.
-pub trait SettingsSet {
-    /// An identifier a part of this list claims, in the form of that part.
-    type Identifier: Copy + Eq;
-    /// A setting of a part of this list.
+/// The setting types of a list of parts: the lists of the parts
+/// ([`SettingsPart::Settings`]) joined in the order of the parts.
+///
+/// It is implemented for `HNil` and for `HCons<P, Ps>` of a part `P` and a
+/// list of parts `Ps`, such as `HList![hatate_wire::Part,
+/// hatate_wire_datagram::Part]`.
+pub trait SettingsOf {
+    /// The joined list: one flat list of setting types.
+    type Settings: SettingList;
+}
+
+impl SettingsOf for HNil {
+    type Settings = HNil;
+}
+
+impl<P, Ps> SettingsOf for HCons<P, Ps>
+where
+    P: SettingsPart,
+    Ps: SettingsOf,
+    P::Settings: Add<Ps::Settings>,
+    <P::Settings as Add<Ps::Settings>>::Output: SettingList,
+{
+    type Settings = <P::Settings as Add<Ps::Settings>>::Output;
+}
+
+/// The identifiers that the types of a [`SettingList`] claim, in the order
+/// of the list.
+#[derive(Debug)]
+pub struct SettingIdentifiers(Option<(VarInt, &'static SettingIdentifiers)>);
+
+impl SettingIdentifiers {
+    /// No identifier.
+    const EMPTY: Self = Self(None);
+
+    /// `first`, then the identifiers of `rest`.
+    const fn with(first: VarInt, rest: &'static Self) -> Self {
+        Self(Some((first, rest)))
+    }
+
+    /// Whether `identifier` is one of the identifiers.
+    pub const fn contains(&self, identifier: VarInt) -> bool {
+        let mut identifiers = self;
+        while let Some((first, rest)) = identifiers.0 {
+            if first.get() == identifier.get() {
+                return true;
+            }
+            identifiers = rest;
+        }
+        false
+    }
+}
+
+/// A list of setting types: `HNil`, or `HCons<H, T>` of a setting type `H`
+/// and a list `T`, such as `HList![MaxFieldSectionSize, H3Datagram]`. The
+/// list is used as a type only; the values are in [`Settings`].
+///
+/// Each function handles the first type of the list and leaves the rest to
+/// the rest of the list.
+pub trait SettingList {
+    /// One slot per type, in the order of the list: `HNil`, or
+    /// `HCons<Option<Keyed<H>>, T::Slots>`.
+    type Slots;
+
+    /// A setting of a type of the list: `CNil`, or
+    /// `Coproduct<Keyed<H>, T::Setting>`.
     type Setting;
-    /// A failure of a value that a part of this list rejects.
-    type ValueError;
-    /// The occurrences of the parts' identifiers.
-    type Occurrences: Default;
 
-    /// The identifiers the parts of this list claim.
-    const SETTING_IDENTIFIERS: &'static ClaimedValues;
+    /// The sum of the [`KeyedSetting::ValueError`]s of the types: `CNil`,
+    /// or `Coproduct<H::ValueError, T::ValueErrors>`.
+    type ValueErrors;
 
-    /// Whether the parts claim disjoint identifiers, none of them reserved
-    /// ([`is_reserved`](crate::registry::is_reserved)), 0x00, or left by
-    /// HTTP/2 ([`Http2SettingIdentifier`](super::Http2SettingIdentifier)).
+    /// The identifiers the types claim.
+    const IDENTIFIERS: &'static SettingIdentifiers;
+
+    /// Whether no two types claim the same identifier, and none claims a
+    /// reserved one ([`is_reserved`]), 0x00,
+    /// or one left by HTTP/2
+    /// ([`Http2SettingIdentifier`](super::Http2SettingIdentifier)).
     const CLAIMS_VALID: bool;
 
-    /// The identifier `value` in the form of the part that claims it.
-    fn identifier_of(value: VarInt) -> Option<Self::Identifier>;
+    /// The slots with every slot empty.
+    fn empty() -> Self::Slots;
 
-    /// The setting `identifier` with `value`, as its part checks it.
+    /// Whether the slot of the type that claims `identifier` holds a
+    /// setting; `false` if no type claims it.
+    fn is_taken(slots: &Self::Slots, identifier: VarInt) -> bool;
+
+    /// The setting of `identifier` with `value`, as the type that claims
+    /// the identifier checks it; `None` if no type claims it.
     ///
     /// # Errors
     ///
-    /// The part's failure if it rejects the value.
+    /// The failure of the type if it rejects the value.
     fn setting_of(
-        identifier: Self::Identifier,
-        identifier_width: VarIntWidth,
+        identifier: VarIntField<VarInt>,
         value: VarIntField<VarInt>,
-    ) -> Result<Self::Setting, Self::ValueError>;
+    ) -> Option<Result<Self::Setting, Self::ValueErrors>>;
 
-    /// The identifier of `setting`.
-    fn identifier(setting: &Self::Setting) -> Self::Identifier;
+    /// Puts `setting` into the slot of its type.
+    fn insert(slots: &mut Self::Slots, setting: &Self::Setting);
 
     /// The identifier and value of `setting` as they are on the wire.
     fn fields(setting: &Self::Setting) -> (VarIntField<VarInt>, VarIntField<VarInt>);
-
-    /// Records that `identifier` occurred; `false` if it had already.
-    fn record(occurrences: &mut Self::Occurrences, identifier: Self::Identifier) -> bool;
 }
 
-impl SettingsSet for HNil {
-    type Identifier = CNil;
+impl SettingList for HNil {
+    type Slots = HNil;
     type Setting = CNil;
-    type ValueError = CNil;
-    type Occurrences = ();
-    const SETTING_IDENTIFIERS: &'static ClaimedValues = &ClaimedValues::NONE;
+    type ValueErrors = CNil;
+    const IDENTIFIERS: &'static SettingIdentifiers = &SettingIdentifiers::EMPTY;
     const CLAIMS_VALID: bool = true;
 
-    fn identifier_of(_value: VarInt) -> Option<CNil> {
+    fn empty() -> HNil {
+        HNil
+    }
+
+    fn is_taken(_slots: &HNil, _identifier: VarInt) -> bool {
+        false
+    }
+
+    fn setting_of(
+        _identifier: VarIntField<VarInt>,
+        _value: VarIntField<VarInt>,
+    ) -> Option<Result<CNil, CNil>> {
         None
     }
 
-    fn setting_of(
-        identifier: CNil,
-        _identifier_width: VarIntWidth,
-        _value: VarIntField<VarInt>,
-    ) -> Result<CNil, CNil> {
-        match identifier {}
-    }
-
-    fn identifier(setting: &CNil) -> CNil {
+    fn insert(_slots: &mut HNil, setting: &CNil) {
         match *setting {}
     }
 
     fn fields(setting: &CNil) -> (VarIntField<VarInt>, VarIntField<VarInt>) {
         match *setting {}
     }
-
-    fn record(_occurrences: &mut (), identifier: CNil) -> bool {
-        match identifier {}
-    }
 }
 
-impl<P: SettingsPart, Ps: SettingsSet> SettingsSet for HCons<P, Ps> {
-    type Identifier = Coproduct<P::Identifier, Ps::Identifier>;
-    type Setting = Coproduct<P::Setting, Ps::Setting>;
-    type ValueError = Coproduct<P::ValueError, Ps::ValueError>;
-    type Occurrences = (P::Occurrences, Ps::Occurrences);
-    const SETTING_IDENTIFIERS: &'static ClaimedValues =
-        &ClaimedValues::join(P::SETTING_IDENTIFIERS, Ps::SETTING_IDENTIFIERS);
-    const CLAIMS_VALID: bool = Ps::CLAIMS_VALID
-        && P::SETTING_IDENTIFIERS.is_disjoint(Ps::SETTING_IDENTIFIERS)
-        && P::SETTING_IDENTIFIERS.is_disjoint(&RESERVED_SETTING_IDENTIFIERS)
-        && P::SETTING_IDENTIFIERS.avoids_reserved();
+impl<H: KeyedSetting, T: SettingList> SettingList for HCons<H, T> {
+    type Slots = HCons<Option<Keyed<H>>, T::Slots>;
+    type Setting = Coproduct<Keyed<H>, T::Setting>;
+    type ValueErrors = Coproduct<H::ValueError, T::ValueErrors>;
+    const IDENTIFIERS: &'static SettingIdentifiers =
+        &SettingIdentifiers::with(H::IDENTIFIER, T::IDENTIFIERS);
+    const CLAIMS_VALID: bool = T::CLAIMS_VALID
+        && !T::IDENTIFIERS.contains(H::IDENTIFIER)
+        && !RESERVED_SETTING_IDENTIFIERS.contains(H::IDENTIFIER)
+        && !is_reserved(H::IDENTIFIER);
 
-    fn identifier_of(value: VarInt) -> Option<Self::Identifier> {
-        const {
-            assert!(
-                Self::CLAIMS_VALID,
-                "the parts claim overlapping or reserved setting identifiers"
-            );
+    fn empty() -> Self::Slots {
+        HCons {
+            head: None,
+            tail: T::empty(),
         }
-        P::identifier_of(value)
-            .map(Coproduct::Inl)
-            .or_else(|| Ps::identifier_of(value).map(Coproduct::Inr))
+    }
+
+    fn is_taken(slots: &Self::Slots, identifier: VarInt) -> bool {
+        if identifier == H::IDENTIFIER {
+            slots.head.is_some()
+        } else {
+            T::is_taken(&slots.tail, identifier)
+        }
     }
 
     fn setting_of(
-        identifier: Self::Identifier,
-        identifier_width: VarIntWidth,
+        identifier: VarIntField<VarInt>,
         value: VarIntField<VarInt>,
-    ) -> Result<Self::Setting, Self::ValueError> {
-        match identifier {
-            Coproduct::Inl(identifier) => P::setting_of(identifier, identifier_width, value)
-                .map(Coproduct::Inl)
-                .map_err(Coproduct::Inl),
-            Coproduct::Inr(identifier) => Ps::setting_of(identifier, identifier_width, value)
-                .map(Coproduct::Inr)
-                .map_err(Coproduct::Inr),
+    ) -> Option<Result<Self::Setting, Self::ValueErrors>> {
+        if identifier.get() != H::IDENTIFIER {
+            return T::setting_of(identifier, value)
+                .map(|result| result.map(Coproduct::Inr).map_err(Coproduct::Inr));
         }
+        Some(
+            H::from_value(value)
+                .map(|setting| Coproduct::Inl(Keyed::read(identifier, setting)))
+                .map_err(Coproduct::Inl),
+        )
     }
 
-    fn identifier(setting: &Self::Setting) -> Self::Identifier {
+    fn insert(slots: &mut Self::Slots, setting: &Self::Setting) {
         match setting {
-            Coproduct::Inl(setting) => Coproduct::Inl(P::identifier(setting)),
-            Coproduct::Inr(setting) => Coproduct::Inr(Ps::identifier(setting)),
+            Coproduct::Inl(setting) => slots.head = Some(*setting),
+            Coproduct::Inr(setting) => T::insert(&mut slots.tail, setting),
         }
     }
 
     fn fields(setting: &Self::Setting) -> (VarIntField<VarInt>, VarIntField<VarInt>) {
         match setting {
-            Coproduct::Inl(setting) => P::fields(setting),
-            Coproduct::Inr(setting) => Ps::fields(setting),
-        }
-    }
-
-    fn record(occurrences: &mut Self::Occurrences, identifier: Self::Identifier) -> bool {
-        match identifier {
-            Coproduct::Inl(identifier) => P::record(&mut occurrences.0, identifier),
-            Coproduct::Inr(identifier) => Ps::record(&mut occurrences.1, identifier),
+            Coproduct::Inl(setting) => (setting.identifier(), setting.setting().value()),
+            Coproduct::Inr(setting) => T::fields(setting),
         }
     }
 }
+
+/// The settings of one SETTINGS frame for the list of setting types `L`: a
+/// slot for each type, filled as
+/// [`read_setting`](super::codec::read_setting) reads the frame.
+///
+/// Settings whose identifier no type of `L` claims are not kept: the peer
+/// may send any number of them, and they are handed to the caller as they
+/// are read.
+pub struct Settings<L: SettingList> {
+    slots: L::Slots,
+}
+
+impl<L: SettingList> Settings<L> {
+    /// No setting: every slot empty.
+    pub fn new() -> Self {
+        const {
+            assert!(
+                L::CLAIMS_VALID,
+                "two setting types of the list claim the same identifier, or one claims a reserved one"
+            );
+        }
+        Self { slots: L::empty() }
+    }
+
+    /// The setting of the type `T`, or `None` if it is absent.
+    ///
+    /// `I` is the position of the type in the list, which the compiler
+    /// infers: `settings.get::<MaxFieldSectionSize, _>()`.
+    pub fn get<T, I>(&self) -> Option<&T>
+    where
+        L::Slots: Selector<Option<Keyed<T>>, I>,
+        T: KeyedSetting,
+    {
+        self.slots.get().as_ref().map(Keyed::setting)
+    }
+
+    pub(crate) fn slots(&self) -> &L::Slots {
+        &self.slots
+    }
+
+    pub(crate) fn slots_mut(&mut self) -> &mut L::Slots {
+        &mut self.slots
+    }
+}
+
+impl<L: SettingList> Default for Settings<L> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<L: SettingList> Clone for Settings<L>
+where
+    L::Slots: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            slots: self.slots.clone(),
+        }
+    }
+}
+
+impl<L: SettingList> fmt::Debug for Settings<L>
+where
+    L::Slots: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Settings")
+            .field("slots", &self.slots)
+            .finish()
+    }
+}
+
+impl<L: SettingList> PartialEq for Settings<L>
+where
+    L::Slots: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.slots == other.slots
+    }
+}
+
+impl<L: SettingList> Eq for Settings<L> where L::Slots: Eq {}

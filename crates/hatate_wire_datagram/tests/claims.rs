@@ -3,7 +3,10 @@
 //! which would need a dependency on them).
 use hatate_wire::{
     frame::set::{FramePart, FrameSet},
-    settings::set::{SettingsPart, SettingsSet},
+    settings::{
+        KeyedSetting,
+        set::{SettingList, SettingsOf, SettingsPart},
+    },
     stream_type::{StreamTypePart, StreamTypeSet},
 };
 use sakuya_var_int::VarInt;
@@ -27,18 +30,13 @@ fn probes() -> Vec<VarInt> {
         .collect()
 }
 
-fn agree<P: FramePart + SettingsPart + StreamTypePart>(name: &str) {
+fn agree<P: FramePart + StreamTypePart>(name: &str) {
     assert!(!probes().is_empty());
     for value in probes() {
         assert_eq!(
             <P as FramePart>::FRAME_TYPES.contains(value),
             <P as FramePart>::type_value_of(value).is_some(),
             "{name}: frame type {value:?}"
-        );
-        assert_eq!(
-            <P as SettingsPart>::SETTING_IDENTIFIERS.contains(value),
-            <P as SettingsPart>::identifier_of(value).is_some(),
-            "{name}: setting identifier {value:?}"
         );
         assert_eq!(
             <P as StreamTypePart>::STREAM_TYPES.contains(value),
@@ -69,8 +67,8 @@ fn the_claims_of_the_list_of_all_parts_agree_with_its_lookups() {
             "{value:?}"
         );
         assert_eq!(
-            <All as SettingsSet>::SETTING_IDENTIFIERS.contains(value),
-            <All as SettingsSet>::identifier_of(value).is_some(),
+            <<All as SettingsOf>::Settings as SettingList>::IDENTIFIERS.contains(value),
+            [0x01, 0x06, 0x07, 0x08, 0x33].contains(&value.get()),
             "{value:?}"
         );
         assert_eq!(
@@ -83,17 +81,20 @@ fn the_claims_of_the_list_of_all_parts_agree_with_its_lookups() {
 
 #[test]
 fn the_extensions_claim_their_one_setting_and_nothing_else() {
-    use hatate_wire_datagram::H3DatagramSettingIdentifier;
-    use hatate_wire_extended_connect::EnableConnectProtocolSettingIdentifier;
+    use hatate_wire_datagram::H3Datagram;
+    use hatate_wire_extended_connect::EnableConnectProtocol;
+    assert_eq!(H3Datagram::IDENTIFIER.get(), 0x33);
+    assert_eq!(EnableConnectProtocol::IDENTIFIER.get(), 0x08);
     for value in probes() {
-        let datagram = value == H3DatagramSettingIdentifier::VALUE;
-        let connect = value == EnableConnectProtocolSettingIdentifier::VALUE;
+        let datagram = value == H3Datagram::IDENTIFIER;
+        let connect = value == EnableConnectProtocol::IDENTIFIER;
         assert_eq!(
-            <hatate_wire_datagram::Part as SettingsPart>::SETTING_IDENTIFIERS.contains(value),
+            <<hatate_wire_datagram::Part as SettingsPart>::Settings as SettingList>::IDENTIFIERS
+                .contains(value),
             datagram
         );
         assert_eq!(
-            <hatate_wire_extended_connect::Part as SettingsPart>::SETTING_IDENTIFIERS
+            <<hatate_wire_extended_connect::Part as SettingsPart>::Settings as SettingList>::IDENTIFIERS
                 .contains(value),
             connect
         );

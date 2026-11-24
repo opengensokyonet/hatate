@@ -2,7 +2,7 @@
 //! compile-time check of disjointness is only as good as that agreement.
 use hatate_wire::{
     frame::set::{FramePart, FrameSet},
-    settings::set::{SettingsPart, SettingsSet},
+    settings::set::{SettingList, SettingsOf, SettingsPart},
     stream_type::{StreamTypePart, StreamTypeSet},
 };
 use sakuya_var_int::VarInt;
@@ -26,18 +26,13 @@ fn probes() -> Vec<VarInt> {
         .collect()
 }
 
-fn agree<P: FramePart + SettingsPart + StreamTypePart>(name: &str) {
+fn agree<P: FramePart + StreamTypePart>(name: &str) {
     assert!(!probes().is_empty());
     for value in probes() {
         assert_eq!(
             <P as FramePart>::FRAME_TYPES.contains(value),
             <P as FramePart>::type_value_of(value).is_some(),
             "{name}: frame type {value:?}"
-        );
-        assert_eq!(
-            <P as SettingsPart>::SETTING_IDENTIFIERS.contains(value),
-            <P as SettingsPart>::identifier_of(value).is_some(),
-            "{name}: setting identifier {value:?}"
         );
         assert_eq!(
             <P as StreamTypePart>::STREAM_TYPES.contains(value),
@@ -62,8 +57,8 @@ fn the_claims_of_a_list_agree_with_its_lookups() {
             "{value:?}"
         );
         assert_eq!(
-            <List as SettingsSet>::SETTING_IDENTIFIERS.contains(value),
-            <List as SettingsSet>::identifier_of(value).is_some(),
+            <<List as SettingsOf>::Settings as SettingList>::IDENTIFIERS.contains(value),
+            [0x01, 0x06, 0x07].contains(&value.get()),
             "{value:?}"
         );
         assert_eq!(
@@ -79,7 +74,10 @@ fn the_part_claims_nothing_reserved() {
     for value in probes() {
         if hatate_wire::registry::is_reserved(value) {
             assert!(!<hatate_wire::Part as FramePart>::FRAME_TYPES.contains(value));
-            assert!(!<hatate_wire::Part as SettingsPart>::SETTING_IDENTIFIERS.contains(value));
+            assert!(
+                !<<hatate_wire::Part as SettingsPart>::Settings as SettingList>::IDENTIFIERS
+                    .contains(value)
+            );
             assert!(!<hatate_wire::Part as StreamTypePart>::STREAM_TYPES.contains(value));
         }
     }

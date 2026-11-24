@@ -18,7 +18,6 @@ use core::{
 };
 use frunk_core::HList;
 use hatate_wire::{
-    defaults::RejectKnownDuplicates,
     error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
         FrameWidths,
@@ -26,7 +25,11 @@ use hatate_wire::{
         control::{GoawayFrame, codec::*},
         payload::{FramePayload, PayloadError},
     },
-    settings::{Setting, codec::ReadSettingExt as _},
+    settings::{
+        Setting,
+        codec::ReadSettingExt as _,
+        set::{Settings, SettingsOf},
+    },
 };
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::Read;
@@ -77,8 +80,8 @@ where
     <F as Read>::Error: core::fmt::Debug,
 {
     let mut source = io.compose(payload);
-    let mut policy = RejectKnownDuplicates::<Parts>::new();
-    match source.read_setting(&mut policy).await {
+    let mut settings = Settings::<<Parts as SettingsOf>::Settings>::new();
+    match source.read_setting(&mut settings).await {
         Ok(Some(Setting::Known(setting))) => format!("known {setting:?}"),
         Ok(Some(Setting::Unknown(setting))) => format!(
             "unknown {:#x}={:#x}",

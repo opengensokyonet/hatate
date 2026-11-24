@@ -4,45 +4,42 @@ mod common;
 
 use common::{Dribble, run};
 use core::{convert::Infallible, marker::PhantomData};
-use frunk_core::{HList, coproduct::Coproduct};
+use frunk_core::{
+    HList,
+    coproduct::{CoprodInjector, Coproduct, CoproductSelector},
+};
 use hatate_wire::{
     Part,
-    defaults::RejectKnownDuplicates,
     error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
         FrameType, FrameWidths, Http3FrameType, codec::ReadFrameHeadExt as _, payload::PayloadError,
     },
     settings::{
-        Http2SettingIdentifier, Http3Setting, Http3SettingIdentifier, Setting, UnknownSetting,
+        Http2SettingIdentifier, Keyed, KeyedSetting, MaxFieldSectionSize, Setting, UnknownSetting,
         codec::{
-            DuplicateSettingError, DuplicateSettingPolicy, ReadSettingError, ReadSettingExt as _,
-            SettingsFrame, SettingsFrameError, WriteSettingsFrameHostExt as _,
+            ReadSettingError, ReadSettingExt as _, SettingsFrame, SettingsFrameError,
+            WriteSettingsFrameHostExt as _,
         },
-        set::SettingsSet,
+        set::{SettingList, Settings, SettingsOf, SettingsPart},
     },
 };
-use hatate_wire_qpack::QpackSettingIdentifier;
+use hatate_wire_qpack::{QpackBlockedStreams, QpackMaxTableCapacity};
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::Read;
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
 type Parts = HList![Part];
-type Item = Setting<<Parts as SettingsSet>::Setting>;
-type Error = ReadSettingError<PayloadError<Infallible>, <Parts as SettingsSet>::ValueError>;
+type List = <Parts as SettingsOf>::Settings;
+type Item = Setting<<List as SettingList>::Setting>;
+type Error = ReadSettingError<PayloadError<Infallible>, <List as SettingList>::ValueErrors>;
 
-/// Reads one whole SETTINGS frame with `policy`, and finishes its payload
+/// Reads one whole SETTINGS frame into `settings`, and finishes its payload
 /// when every setting was read.
 #[call(sync)]
-async fn read_settings<P, F: Read, A: ReceiverAccess<Family = F>>(
+async fn read_settings<L: SettingList, F: Read, A: ReceiverAccess<Family = F>>(
     io: &mut A,
-    policy: &mut P,
-) -> Result<
-    Vec<Setting<<P::Parts as SettingsSet>::Setting>>,
-    ReadSettingError<PayloadError<F::Error>, <P::Parts as SettingsSet>::ValueError>,
->
-where
-    P: DuplicateSettingPolicy,
-{
+    settings: &mut Settings<L>,
+) -> Result<Vec<Setting<L::Setting>>, ReadSettingError<PayloadError<F::Error>, L::ValueErrors>> {
     let Ok(Some(head)) = io.read_frame_head(PhantomData::<Parts>).await else {
         panic!("no frame head");
     };
@@ -51,15 +48,15 @@ where
         FrameType::Known(Coproduct::Inl(Http3FrameType::Settings))
     );
     let mut payload = head.payload();
-    let mut settings = Vec::new();
+    let mut read = Vec::new();
     {
         let mut source = io.compose(&mut payload);
-        while let Some(setting) = source.read_setting(policy).await? {
-            settings.push(setting);
+        while let Some(setting) = source.read_setting(settings).await? {
+            read.push(setting);
         }
     }
     payload.finish().expect("the payload was read to its end");
-    Ok(settings)
+    Ok(read)
 }
 
 fn frame(payload: &[u8]) -> Vec<u8> {
@@ -67,16 +64,31 @@ fn frame(payload: &[u8]) -> Vec<u8> {
     [&[0x04, payload.len() as u8][..], payload].concat()
 }
 
-fn read(payload: &[u8]) -> Result<Vec<Item>, Error> {
+fn read_into(payload: &[u8], settings: &mut Settings<List>) -> Result<Vec<Item>, Error> {
     let wire = frame(payload);
-    (&wire[..]).sync_read_settings_unpin(&mut RejectKnownDuplicates::<Parts>::new())
+    (&wire[..]).sync_read_settings_unpin(settings)
 }
 
-fn http3(setting: &Item) -> Http3Setting {
+fn read(payload: &[u8]) -> Result<Vec<Item>, Error> {
+    read_into(payload, &mut Settings::new())
+}
+
+/// The setting of the type `T` that `setting` holds.
+fn known<T: Copy, I>(setting: &Item) -> Keyed<T>
+where
+    <List as SettingList>::Setting: CoproductSelector<Keyed<T>, I>,
+{
     match setting {
-        Setting::Known(Coproduct::Inl(setting)) => *setting,
-        other => panic!("not a setting of HTTP/3: {other:?}"),
+        Setting::Known(known) => *known.get::<Keyed<T>, I>().expect("a setting of the type"),
+        Setting::Unknown(other) => panic!("not a known setting: {other:?}"),
     }
+}
+
+fn keyed<T: KeyedSetting, I>(setting: T) -> Item
+where
+    <List as SettingList>::Setting: CoprodInjector<Keyed<T>, I>,
+{
+    Setting::Known(<List as SettingList>::Setting::inject(Keyed::new(setting)))
 }
 
 fn unknown(setting: &Item) -> UnknownSetting {
@@ -92,61 +104,92 @@ fn value_field(value: u32, width: VarIntWidth) -> VarIntField<VarInt> {
 
 #[test]
 fn settings_of_http3_are_read_with_their_widths() {
-    let settings = read(&[
-        0x01, 0x40, 0x40, // QPACK_MAX_TABLE_CAPACITY = 0x40, two bytes
-        0x40, 0x06, 0x80, 0x00, 0x01, 0x00, // MAX_FIELD_SECTION_SIZE (2-byte id) = 256
-        0x07, 0x00, // QPACK_BLOCKED_STREAMS = 0
-    ])
+    let mut settings = Settings::new();
+    let read = read_into(
+        &[
+            0x01, 0x40, 0x40, // QPACK_MAX_TABLE_CAPACITY = 0x40, two bytes
+            0x40, 0x06, 0x80, 0x00, 0x01, 0x00, // MAX_FIELD_SECTION_SIZE (2-byte id) = 256
+            0x07, 0x00, // QPACK_BLOCKED_STREAMS = 0
+        ],
+        &mut settings,
+    )
     .unwrap();
-    assert_eq!(settings.len(), 3);
-    let first = http3(&settings[0]);
-    assert_eq!(
-        first.identifier(),
-        Http3SettingIdentifier::Qpack(QpackSettingIdentifier::MaxTableCapacity)
-    );
-    assert_eq!(first.identifier_width(), VarIntWidth::One);
-    assert_eq!(first.value(), value_field(0x40, VarIntWidth::Two));
-    let second = http3(&settings[1]);
-    assert_eq!(
-        second.identifier(),
-        Http3SettingIdentifier::MaxFieldSectionSize
-    );
+    assert_eq!(read.len(), 3);
+    let first = known::<QpackMaxTableCapacity, _>(&read[0]);
+    assert_eq!(first.identifier(), value_field(0x01, VarIntWidth::One));
+    assert_eq!(first.setting().value(), value_field(0x40, VarIntWidth::Two));
+    let second = known::<MaxFieldSectionSize, _>(&read[1]);
     assert_eq!(second.identifier_width(), VarIntWidth::Two);
-    assert_eq!(second.value(), value_field(256, VarIntWidth::Four));
-    let third = http3(&settings[2]);
+    assert_eq!(second.identifier(), value_field(0x06, VarIntWidth::Two));
     assert_eq!(
-        third.identifier(),
-        Http3SettingIdentifier::Qpack(QpackSettingIdentifier::BlockedStreams)
+        second.setting().value(),
+        value_field(256, VarIntWidth::Four)
     );
-    assert_eq!(third.value(), value_field(0, VarIntWidth::One));
+    let third = known::<QpackBlockedStreams, _>(&read[2]);
+    assert_eq!(third.setting().value(), value_field(0, VarIntWidth::One));
+    // The slots hold what was read.
+    assert_eq!(
+        settings.get::<QpackMaxTableCapacity, _>(),
+        Some(first.setting())
+    );
+    assert_eq!(
+        settings.get::<MaxFieldSectionSize, _>(),
+        Some(second.setting())
+    );
+    assert_eq!(
+        settings.get::<QpackBlockedStreams, _>(),
+        Some(third.setting())
+    );
 }
 
 #[test]
-fn reserved_zero_and_undefined_identifiers_are_unknown() {
+fn an_absent_setting_has_an_empty_slot() {
+    let mut settings = Settings::new();
+    read_into(&[0x06, 0x10], &mut settings).unwrap();
+    assert_eq!(
+        settings
+            .get::<MaxFieldSectionSize, _>()
+            .unwrap()
+            .value()
+            .get()
+            .get(),
+        0x10
+    );
+    assert!(settings.get::<QpackMaxTableCapacity, _>().is_none());
+    assert!(settings.get::<QpackBlockedStreams, _>().is_none());
+    assert_eq!(Settings::<List>::default(), Settings::new());
+}
+
+#[test]
+fn reserved_zero_and_undefined_identifiers_are_unknown_and_not_kept() {
     // 0x21 and 0x40 (two bytes) are of the form 0x1f * N + 0x21; 0x00 is
     // reserved; 0x0b is undefined.
-    let settings = read(&[
-        0x21, 0x05, 0x40, 0x40, 0x00, 0x00, 0x21, 0x0b, 0x01, 0x07, 0x00,
-    ])
+    let mut settings = Settings::new();
+    let read = read_into(
+        &[
+            0x21, 0x05, 0x40, 0x40, 0x00, 0x00, 0x21, 0x0b, 0x01, 0x07, 0x00,
+        ],
+        &mut settings,
+    )
     .unwrap();
-    assert_eq!(settings.len(), 5);
+    assert_eq!(read.len(), 5);
     let expected = [
         (0x21, VarIntWidth::One, 5),
         (0x40, VarIntWidth::Two, 0),
         (0x00, VarIntWidth::One, 0x21),
         (0x0b, VarIntWidth::One, 1),
     ];
-    for (setting, (identifier, width, value)) in settings.iter().zip(expected) {
+    for (setting, (identifier, width, value)) in read.iter().zip(expected) {
         let setting = unknown(setting);
         assert_eq!(setting.identifier().get().get(), identifier);
         assert_eq!(setting.identifier().width(), width);
         assert_eq!(setting.value().get().get(), value);
     }
-    // The known setting after them is still read.
-    assert_eq!(
-        http3(&settings[4]).identifier(),
-        Http3SettingIdentifier::Qpack(QpackSettingIdentifier::BlockedStreams)
-    );
+    // The known setting after them is still read, and is the only one kept.
+    known::<QpackBlockedStreams, _>(&read[4]);
+    let mut only_blocked = Settings::<List>::new();
+    read_into(&[0x07, 0x00], &mut only_blocked).unwrap();
+    assert_eq!(settings, only_blocked);
 }
 
 #[test]
@@ -184,21 +227,51 @@ fn a_repeated_known_identifier_is_a_settings_error() {
         (vec![0x80, 0, 0, 0x07], vec![0x07]),
     ] {
         let payload = [identifier.clone(), vec![0x00], again, vec![0x01]].concat();
-        let error = read(&payload).unwrap_err();
+        let mut settings = Settings::new();
+        let error = read_into(&payload, &mut settings).unwrap_err();
         assert!(
             matches!(&error, ReadSettingError::Duplicate { source }
                 if source.identifier().get() == u64::from(*identifier.last().unwrap())),
             "{error:?}"
         );
         assert_eq!(error.error_code(), Some(ErrorCode::H3_SETTINGS_ERROR));
+        // The slot keeps the first.
+        let kept = [
+            settings
+                .get::<QpackMaxTableCapacity, _>()
+                .map(|s| s.value()),
+            settings.get::<MaxFieldSectionSize, _>().map(|s| s.value()),
+            settings.get::<QpackBlockedStreams, _>().map(|s| s.value()),
+        ];
+        assert_eq!(
+            kept.iter()
+                .flatten()
+                .map(|value| value.get().get())
+                .collect::<Vec<_>>(),
+            [0]
+        );
     }
 }
 
 #[test]
+fn a_new_set_of_settings_takes_each_identifier_again() {
+    let wire = frame(&[0x06, 0x01]);
+    let mut settings = Settings::<List>::new();
+    (&wire[..]).sync_read_settings_unpin(&mut settings).unwrap();
+    assert!(matches!(
+        (&wire[..]).sync_read_settings_unpin(&mut settings),
+        Err(ReadSettingError::Duplicate { .. })
+    ));
+    (&wire[..])
+        .sync_read_settings_unpin(&mut Settings::<List>::new())
+        .unwrap();
+}
+
+#[test]
 fn repeated_unknown_identifiers_are_not_an_error() {
-    let settings = read(&[0x21, 0x00, 0x21, 0x01, 0x00, 0x00, 0x00, 0x02]).unwrap();
-    assert_eq!(settings.len(), 4);
-    assert_eq!(unknown(&settings[1]).value().get().get(), 1);
+    let read = read(&[0x21, 0x00, 0x21, 0x01, 0x00, 0x00, 0x00, 0x02]).unwrap();
+    assert_eq!(read.len(), 4);
+    assert_eq!(unknown(&read[1]).value().get().get(), 1);
 }
 
 #[test]
@@ -207,7 +280,7 @@ fn a_payload_that_ends_between_the_pair_is_a_frame_error() {
     let mut wire = frame(&[0x01]);
     wire.extend([0x00, 0x04, 0x00]);
     let error = (&wire[..])
-        .sync_read_settings_unpin(&mut RejectKnownDuplicates::<Parts>::new())
+        .sync_read_settings_unpin(&mut Settings::<List>::new())
         .unwrap_err();
     assert!(matches!(error, ReadSettingError::Value { .. }), "{error:?}");
     assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
@@ -230,7 +303,7 @@ fn a_payload_that_ends_between_the_pair_is_a_frame_error() {
 fn a_stream_that_ends_inside_the_payload_is_a_frame_error() {
     let wire = [0x04, 0x04, 0x06, 0x01];
     let error = (&wire[..])
-        .sync_read_settings_unpin(&mut RejectKnownDuplicates::<Parts>::new())
+        .sync_read_settings_unpin(&mut Settings::<List>::new())
         .unwrap_err();
     assert!(
         matches!(&error, ReadSettingError::Identifier { source }
@@ -245,60 +318,16 @@ fn an_empty_settings_frame_has_no_settings() {
     assert!(read(&[]).unwrap().is_empty());
 }
 
-struct AcceptAll;
-
-impl DuplicateSettingPolicy for AcceptAll {
-    type Parts = Parts;
-    fn check(&mut self, _setting: &Item) -> Result<(), DuplicateSettingError> {
-        Ok(())
-    }
-}
-
-#[test]
-fn the_duplicate_policy_can_be_replaced() {
-    let wire = frame(&[0x06, 0x01, 0x06, 0x02, 0x01, 0x00, 0x01, 0x00]);
-    let settings = (&wire[..])
-        .sync_read_settings_unpin(&mut AcceptAll)
-        .unwrap();
-    assert_eq!(settings.len(), 4);
-    assert_eq!(http3(&settings[0]).value().get().get(), 1);
-    assert_eq!(http3(&settings[1]).value().get().get(), 2);
-    // The default policy rejects the same frame.
-    assert!(matches!(
-        (&wire[..]).sync_read_settings_unpin(&mut RejectKnownDuplicates::<Parts>::new()),
-        Err(ReadSettingError::Duplicate { .. })
-    ));
-}
-
-#[test]
-fn a_policy_that_rejects_everything_is_honoured() {
-    struct RejectAll;
-    impl DuplicateSettingPolicy for RejectAll {
-        type Parts = Parts;
-        fn check(&mut self, _setting: &Item) -> Result<(), DuplicateSettingError> {
-            Err(DuplicateSettingError::new(VarInt::from_u32(9)))
-        }
-    }
-    let wire = frame(&[0x21, 0x00]);
-    let error = (&wire[..])
-        .sync_read_settings_unpin(&mut RejectAll)
-        .unwrap_err();
-    assert!(
-        matches!(&error, ReadSettingError::Duplicate { source } if source.identifier().get() == 9)
-    );
-}
-
 fn built(
     settings: Vec<Item>,
     widths: FrameWidths,
-) -> Result<SettingsFrame<<Parts as SettingsSet>::Setting>, SettingsFrameError> {
-    SettingsFrame::new::<Parts>(settings, widths)
+) -> Result<SettingsFrame<List>, SettingsFrameError> {
+    SettingsFrame::new(settings, widths)
 }
 
-fn write(frame: &SettingsFrame<<Parts as SettingsSet>::Setting>) -> Vec<u8> {
+fn write(frame: &SettingsFrame<List>) -> Vec<u8> {
     let mut out = Vec::new();
-    out.sync_write_settings_frame_unpin(frame, PhantomData::<Parts>)
-        .unwrap();
+    out.sync_write_settings_frame_unpin(frame).unwrap();
     out
 }
 
@@ -325,11 +354,11 @@ fn written_frames_read_back_with_the_same_bytes() {
         head_widths,
         FrameWidths::new(VarIntWidth::Two, VarIntWidth::Four)
     );
-    let settings = input
-        .sync_read_settings_unpin(&mut RejectKnownDuplicates::<Parts>::new())
+    let read = input
+        .sync_read_settings_unpin(&mut Settings::<List>::new())
         .unwrap();
     assert!(input.is_empty());
-    let frame = built(settings, head_widths).unwrap();
+    let frame = built(read, head_widths).unwrap();
     assert_eq!(frame.payload_len(), 19);
     assert_eq!(frame.widths(), head_widths);
     assert_eq!(frame.settings().len(), 4);
@@ -337,11 +366,29 @@ fn written_frames_read_back_with_the_same_bytes() {
 }
 
 #[test]
+fn each_setting_of_http3_is_written_and_read_back() {
+    let value = value_field(0x1234, VarIntWidth::Eight);
+    for (setting, identifier) in [
+        (keyed(QpackMaxTableCapacity::new(value)), 0x01),
+        (keyed(MaxFieldSectionSize::new(value)), 0x06),
+        (keyed(QpackBlockedStreams::new(value)), 0x07),
+    ] {
+        let frame = built(vec![setting], FrameWidths::SHORTEST).unwrap();
+        let wire = write(&frame);
+        assert_eq!(wire, [0x04, 9, identifier, 0xc0, 0, 0, 0, 0, 0, 0x12, 0x34]);
+        let mut input = &wire[..];
+        let read = input
+            .sync_read_settings_unpin(&mut Settings::<List>::new())
+            .unwrap();
+        assert_eq!(read, [setting]);
+    }
+}
+
+#[test]
 fn a_frame_of_new_settings_is_written_in_order() {
     let settings = vec![
-        Setting::Known(Coproduct::Inl(Http3Setting::new(
-            Http3SettingIdentifier::MaxFieldSectionSize,
-            VarIntField::shortest(VarInt::from_u32(0x1000)),
+        keyed(MaxFieldSectionSize::new(VarIntField::shortest(
+            VarInt::from_u32(0x1000),
         ))),
         Setting::Unknown(
             UnknownSetting::new(
@@ -350,11 +397,13 @@ fn a_frame_of_new_settings_is_written_in_order() {
             )
             .unwrap(),
         ),
-        Setting::Known(Coproduct::Inl(Http3Setting::with_identifier_width(
-            Http3SettingIdentifier::Qpack(QpackSettingIdentifier::BlockedStreams),
-            VarIntWidth::Eight,
-            VarIntField::shortest(VarInt::from_u32(1)),
-        ))),
+        Setting::Known(<List as SettingList>::Setting::inject(
+            Keyed::with_identifier_width(
+                QpackBlockedStreams::new(VarIntField::shortest(VarInt::from_u32(1))),
+                VarIntWidth::Eight,
+            )
+            .unwrap(),
+        )),
     ];
     let frame = built(settings.clone(), FrameWidths::SHORTEST).unwrap();
     let wire = write(&frame);
@@ -368,7 +417,7 @@ fn a_frame_of_new_settings_is_written_in_order() {
     );
     let mut input = &wire[..];
     let read = input
-        .sync_read_settings_unpin(&mut RejectKnownDuplicates::<Parts>::new())
+        .sync_read_settings_unpin(&mut Settings::<List>::new())
         .unwrap();
     assert_eq!(read, settings);
 }
@@ -396,20 +445,12 @@ fn a_frame_refuses_a_repeated_identifier_even_if_unknown() {
         matches!(&error, SettingsFrameError::Duplicate { source } if source.identifier().get() == 0x21),
         "{error:?}"
     );
-    let known = |identifier| {
-        Setting::Known(Coproduct::Inl(Http3Setting::new(
-            identifier,
-            VarIntField::shortest(VarInt::from_u32(0)),
+    let max = || {
+        keyed(MaxFieldSectionSize::new(VarIntField::shortest(
+            VarInt::ZERO,
         )))
     };
-    let error = built(
-        vec![
-            known(Http3SettingIdentifier::MaxFieldSectionSize),
-            known(Http3SettingIdentifier::MaxFieldSectionSize),
-        ],
-        FrameWidths::SHORTEST,
-    )
-    .unwrap_err();
+    let error = built(vec![max(), max()], FrameWidths::SHORTEST).unwrap_err();
     assert!(
         matches!(error, SettingsFrameError::Duplicate { .. }),
         "{error:?}"
@@ -449,14 +490,25 @@ fn a_length_that_does_not_fit_its_width_is_refused() {
 
 #[test]
 fn unknown_settings_cannot_be_the_identifiers_of_http2() {
-    for identifier in 0x02..=0x05 {
-        assert!(
-            UnknownSetting::new(
-                value_field(identifier, VarIntWidth::One),
-                value_field(0, VarIntWidth::One)
+    for (identifier, expected) in [
+        (0x02, Http2SettingIdentifier::EnablePush),
+        (0x03, Http2SettingIdentifier::MaxConcurrentStreams),
+        (0x04, Http2SettingIdentifier::InitialWindowSize),
+        (0x05, Http2SettingIdentifier::MaxFrameSize),
+    ] {
+        for width in VarIntWidth::ALL {
+            let error = UnknownSetting::new(
+                value_field(identifier, width),
+                value_field(0, VarIntWidth::One),
             )
-            .is_err_and(|error| error.identifier().value().get() == u64::from(identifier))
-        );
+            .unwrap_err();
+            assert_eq!(error.identifier(), expected);
+            assert_eq!(error.identifier().value().get(), u64::from(identifier));
+            assert_eq!(
+                error,
+                hatate_wire::settings::Http2SettingIdentifierError::new(expected)
+            );
+        }
     }
     assert!(
         UnknownSetting::new(
@@ -472,19 +524,21 @@ fn a_pending_between_every_byte_changes_nothing() {
     let wire = [
         0x04, 0x0b, 0x40, 0x01, 0x40, 0x40, 0x21, 0x00, 0x06, 0x80, 0, 0, 0x10, 0xff,
     ];
+    let mut expected_settings = Settings::<List>::new();
     let expected = (&wire[..])
-        .sync_read_settings_unpin(&mut RejectKnownDuplicates::<Parts>::new())
+        .sync_read_settings_unpin(&mut expected_settings)
         .unwrap();
     let mut host = Dribble::new(&wire, 1);
-    let mut policy = RejectKnownDuplicates::<Parts>::new();
-    let (settings, pending) = run(host.read_settings_unpin(&mut policy));
-    assert_eq!(settings.unwrap(), expected);
+    let mut settings = Settings::<List>::new();
+    let (read, pending) = run(host.read_settings_unpin(&mut settings));
+    assert_eq!(read.unwrap(), expected);
+    assert_eq!(settings, expected_settings);
     assert!(pending >= wire.len() - 1, "{pending}");
     assert_eq!(host.rest(), [0xff]);
 }
 
 #[test]
-fn an_unknown_setting_cannot_take_an_identifier_a_part_claims() {
+fn an_unknown_setting_cannot_take_an_identifier_a_type_claims() {
     let unknown = |identifier: u32, width| {
         Setting::Unknown(
             UnknownSetting::new(
@@ -518,7 +572,7 @@ fn an_unknown_setting_cannot_take_an_identifier_a_part_claims() {
         matches!(error, SettingsFrameError::ClaimedIdentifier { .. }),
         "{error:?}"
     );
-    // Identifiers that no part claims are accepted, reserved or not.
+    // Identifiers that no type claims are accepted, reserved or not.
     for identifier in [0x00, 0x08, 0x0a, 0x21, 0x33, 0x40] {
         let frame = built(
             vec![unknown(identifier, VarIntWidth::Two)],
@@ -526,29 +580,6 @@ fn an_unknown_setting_cannot_take_an_identifier_a_part_claims() {
         )
         .unwrap_or_else(|error| panic!("{identifier:#x}: {error:?}"));
         assert_eq!(frame.settings().len(), 1);
-    }
-}
-
-#[test]
-fn unknown_settings_of_http2_name_the_identifier() {
-    for (identifier, expected) in [
-        (0x02, Http2SettingIdentifier::EnablePush),
-        (0x03, Http2SettingIdentifier::MaxConcurrentStreams),
-        (0x04, Http2SettingIdentifier::InitialWindowSize),
-        (0x05, Http2SettingIdentifier::MaxFrameSize),
-    ] {
-        for width in VarIntWidth::ALL {
-            let error = UnknownSetting::new(
-                value_field(identifier, width),
-                value_field(0, VarIntWidth::One),
-            )
-            .unwrap_err();
-            assert_eq!(error.identifier(), expected);
-            assert_eq!(
-                error,
-                hatate_wire::settings::Http2SettingIdentifierError::new(expected)
-            );
-        }
     }
 }
 
@@ -561,7 +592,7 @@ fn a_stream_that_ends_between_the_pair_is_a_frame_error_too() {
         &[0x04, 0x03, 0x06, 0x01, 0x40][..],
     ] {
         let error = (&wire[..])
-            .sync_read_settings_unpin(&mut RejectKnownDuplicates::<Parts>::new())
+            .sync_read_settings_unpin(&mut Settings::<List>::new())
             .unwrap_err();
         assert!(
             matches!(&error, ReadSettingError::Identifier { source } | ReadSettingError::Value { source }
@@ -574,5 +605,80 @@ fn a_stream_that_ends_between_the_pair_is_a_frame_error_too() {
             Some(ErrorCode::H3_FRAME_ERROR),
             "{wire:x?}"
         );
+    }
+}
+
+/// A setting type with the identifier `IDENTIFIER` and any value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Probe<const IDENTIFIER: u32>(VarIntField<VarInt>);
+
+impl<const IDENTIFIER: u32> KeyedSetting for Probe<IDENTIFIER> {
+    type ValueError = Infallible;
+    const IDENTIFIER: VarInt = VarInt::from_u32(IDENTIFIER);
+
+    fn from_value(value: VarIntField<VarInt>) -> Result<Self, Infallible> {
+        Ok(Self(value))
+    }
+
+    fn value(&self) -> VarIntField<VarInt> {
+        self.0
+    }
+}
+
+#[test]
+fn an_identifier_width_must_hold_the_identifier() {
+    let probe = Probe::<0x4000>(VarIntField::shortest(VarInt::ZERO));
+    assert_eq!(Keyed::new(probe).identifier_width(), VarIntWidth::Four);
+    for width in [VarIntWidth::One, VarIntWidth::Two] {
+        let error = Keyed::with_identifier_width(probe, width).unwrap_err();
+        assert_eq!(error.width(), width);
+        assert_eq!(error.value().get(), 0x4000);
+    }
+    let keyed = Keyed::with_identifier_width(probe, VarIntWidth::Eight).unwrap();
+    assert_eq!(keyed.identifier(), value_field(0x4000, VarIntWidth::Eight));
+    assert_eq!(keyed.into_setting(), probe);
+}
+
+/// A part with one setting type, `Probe<IDENTIFIER>`.
+struct ProbePart<const IDENTIFIER: u32>;
+
+impl<const IDENTIFIER: u32> SettingsPart for ProbePart<IDENTIFIER> {
+    type Settings = HList![Probe<IDENTIFIER>];
+}
+
+#[test]
+fn the_lists_of_the_parts_are_joined_in_order_and_checked_for_repeats() {
+    type Joined = <HList![Part, ProbePart<0x0a>, ProbePart<0x0b>] as SettingsOf>::Settings;
+    let _: core::marker::PhantomData<Joined> = core::marker::PhantomData::<
+        HList![
+            QpackMaxTableCapacity,
+            MaxFieldSectionSize,
+            QpackBlockedStreams,
+            Probe<0x0a>,
+            Probe<0x0b>
+        ],
+    >;
+    for identifier in [0x01, 0x06, 0x07, 0x0a, 0x0b] {
+        assert!(Joined::IDENTIFIERS.contains(VarInt::from_u32(identifier)));
+    }
+    assert!(!Joined::IDENTIFIERS.contains(VarInt::from_u32(0x08)));
+    const {
+        assert!(Joined::CLAIMS_VALID);
+        assert!(List::CLAIMS_VALID);
+        // A repeat across parts, and within one list.
+        assert!(
+            !<<HList![Part, ProbePart<0x06>] as SettingsOf>::Settings as SettingList>::CLAIMS_VALID
+        );
+        assert!(!<<HList![ProbePart<0x0a>, ProbePart<0x0a>] as SettingsOf>::Settings as SettingList>::CLAIMS_VALID);
+        assert!(!<HList![MaxFieldSectionSize, MaxFieldSectionSize] as SettingList>::CLAIMS_VALID);
+        // Reserved identifiers: 0x00, those of HTTP/2, and 0x1f * N + 0x21.
+        assert!(!<HList![Probe<0x00>] as SettingList>::CLAIMS_VALID);
+        assert!(!<HList![Probe<0x02>] as SettingList>::CLAIMS_VALID);
+        assert!(!<HList![Probe<0x03>] as SettingList>::CLAIMS_VALID);
+        assert!(!<HList![Probe<0x04>] as SettingList>::CLAIMS_VALID);
+        assert!(!<HList![Probe<0x05>] as SettingList>::CLAIMS_VALID);
+        assert!(!<HList![Probe<0x21>] as SettingList>::CLAIMS_VALID);
+        assert!(!<HList![Probe<0x40>] as SettingList>::CLAIMS_VALID);
+        assert!(<HList![Probe<0x22>] as SettingList>::CLAIMS_VALID);
     }
 }

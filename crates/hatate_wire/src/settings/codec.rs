@@ -1,6 +1,7 @@
 //! Reading settings one at a time, and writing a SETTINGS frame.
 use super::{
-    Http2SettingIdentifier, Http2SettingIdentifierError, Setting, UnknownSetting, set::SettingsSet,
+    Http2SettingIdentifier, Http2SettingIdentifierError, Setting, UnknownSetting,
+    set::{SettingList, Settings},
 };
 use crate::{
     error_code::{ErrorCode, ErrorCodeOf},
@@ -14,7 +15,7 @@ use crate::{
     parts::PartsError,
 };
 use alloc::vec::Vec;
-use core::{future::poll_fn, task::Poll};
+use core::{fmt, future::poll_fn, task::Poll};
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::{ExactLen, prelude::*};
 use sakuya_var_int::{
@@ -22,30 +23,6 @@ use sakuya_var_int::{
     call::{ReadVarIntError, ReadVarIntFieldExt as _, WriteVarIntError, WriteVarIntFieldExt as _},
 };
 use snafu::{ResultExt, Snafu};
-
-/// Decides whether a setting may follow those before it in one SETTINGS
-/// frame. RFC 9114 forbids sending an identifier twice and lets a receiver
-/// treat a repeat as a connection error of type H3_SETTINGS_ERROR, or not
-/// ([RFC 9114 §7.2.4]).
-///
-/// Use a new policy value for each frame. The default is
-/// [`RejectKnownDuplicates`](crate::defaults::RejectKnownDuplicates).
-///
-/// [RFC 9114 §7.2.4]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4
-pub trait DuplicateSettingPolicy {
-    /// The list of parts whose settings it checks.
-    type Parts: SettingsSet;
-
-    /// Checks `setting`, which follows the settings checked before it.
-    ///
-    /// # Errors
-    ///
-    /// [`DuplicateSettingError`] to reject the frame.
-    fn check(
-        &mut self,
-        setting: &Setting<<Self::Parts as SettingsSet>::Setting>,
-    ) -> Result<(), DuplicateSettingError>;
-}
 
 /// A setting repeats an identifier that occurred earlier in its frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
@@ -56,7 +33,7 @@ pub struct DuplicateSettingError {
 
 impl DuplicateSettingError {
     /// The error for the repeated `identifier`.
-    pub const fn new(identifier: VarInt) -> Self {
+    pub(crate) const fn new(identifier: VarInt) -> Self {
         Self { identifier }
     }
 
@@ -66,31 +43,27 @@ impl DuplicateSettingError {
     }
 }
 
-/// Reads the next setting from the payload of a SETTINGS frame, of the list
-/// of parts that `policy` checks.
+/// Reads the next setting from the payload of a SETTINGS frame into
+/// `settings`, whose list of setting types it reads with.
 ///
 /// `io` is the payload, such as a [`FramePayload`](crate::frame::payload::FramePayload)
 /// composed onto the control stream. Returns `None` at its end. A setting
-/// whose identifier a part claims is checked by that part; one that no part
-/// claims is [`Setting::Unknown`]. Then `policy` checks it against the
-/// settings before it.
+/// whose identifier a type of the list claims is checked by that type, put
+/// into its slot of `settings`, and returned as [`Setting::Known`]; its
+/// identifier may occur once in a frame. One that no type claims is
+/// [`Setting::Unknown`]: it is returned and not kept, and may repeat.
+///
+/// Use a new [`Settings`] for each frame.
 ///
 /// # Errors
 ///
 /// [`ReadSettingError`]; its [`ErrorCodeOf::error_code`] gives the
 /// connection error it calls for.
 #[call(sync)]
-pub async fn read_setting<
-    P: DuplicateSettingPolicy,
-    F: Read + ExactLen,
-    A: ReceiverAccess<Family = F>,
->(
+pub async fn read_setting<L: SettingList, F: Read + ExactLen, A: ReceiverAccess<Family = F>>(
     io: &mut A,
-    policy: &mut P,
-) -> Result<
-    Option<Setting<<P::Parts as SettingsSet>::Setting>>,
-    ReadSettingError<F::Error, <P::Parts as SettingsSet>::ValueError>,
->
+    settings: &mut Settings<L>,
+) -> Result<Option<Setting<L::Setting>>, ReadSettingError<F::Error, L::ValueErrors>>
 where
     <F as ExactLen>::Length: TryInto<u64>,
 {
@@ -112,21 +85,22 @@ where
         .read_var_int_field::<VarInt>()
         .await
         .context(read_setting_error::ValueSnafu)?;
-    let setting = match <P::Parts as SettingsSet>::identifier_of(identifier.get()) {
-        Some(known) => Setting::Known(
-            <P::Parts as SettingsSet>::setting_of(known, identifier.width(), value)
-                .map_err(PartsError::new)
-                .context(read_setting_error::RejectedSnafu)?,
-        ),
+    let Some(setting) = L::setting_of(identifier, value) else {
         // invariant: HTTP/2 identifiers were rejected above.
-        None => Setting::Unknown(UnknownSetting { identifier, value }),
+        return Ok(Some(Setting::Unknown(UnknownSetting { identifier, value })));
     };
-    policy.check(&setting)?;
-    Ok(Some(setting))
+    if L::is_taken(settings.slots(), identifier.get()) {
+        return Err(DuplicateSettingError::new(identifier.get()).into());
+    }
+    let setting = setting
+        .map_err(PartsError::new)
+        .context(read_setting_error::RejectedSnafu)?;
+    L::insert(settings.slots_mut(), &setting);
+    Ok(Some(Setting::Known(setting)))
 }
 
-/// Failures of [`read_setting`]. `V` is the sum of the parts' value
-/// failures.
+/// Failures of [`read_setting`]. `V` is the sum of the value failures of
+/// the setting types.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum ReadSettingError<E, V> {
@@ -148,13 +122,13 @@ pub enum ReadSettingError<E, V> {
         /// The identifier received.
         source: Http2SettingIdentifierError,
     },
-    /// The part that claims the identifier rejects the value.
+    /// The setting type that claims the identifier rejects the value.
     #[snafu(display("invalid setting value"))]
     Rejected {
-        /// The part's failure.
+        /// The failure of the type.
         source: PartsError<V>,
     },
-    /// The policy rejects a repeated identifier.
+    /// The identifier of a setting type occurs again in the frame.
     #[snafu(transparent)]
     Duplicate {
         /// The repeated identifier.
@@ -184,40 +158,44 @@ impl<E: ErrorCodeOf<ErrorCode>, V> ErrorCodeOf<ErrorCode> for ReadSettingError<E
     }
 }
 
-/// A SETTINGS frame to write: its settings in order, none repeating an
-/// identifier, and the widths of its Type and Length.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SettingsFrame<T> {
+/// A SETTINGS frame to write for the list of setting types `L`: its
+/// settings in order, none repeating an identifier, and the widths of its
+/// Type and Length.
+pub struct SettingsFrame<L: SettingList> {
     widths: FrameWidths,
     length: VarIntField<VarInt>,
-    settings: Vec<Setting<T>>,
+    settings: Vec<Setting<L::Setting>>,
 }
 
-impl<T> SettingsFrame<T> {
-    /// The frame of `settings` of the list of parts `S`, with `widths`.
+impl<L: SettingList> SettingsFrame<L> {
+    /// The frame of `settings`, with `widths`.
     ///
     /// # Errors
     ///
     /// [`SettingsFrameError`] if an identifier occurs twice, an unknown
-    /// setting has an identifier that a part of `S` claims, or the Length
+    /// setting has an identifier that a type of `L` claims, or the Length
     /// cannot be written at its width.
-    pub fn new<S: SettingsSet<Setting = T>>(
-        settings: Vec<Setting<T>>,
+    pub fn new(
+        settings: Vec<Setting<L::Setting>>,
         widths: FrameWidths,
     ) -> Result<Self, SettingsFrameError> {
+        const {
+            assert!(
+                L::CLAIMS_VALID,
+                "two setting types of the list claim the same identifier, or one claims a reserved one"
+            );
+        }
         let mut length = 0u64;
         for (index, setting) in settings.iter().enumerate() {
-            let (identifier, value) = fields::<S>(setting);
-            if matches!(setting, Setting::Unknown(_))
-                && S::identifier_of(identifier.get()).is_some()
-            {
+            let (identifier, value) = fields::<L>(setting);
+            if matches!(setting, Setting::Unknown(_)) && L::IDENTIFIERS.contains(identifier.get()) {
                 return Err(SettingsFrameError::ClaimedIdentifier {
                     identifier: identifier.get(),
                 });
             }
             if settings[..index]
                 .iter()
-                .any(|earlier| fields::<S>(earlier).0.get() == identifier.get())
+                .any(|earlier| fields::<L>(earlier).0.get() == identifier.get())
             {
                 return Err(SettingsFrameError::Duplicate {
                     source: DuplicateSettingError::new(identifier.get()),
@@ -235,7 +213,7 @@ impl<T> SettingsFrame<T> {
     }
 
     /// The settings, in order.
-    pub fn settings(&self) -> &[Setting<T>] {
+    pub fn settings(&self) -> &[Setting<L::Setting>] {
         &self.settings
     }
 
@@ -250,11 +228,50 @@ impl<T> SettingsFrame<T> {
     }
 }
 
-fn fields<S: SettingsSet>(
-    setting: &Setting<S::Setting>,
+impl<L: SettingList> Clone for SettingsFrame<L>
+where
+    L::Setting: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            widths: self.widths,
+            length: self.length,
+            settings: self.settings.clone(),
+        }
+    }
+}
+
+impl<L: SettingList> fmt::Debug for SettingsFrame<L>
+where
+    L::Setting: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SettingsFrame")
+            .field("widths", &self.widths)
+            .field("length", &self.length)
+            .field("settings", &self.settings)
+            .finish()
+    }
+}
+
+impl<L: SettingList> PartialEq for SettingsFrame<L>
+where
+    L::Setting: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.widths == other.widths
+            && self.length == other.length
+            && self.settings == other.settings
+    }
+}
+
+impl<L: SettingList> Eq for SettingsFrame<L> where L::Setting: Eq {}
+
+fn fields<L: SettingList>(
+    setting: &Setting<L::Setting>,
 ) -> (VarIntField<VarInt>, VarIntField<VarInt>) {
     match setting {
-        Setting::Known(setting) => S::fields(setting),
+        Setting::Known(setting) => L::fields(setting),
         Setting::Unknown(setting) => (setting.identifier, setting.value),
     }
 }
@@ -269,8 +286,8 @@ pub enum SettingsFrameError {
         /// The repeated identifier.
         source: DuplicateSettingError,
     },
-    /// An unknown setting has an identifier that a part of the list claims,
-    /// whose value that part would check; read back, it is a known setting.
+    /// An unknown setting has an identifier that a type of the list claims,
+    /// whose value that type would check; read back, it is a known setting.
     #[snafu(display("unknown setting has the claimed identifier {}", identifier.get()))]
     ClaimedIdentifier {
         /// The identifier.
@@ -284,26 +301,24 @@ pub enum SettingsFrameError {
     },
 }
 
-/// Writes a SETTINGS frame of the list of parts `S`, which `parts` names.
+/// Writes `frame`.
 ///
 /// # Errors
 ///
 /// [`WriteSettingsFrameError`]; bytes accepted before the failure stay
 /// written.
 #[call(sync)]
-pub async fn write_settings_frame<S: SettingsSet, F: Write, A: ReceiverAccess<Family = F>>(
+pub async fn write_settings_frame<L: SettingList, F: Write, A: ReceiverAccess<Family = F>>(
     io: &mut A,
-    frame: &SettingsFrame<S::Setting>,
-    parts: core::marker::PhantomData<S>,
+    frame: &SettingsFrame<L>,
 ) -> Result<(), WriteSettingsFrameError<F::Error>> {
-    let _ = parts;
     let type_field = VarIntField::new(Http3FrameType::Settings.value(), frame.widths.type_width())
         .expect("every width holds the frame type 0x04");
     io.write_frame_head(type_field, frame.length)
         .await
         .context(write_settings_frame_error::HeadSnafu)?;
     for (index, setting) in frame.settings.iter().enumerate() {
-        let (identifier, value) = fields::<S>(setting);
+        let (identifier, value) = fields::<L>(setting);
         io.write_var_int_field(identifier)
             .await
             .context(write_settings_frame_error::IdentifierSnafu { index })?;

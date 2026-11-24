@@ -16,12 +16,14 @@
     clippy::alloc_instead_of_core
 )]
 
-use frunk_core::coproduct::CNil;
+use frunk_core::{HList, coproduct::CNil};
 use hatate_wire::{
-    frame::set::FramePart, registry::ClaimedValues, settings::set::SettingsPart,
+    frame::set::FramePart,
+    registry::ClaimedValues,
+    settings::{KeyedSetting, set::SettingsPart},
     stream_type::StreamTypePart,
 };
-use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
+use sakuya_var_int::{VarInt, VarIntField};
 use snafu::Snafu;
 
 /// The part of Extended CONNECT: one setting, no frame types or stream
@@ -29,51 +31,23 @@ use snafu::Snafu;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Part;
 
-/// The identifier SETTINGS_ENABLE_CONNECT_PROTOCOL (0x08), the only one this
-/// part claims.
+/// SETTINGS_ENABLE_CONNECT_PROTOCOL (0x08): 0 or 1. 1 lets the client use
+/// Extended CONNECT; a server's own setting has no effect
+/// ([RFC 8441 §3]).
+///
+/// [RFC 8441 §3]: https://www.rfc-editor.org/rfc/rfc8441.html#section-3
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct EnableConnectProtocolSettingIdentifier;
-
-impl EnableConnectProtocolSettingIdentifier {
-    /// The identifier on the wire.
-    pub const VALUE: VarInt = VarInt::from_u32(0x08);
-}
-
-/// A SETTINGS_ENABLE_CONNECT_PROTOCOL setting: 0 or 1, with the widths of
-/// its identifier and value on the wire. 1 lets the client use Extended
-/// CONNECT; a server's own setting has no effect.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct EnableConnectProtocolSetting {
-    identifier_width: VarIntWidth,
+pub struct EnableConnectProtocol {
     value: VarIntField<VarInt>,
 }
 
-impl EnableConnectProtocolSetting {
-    /// The setting with value 1 if `enabled`, else 0, both in their
-    /// shortest encodings.
+impl EnableConnectProtocol {
+    /// The setting with value 1 if `enabled`, else 0, in its shortest
+    /// encoding.
     pub fn new(enabled: bool) -> Self {
         Self {
-            identifier_width: VarIntWidth::One,
             value: VarIntField::shortest(VarInt::from_u32(u32::from(enabled))),
         }
-    }
-
-    /// The setting `value` with its identifier at `identifier_width`.
-    ///
-    /// # Errors
-    ///
-    /// [`EnableConnectProtocolValueError`] if the value is neither 0 nor 1.
-    pub fn with_widths(
-        identifier_width: VarIntWidth,
-        value: VarIntField<VarInt>,
-    ) -> Result<Self, EnableConnectProtocolValueError> {
-        if value.get().get() > 1 {
-            return Err(EnableConnectProtocolValueError { value: value.get() });
-        }
-        Ok(Self {
-            identifier_width,
-            value,
-        })
     }
 
     /// Whether the value is 1.
@@ -81,13 +55,24 @@ impl EnableConnectProtocolSetting {
         self.value.get().get() == 1
     }
 
-    /// The width of the identifier.
-    pub const fn identifier_width(&self) -> VarIntWidth {
-        self.identifier_width
-    }
-
     /// The value as it is on the wire.
     pub const fn value(&self) -> VarIntField<VarInt> {
+        self.value
+    }
+}
+
+impl KeyedSetting for EnableConnectProtocol {
+    type ValueError = EnableConnectProtocolValueError;
+    const IDENTIFIER: VarInt = VarInt::from_u32(0x08);
+
+    fn from_value(value: VarIntField<VarInt>) -> Result<Self, EnableConnectProtocolValueError> {
+        if value.get().get() > 1 {
+            return Err(EnableConnectProtocolValueError { value: value.get() });
+        }
+        Ok(Self { value })
+    }
+
+    fn value(&self) -> VarIntField<VarInt> {
         self.value
     }
 }
@@ -115,48 +100,7 @@ impl EnableConnectProtocolValueError {
 }
 
 impl SettingsPart for Part {
-    type Identifier = EnableConnectProtocolSettingIdentifier;
-    type Setting = EnableConnectProtocolSetting;
-    type ValueError = EnableConnectProtocolValueError;
-    type Occurrences = bool;
-    const SETTING_IDENTIFIERS: &'static ClaimedValues =
-        &ClaimedValues::new(&[EnableConnectProtocolSettingIdentifier::VALUE
-            ..=EnableConnectProtocolSettingIdentifier::VALUE]);
-
-    fn identifier_of(value: VarInt) -> Option<EnableConnectProtocolSettingIdentifier> {
-        (value == EnableConnectProtocolSettingIdentifier::VALUE)
-            .then_some(EnableConnectProtocolSettingIdentifier)
-    }
-
-    fn setting_of(
-        _identifier: EnableConnectProtocolSettingIdentifier,
-        identifier_width: VarIntWidth,
-        value: VarIntField<VarInt>,
-    ) -> Result<EnableConnectProtocolSetting, EnableConnectProtocolValueError> {
-        EnableConnectProtocolSetting::with_widths(identifier_width, value)
-    }
-
-    fn identifier(
-        _setting: &EnableConnectProtocolSetting,
-    ) -> EnableConnectProtocolSettingIdentifier {
-        EnableConnectProtocolSettingIdentifier
-    }
-
-    fn fields(
-        setting: &EnableConnectProtocolSetting,
-    ) -> (VarIntField<VarInt>, VarIntField<VarInt>) {
-        // invariant: every width holds 0x08.
-        let identifier = VarIntField::new(
-            EnableConnectProtocolSettingIdentifier::VALUE,
-            setting.identifier_width,
-        )
-        .expect("every width holds the identifier 0x08");
-        (identifier, setting.value)
-    }
-
-    fn record(occurrences: &mut bool, _identifier: EnableConnectProtocolSettingIdentifier) -> bool {
-        !core::mem::replace(occurrences, true)
-    }
+    type Settings = HList![EnableConnectProtocol];
 }
 
 impl FramePart for Part {

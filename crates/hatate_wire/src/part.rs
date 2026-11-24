@@ -2,11 +2,12 @@
 use crate::{
     frame::{Http3FrameType, set::FramePart},
     registry::ClaimedValues,
-    settings::{Http3Setting, Http3SettingIdentifier, set::SettingsPart},
+    settings::{MaxFieldSectionSize, set::SettingsPart},
     stream_type::{Http3StreamType, StreamTypePart},
 };
-use core::convert::Infallible;
-use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
+use frunk_core::HList;
+use hatate_wire_qpack::{QpackBlockedStreams, QpackMaxTableCapacity};
+use sakuya_var_int::VarInt;
 
 /// The part of RFC 9114: its frame types, its settings and QPACK's, and its
 /// unidirectional stream types and QPACK's. Every connection's list of
@@ -42,43 +43,11 @@ impl FramePart for Part {
 }
 
 impl SettingsPart for Part {
-    type Identifier = Http3SettingIdentifier;
-    type Setting = Http3Setting;
-    type ValueError = Infallible;
-    type Occurrences = [bool; 3];
-    const SETTING_IDENTIFIERS: &'static ClaimedValues =
-        &ClaimedValues::new(&[v(0x01)..=v(0x01), v(0x06)..=v(0x07)]);
-
-    fn identifier_of(value: VarInt) -> Option<Http3SettingIdentifier> {
-        Http3SettingIdentifier::of(value)
-    }
-
-    fn setting_of(
-        identifier: Http3SettingIdentifier,
-        identifier_width: VarIntWidth,
-        value: VarIntField<VarInt>,
-    ) -> Result<Http3Setting, Infallible> {
-        Ok(Http3Setting::with_identifier_width(
-            identifier,
-            identifier_width,
-            value,
-        ))
-    }
-
-    fn identifier(setting: &Http3Setting) -> Http3SettingIdentifier {
-        setting.identifier()
-    }
-
-    fn fields(setting: &Http3Setting) -> (VarIntField<VarInt>, VarIntField<VarInt>) {
-        // invariant: every width holds these identifiers.
-        let identifier = VarIntField::new(setting.identifier().value(), setting.identifier_width())
-            .expect("every width holds an identifier below 64");
-        (identifier, setting.value())
-    }
-
-    fn record(occurrences: &mut [bool; 3], identifier: Http3SettingIdentifier) -> bool {
-        !core::mem::replace(&mut occurrences[identifier.index()], true)
-    }
+    type Settings = HList![
+        QpackMaxTableCapacity,
+        MaxFieldSectionSize,
+        QpackBlockedStreams
+    ];
 }
 
 impl StreamTypePart for Part {

@@ -2,11 +2,14 @@
 use core::marker::PhantomData;
 use frunk_core::HList;
 use hatate_wire::{
-    defaults::RejectKnownDuplicates,
     frame::{
         FrameType, Http3FrameType, control::codec::ReadGoawayFrameExt as _, payload::FramePayload,
     },
-    settings::{Setting, codec::ReadSettingExt as _},
+    settings::{
+        Setting,
+        codec::ReadSettingExt as _,
+        set::{Settings, SettingsOf},
+    },
 };
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::Read;
@@ -35,8 +38,8 @@ where
     let mut count = 0;
     {
         let mut source = io.compose(&mut payload);
-        let mut policy = RejectKnownDuplicates::<Parts>::new();
-        while let Some(setting) = source.read_setting(&mut policy).await.unwrap() {
+        let mut settings = Settings::<<Parts as SettingsOf>::Settings>::new();
+        while let Some(setting) = source.read_setting(&mut settings).await.unwrap() {
             assert!(matches!(setting, Setting::Known(_) | Setting::Unknown(_)));
             count += 1;
         }

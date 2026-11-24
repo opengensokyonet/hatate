@@ -20,16 +20,16 @@
 )]
 
 use bytes::{Buf, BufMut};
-use frunk_core::coproduct::CNil;
+use frunk_core::{HList, coproduct::CNil};
 use hatate_wire::{
     error_code::{ErrorCode, ErrorCodeOf},
     frame::set::FramePart,
     registry::ClaimedValues,
-    settings::set::SettingsPart,
+    settings::{KeyedSetting, set::SettingsPart},
     stream_type::StreamTypePart,
 };
 use sakuya_var_int::{
-    VarInt, VarIntField, VarIntWidth,
+    VarInt, VarIntField,
     codec::{ReadVarIntFieldError, read_var_int_field, write_var_int_field},
 };
 use snafu::{ResultExt, Snafu};
@@ -43,53 +43,22 @@ pub const H3_DATAGRAM_ERROR: ErrorCode = ErrorCode::new(VarInt::from_u32(0x33));
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Part;
 
-/// The identifier SETTINGS_H3_DATAGRAM (0x33), the only one this part
-/// claims.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct H3DatagramSettingIdentifier;
-
-impl H3DatagramSettingIdentifier {
-    /// The identifier on the wire.
-    pub const VALUE: VarInt = VarInt::from_u32(0x33);
-}
-
-/// A SETTINGS_H3_DATAGRAM setting: 0 or 1, with the widths of its
-/// identifier and value on the wire. 1 states that the sender is willing to
-/// receive HTTP/3 datagrams ([RFC 9297 §2.1.1]).
+/// SETTINGS_H3_DATAGRAM (0x33): 0 or 1. 1 states that the sender is willing
+/// to receive HTTP/3 datagrams ([RFC 9297 §2.1.1]).
 ///
 /// [RFC 9297 §2.1.1]: https://www.rfc-editor.org/rfc/rfc9297.html#section-2.1.1
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct H3DatagramSetting {
-    identifier_width: VarIntWidth,
+pub struct H3Datagram {
     value: VarIntField<VarInt>,
 }
 
-impl H3DatagramSetting {
-    /// The setting with value 1 if `enabled`, else 0, both in their
-    /// shortest encodings.
+impl H3Datagram {
+    /// The setting with value 1 if `enabled`, else 0, in its shortest
+    /// encoding.
     pub fn new(enabled: bool) -> Self {
         Self {
-            identifier_width: VarIntWidth::One,
             value: VarIntField::shortest(VarInt::from_u32(u32::from(enabled))),
         }
-    }
-
-    /// The setting `value` with its identifier at `identifier_width`.
-    ///
-    /// # Errors
-    ///
-    /// [`H3DatagramValueError`] if the value is neither 0 nor 1.
-    pub fn with_widths(
-        identifier_width: VarIntWidth,
-        value: VarIntField<VarInt>,
-    ) -> Result<Self, H3DatagramValueError> {
-        if value.get().get() > 1 {
-            return Err(H3DatagramValueError { value: value.get() });
-        }
-        Ok(Self {
-            identifier_width,
-            value,
-        })
     }
 
     /// Whether the value is 1.
@@ -97,13 +66,24 @@ impl H3DatagramSetting {
         self.value.get().get() == 1
     }
 
-    /// The width of the identifier.
-    pub const fn identifier_width(&self) -> VarIntWidth {
-        self.identifier_width
-    }
-
     /// The value as it is on the wire.
     pub const fn value(&self) -> VarIntField<VarInt> {
+        self.value
+    }
+}
+
+impl KeyedSetting for H3Datagram {
+    type ValueError = H3DatagramValueError;
+    const IDENTIFIER: VarInt = VarInt::from_u32(0x33);
+
+    fn from_value(value: VarIntField<VarInt>) -> Result<Self, H3DatagramValueError> {
+        if value.get().get() > 1 {
+            return Err(H3DatagramValueError { value: value.get() });
+        }
+        Ok(Self { value })
+    }
+
+    fn value(&self) -> VarIntField<VarInt> {
         self.value
     }
 }
@@ -126,41 +106,7 @@ impl H3DatagramValueError {
 }
 
 impl SettingsPart for Part {
-    type Identifier = H3DatagramSettingIdentifier;
-    type Setting = H3DatagramSetting;
-    type ValueError = H3DatagramValueError;
-    type Occurrences = bool;
-    const SETTING_IDENTIFIERS: &'static ClaimedValues = &ClaimedValues::new(&[
-        H3DatagramSettingIdentifier::VALUE..=H3DatagramSettingIdentifier::VALUE,
-    ]);
-
-    fn identifier_of(value: VarInt) -> Option<H3DatagramSettingIdentifier> {
-        (value == H3DatagramSettingIdentifier::VALUE).then_some(H3DatagramSettingIdentifier)
-    }
-
-    fn setting_of(
-        _identifier: H3DatagramSettingIdentifier,
-        identifier_width: VarIntWidth,
-        value: VarIntField<VarInt>,
-    ) -> Result<H3DatagramSetting, H3DatagramValueError> {
-        H3DatagramSetting::with_widths(identifier_width, value)
-    }
-
-    fn identifier(_setting: &H3DatagramSetting) -> H3DatagramSettingIdentifier {
-        H3DatagramSettingIdentifier
-    }
-
-    fn fields(setting: &H3DatagramSetting) -> (VarIntField<VarInt>, VarIntField<VarInt>) {
-        // invariant: every width holds 0x33.
-        let identifier =
-            VarIntField::new(H3DatagramSettingIdentifier::VALUE, setting.identifier_width)
-                .expect("every width holds the identifier 0x33");
-        (identifier, setting.value)
-    }
-
-    fn record(occurrences: &mut bool, _identifier: H3DatagramSettingIdentifier) -> bool {
-        !core::mem::replace(occurrences, true)
-    }
+    type Settings = HList![H3Datagram];
 }
 
 impl FramePart for Part {
