@@ -8,7 +8,6 @@
 //! own stream ([`StreamPart::read`]). A part never touches a stream that is
 //! not its own.
 use super::class::StreamClass;
-use crate::error_code::ErrorCode;
 use core::future::Future;
 use frunk_core::{
     coproduct::{CNil, Coproduct},
@@ -18,21 +17,22 @@ use nitori_call::ReceiverAccess;
 use nitori_io::Read;
 use sakuya_var_int::{VarInt, VarIntField};
 
-/// A part's verdict on the value at the start of a stream.
+/// A part's verdict on the value at the start of a stream: `T` is the value
+/// in the form of the part, `R` why the part rejects the stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum StreamVerdict<T> {
+pub enum StreamVerdict<T, R> {
     /// The value opens a stream of this part, in the form of this part.
     Claimed(T),
     /// The value is none of this part's.
     NotClaimed,
     /// The value belongs to this part, and a stream of this class that
-    /// starts with it is a connection error with this code.
-    Error(ErrorCode),
-    /// A connection error with this code, unless another part claims the
+    /// starts with it is a connection error, for this reason.
+    Error(R),
+    /// A connection error, for this reason, unless another part claims the
     /// value; HTTP/3 gives it on server-initiated bidirectional streams,
     /// which extensions may use, and on a client-initiated one that starts
     /// with a frame type another part has for other streams.
-    ErrorUnlessClaimed(ErrorCode),
+    ErrorUnlessClaimed(R),
 }
 
 /// What a part makes of the start of a stream of class `C`, in a
@@ -49,6 +49,10 @@ pub trait StreamPart<C: StreamClass, L> {
     /// A value this part claims, in the form of this part: obtained only
     /// from [`judge`](Self::judge).
     type Claimed: Copy;
+    /// Why this part rejects a stream of this class at its start, with
+    /// [`ErrorCodeOf`](crate::error_code::ErrorCodeOf) giving the
+    /// connection error; `CNil` for a part that rejects none.
+    type Rejection;
     /// A stream of this part, on the access `I`.
     type Stream<I>;
     /// The failures of reading what follows the value, from a source whose
@@ -66,7 +70,7 @@ pub trait StreamPart<C: StreamClass, L> {
     /// declares. The list does not check this.
     ///
     /// [`StreamTypePart::STREAM_TYPES`]: crate::stream_type::StreamTypePart::STREAM_TYPES
-    fn judge(value: VarInt, skipped: bool) -> StreamVerdict<Self::Claimed>;
+    fn judge(value: VarInt, skipped: bool) -> StreamVerdict<Self::Claimed, Self::Rejection>;
 
     /// Reads what follows the value `claimed`, read as `field`, from `io`,
     /// and gives the stream of this part.
@@ -79,8 +83,8 @@ pub trait StreamPart<C: StreamClass, L> {
 }
 
 /// What a list of parts, `HNil` or `HCons<P, Ps>`, makes of the start of a
-/// stream of class `C`: the parts' claims, streams and failures as a
-/// `Coproduct` in the order of the list.
+/// stream of class `C`: the parts' claims, rejections, streams and failures
+/// as a `Coproduct` in the order of the list.
 ///
 /// The verdicts combine thus: values are claimed by at most one part, so at
 /// most one part gives [`StreamVerdict::Claimed`] or [`StreamVerdict::Error`]
@@ -90,13 +94,15 @@ pub trait StreamPart<C: StreamClass, L> {
 pub trait StreamSet<C: StreamClass, L> {
     /// A value a part of this list claims.
     type Claimed: Copy;
+    /// Why a part of this list rejects a stream.
+    type Rejection;
     /// A stream of a part of this list.
     type Stream<I>;
     /// A failure of a part of this list.
     type ReadError<E>;
 
     /// The verdict of the list on `value`.
-    fn judge(value: VarInt, skipped: bool) -> StreamVerdict<Self::Claimed>;
+    fn judge(value: VarInt, skipped: bool) -> StreamVerdict<Self::Claimed, Self::Rejection>;
 
     /// Reads what follows `claimed`, as the part that claims it does.
     #[allow(clippy::type_complexity)] // The part's stream and failure on `I`.
@@ -109,10 +115,11 @@ pub trait StreamSet<C: StreamClass, L> {
 
 impl<C: StreamClass, L> StreamSet<C, L> for HNil {
     type Claimed = CNil;
+    type Rejection = CNil;
     type Stream<I> = CNil;
     type ReadError<E> = CNil;
 
-    fn judge(_value: VarInt, _skipped: bool) -> StreamVerdict<CNil> {
+    fn judge(_value: VarInt, _skipped: bool) -> StreamVerdict<CNil, CNil> {
         StreamVerdict::NotClaimed
     }
 
@@ -127,18 +134,19 @@ impl<C: StreamClass, L> StreamSet<C, L> for HNil {
 
 impl<C: StreamClass, L, P: StreamPart<C, L>, Ps: StreamSet<C, L>> StreamSet<C, L> for HCons<P, Ps> {
     type Claimed = Coproduct<P::Claimed, Ps::Claimed>;
+    type Rejection = Coproduct<P::Rejection, Ps::Rejection>;
     type Stream<I> = Coproduct<P::Stream<I>, Ps::Stream<I>>;
     type ReadError<E> = Coproduct<P::ReadError<E>, Ps::ReadError<E>>;
 
-    fn judge(value: VarInt, skipped: bool) -> StreamVerdict<Self::Claimed> {
+    fn judge(value: VarInt, skipped: bool) -> StreamVerdict<Self::Claimed, Self::Rejection> {
         use StreamVerdict::{Claimed, Error, ErrorUnlessClaimed, NotClaimed};
         match (P::judge(value, skipped), Ps::judge(value, skipped)) {
             (Claimed(claimed), _) => Claimed(Coproduct::Inl(claimed)),
             (_, Claimed(claimed)) => Claimed(Coproduct::Inr(claimed)),
-            (Error(code), _) | (_, Error(code)) => Error(code),
-            (ErrorUnlessClaimed(code), _) | (_, ErrorUnlessClaimed(code)) => {
-                ErrorUnlessClaimed(code)
-            }
+            (Error(rejection), _) => Error(Coproduct::Inl(rejection)),
+            (_, Error(rejection)) => Error(Coproduct::Inr(rejection)),
+            (ErrorUnlessClaimed(rejection), _) => ErrorUnlessClaimed(Coproduct::Inl(rejection)),
+            (_, ErrorUnlessClaimed(rejection)) => ErrorUnlessClaimed(Coproduct::Inr(rejection)),
             (NotClaimed, NotClaimed) => NotClaimed,
         }
     }

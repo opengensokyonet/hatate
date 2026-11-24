@@ -9,22 +9,20 @@ use frunk_core::{
 };
 use hatate_wire::{
     Part,
-    error_code::{ErrorCode, ErrorCodeOf as _},
+    error_code::{ErrorCode, ErrorCodeOf},
     frame::{
         FrameType,
-        codec::WriteFrameExt as _,
+        codec::{UnexpectedFrameTypeError, WriteFrameExt as _},
         set::{FramePart, FramePartOn},
     },
     registry::ClaimedValues,
     stream::{
         FrameStream, ReceivedStream,
-        class::{
-            ClientInitiatedBidirectional, ClientInitiatedUnidirectional,
-            ServerInitiatedBidirectional, ServerInitiatedUnidirectional, StreamClass,
-        },
+        class::{ClientInitiatedBidirectional, ServerInitiatedBidirectional},
         codec::{ReadBidirectionalStreamError, read_bidirectional_stream},
+        http3::ServerBidirectionalStreamError,
         kind::{RequestStreamKind, StreamKind},
-        part::{StreamPart, StreamSet, StreamVerdict},
+        part::{StreamPart, StreamVerdict},
     },
 };
 use nitori_call::{ReceiverAccess, call};
@@ -38,6 +36,24 @@ use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 struct Probe;
 
 const PROBE_ERROR: ErrorCode = ErrorCode::new(VarInt::from_u32(0x1234));
+
+/// Why the probe rejects 0x2b.
+#[derive(Debug)]
+struct ProbeRejection;
+
+impl core::fmt::Display for ProbeRejection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the probe rejects the stream")
+    }
+}
+
+impl core::error::Error for ProbeRejection {}
+
+impl ErrorCodeOf<ErrorCode> for ProbeRejection {
+    fn error_code(&self) -> Option<ErrorCode> {
+        Some(PROBE_ERROR)
+    }
+}
 
 impl FramePart for Probe {
     const FRAME_TYPES: &'static ClaimedValues = &ClaimedValues::NONE;
@@ -57,13 +73,14 @@ macro_rules! probe_part {
     ($class:ty) => {
         impl<L> StreamPart<$class, L> for Probe {
             type Claimed = bool;
+            type Rejection = ProbeRejection;
             type Stream<I> = ProbeStream;
             type ReadError<E> = CNil;
 
-            fn judge(value: VarInt, skipped: bool) -> StreamVerdict<bool> {
+            fn judge(value: VarInt, skipped: bool) -> StreamVerdict<bool, ProbeRejection> {
                 match value.get() {
                     0x2a => StreamVerdict::Claimed(skipped),
-                    0x2b => StreamVerdict::Error(PROBE_ERROR),
+                    0x2b => StreamVerdict::Error(ProbeRejection),
                     _ => StreamVerdict::NotClaimed,
                 }
             }
@@ -117,29 +134,84 @@ enum Failed {
     Head(Option<ErrorCode>),
     /// The payload of a reserved frame at the start was cut; the code.
     ReservedPayload(Option<ErrorCode>),
-    /// A part rejected the value.
-    Rejected { value: u64, code: ErrorCode },
+    /// A part rejected the value, for this reason.
+    Rejected {
+        value: u64,
+        code: ErrorCode,
+        reason: Reason,
+    },
     /// The part that claims the value could not read the start; the code.
     Part(Option<ErrorCode>),
+}
+
+/// Which rule rejected a value.
+#[derive(Debug, PartialEq, Eq)]
+enum Reason {
+    Http2Type,
+    NotAllowedOnStream,
+    NotReceivableByRole,
+    ServerBidirectionalStream,
+    Probe,
+}
+
+/// The reason in a sum of rejections.
+trait Classify {
+    fn reason(&self) -> Reason;
+}
+
+impl Classify for CNil {
+    fn reason(&self) -> Reason {
+        match *self {}
+    }
+}
+
+impl<H: Classify, T: Classify> Classify for Coproduct<H, T> {
+    fn reason(&self) -> Reason {
+        match self {
+            Coproduct::Inl(head) => head.reason(),
+            Coproduct::Inr(rest) => rest.reason(),
+        }
+    }
+}
+
+impl Classify for UnexpectedFrameTypeError {
+    fn reason(&self) -> Reason {
+        match self {
+            Self::Http2Type { .. } => Reason::Http2Type,
+            Self::NotAllowedOnStream { .. } => Reason::NotAllowedOnStream,
+            Self::NotReceivableByRole { .. } => Reason::NotReceivableByRole,
+        }
+    }
+}
+
+impl Classify for ServerBidirectionalStreamError {
+    fn reason(&self) -> Reason {
+        Reason::ServerBidirectionalStream
+    }
+}
+
+impl Classify for ProbeRejection {
+    fn reason(&self) -> Reason {
+        Reason::Probe
+    }
 }
 
 fn failed<
     E: hatate_wire::error_code::ErrorCodeOf<ErrorCode>,
     P: hatate_wire::error_code::ErrorCodeOf<ErrorCode>,
+    R: hatate_wire::error_code::ErrorCodeOf<ErrorCode> + Classify,
 >(
-    error: &ReadBidirectionalStreamError<E, P>,
+    error: &ReadBidirectionalStreamError<E, P, R>,
 ) -> Failed {
     let code = error.error_code();
     match error {
         ReadBidirectionalStreamError::Head { .. } => Failed::Head(code),
         ReadBidirectionalStreamError::ReservedPayload { .. } => Failed::ReservedPayload(code),
-        ReadBidirectionalStreamError::Rejected { value, code } => {
-            assert_eq!(error.error_code(), Some(*code));
-            Failed::Rejected {
-                value: value.get(),
-                code: *code,
-            }
-        }
+        ReadBidirectionalStreamError::Rejected { value, source } => Failed::Rejected {
+            value: value.get(),
+            code: code.expect("a rejection has a code"),
+            reason: source.get().reason(),
+        },
         ReadBidirectionalStreamError::Part { .. } => Failed::Part(code),
     }
 }
@@ -436,22 +508,27 @@ fn a_request_stream_after_reserved_frames_has_the_widths_it_had() {
 
 #[test]
 fn frame_types_a_request_stream_may_not_start_with_are_rejected() {
-    let cases: [(u8, &str); 11] = [
-        (0x02, "HTTP/2 PRIORITY"),
-        (0x06, "HTTP/2 PING"),
-        (0x08, "HTTP/2 WINDOW_UPDATE"),
-        (0x09, "HTTP/2 CONTINUATION"),
-        (0x03, "CANCEL_PUSH"),
-        (0x04, "SETTINGS"),
-        (0x07, "GOAWAY"),
-        (0x0d, "MAX_PUSH_ID"),
+    let cases: [(u8, &str, Reason); 11] = [
+        (0x02, "HTTP/2 PRIORITY", Reason::Http2Type),
+        (0x06, "HTTP/2 PING", Reason::Http2Type),
+        (0x08, "HTTP/2 WINDOW_UPDATE", Reason::Http2Type),
+        (0x09, "HTTP/2 CONTINUATION", Reason::Http2Type),
+        // Frames of HTTP/3 for other streams.
+        (0x03, "CANCEL_PUSH", Reason::NotAllowedOnStream),
+        (0x04, "SETTINGS", Reason::NotAllowedOnStream),
+        (0x07, "GOAWAY", Reason::NotAllowedOnStream),
+        (0x0d, "MAX_PUSH_ID", Reason::NotAllowedOnStream),
         // Only a client receives PUSH_PROMISE, and a server receives the
         // streams a client opens.
-        (0x05, "PUSH_PROMISE"),
-        (0x02, "again, after a reserved frame"),
-        (0x04, "again, after a reserved frame"),
+        (0x05, "PUSH_PROMISE", Reason::NotReceivableByRole),
+        (0x02, "again, after a reserved frame", Reason::Http2Type),
+        (
+            0x04,
+            "again, after a reserved frame",
+            Reason::NotAllowedOnStream,
+        ),
     ];
-    for (index, (value, name)) in cases.into_iter().enumerate() {
+    for (index, (value, name, reason)) in cases.into_iter().enumerate() {
         let prefix: &[u8] = if index >= 9 { &[0x21, 0x00] } else { &[] };
         let wire = [prefix, &[value, 0x00, 0xaa]].concat();
         let (started, rest) = client(&wire, false);
@@ -459,7 +536,8 @@ fn frame_types_a_request_stream_may_not_start_with_are_rejected() {
             started.unwrap_err(),
             Failed::Rejected {
                 value: u64::from(value),
-                code: ErrorCode::H3_FRAME_UNEXPECTED
+                code: ErrorCode::H3_FRAME_UNEXPECTED,
+                reason
             },
             "{name}"
         );
@@ -642,7 +720,8 @@ fn http3_does_not_use_bidirectional_streams_the_server_opens() {
             started.unwrap_err(),
             Failed::Rejected {
                 value,
-                code: ErrorCode::H3_STREAM_CREATION_ERROR
+                code: ErrorCode::H3_STREAM_CREATION_ERROR,
+                reason: Reason::ServerBidirectionalStream
             },
             "{wire:?}"
         );
@@ -664,7 +743,8 @@ fn an_extension_may_claim_a_stream_the_server_opens_or_reject_it() {
             started.unwrap_err(),
             Failed::Rejected {
                 value: 0x2b,
-                code: PROBE_ERROR
+                code: PROBE_ERROR,
+                reason: Reason::Probe
             }
         );
     }
@@ -674,162 +754,11 @@ fn an_extension_may_claim_a_stream_the_server_opens_or_reject_it() {
         started.unwrap_err(),
         Failed::Rejected {
             value: 0x2c,
-            code: ErrorCode::H3_STREAM_CREATION_ERROR
+            code: ErrorCode::H3_STREAM_CREATION_ERROR,
+            reason: Reason::ServerBidirectionalStream
         }
     );
     // On the client-initiated side it is a stream no part claims.
     let (started, _) = client_probing(&[0x2c]);
     assert_eq!(started.unwrap().unwrap(), Started::Unknown { value: 0x2c });
-}
-
-/// A part that gives one fixed verdict on one value, in any class.
-struct Says<const VALUE: u32, const VERDICT: u8>;
-
-const FIRST: ErrorCode = ErrorCode::new(VarInt::from_u32(0x2001));
-const WEAK: ErrorCode = ErrorCode::new(VarInt::from_u32(0x2002));
-
-impl<const VALUE: u32, const VERDICT: u8, C: StreamClass, L> StreamPart<C, L>
-    for Says<VALUE, VERDICT>
-{
-    type Claimed = ();
-    type Stream<I> = ();
-    type ReadError<E> = CNil;
-
-    fn judge(value: VarInt, _skipped: bool) -> StreamVerdict<()> {
-        if value.get() != u64::from(VALUE) {
-            return StreamVerdict::NotClaimed;
-        }
-        match VERDICT {
-            0 => StreamVerdict::Claimed(()),
-            1 => StreamVerdict::Error(FIRST),
-            _ => StreamVerdict::ErrorUnlessClaimed(WEAK),
-        }
-    }
-
-    async fn read<I: ReceiverAccess<Family: Read>>(
-        (): (),
-        _field: VarIntField<VarInt>,
-        _io: I,
-    ) -> Result<(), CNil> {
-        Ok(())
-    }
-}
-
-type Claimed<const VALUE: u32> = Says<VALUE, 0>;
-type Errors<const VALUE: u32> = Says<VALUE, 1>;
-type Weak<const VALUE: u32> = Says<VALUE, 2>;
-
-fn judge<C: StreamClass, L: StreamSet<C, L>>(value: u32) -> StreamVerdict<L::Claimed>
-where
-    L::Claimed: core::fmt::Debug,
-{
-    L::judge(VarInt::from_u32(value), false)
-}
-
-#[test]
-fn the_verdicts_of_the_parts_of_a_list_combine_by_the_rules_of_the_set() {
-    use StreamVerdict::{Claimed as Yes, Error, ErrorUnlessClaimed, NotClaimed};
-    type Uni = ClientInitiatedUnidirectional;
-    // The list's own verdict on a value no part has an opinion on.
-    assert_eq!(judge::<Uni, HList![]>(7), NotClaimed);
-    assert_eq!(
-        judge::<Uni, HList![Claimed<1>, Errors<2>, Weak<3>]>(9),
-        NotClaimed
-    );
-
-    // One part's verdict is the list's, wherever it is in the list, and
-    // a claim is given as the injection of the claiming part.
-    type A = HList![Claimed<1>, Errors<2>, Weak<3>];
-    assert_eq!(judge::<Uni, A>(1), Yes(Coproduct::Inl(())));
-    assert_eq!(judge::<Uni, A>(2), Error(FIRST));
-    assert_eq!(judge::<Uni, A>(3), ErrorUnlessClaimed(WEAK));
-    type B = HList![Weak<3>, Errors<2>, Claimed<1>];
-    assert_eq!(
-        judge::<Uni, B>(1),
-        Yes(Coproduct::Inr(Coproduct::Inr(Coproduct::Inl(()))))
-    );
-    assert_eq!(judge::<Uni, B>(2), Error(FIRST));
-    assert_eq!(judge::<Uni, B>(3), ErrorUnlessClaimed(WEAK));
-
-    // A weak error gives way to a claim by another part, in either order,
-    // and an error is stronger than a weak error.
-    type C1 = HList![Weak<5>, Claimed<5>];
-    type C2 = HList![Claimed<5>, Weak<5>];
-    assert_eq!(judge::<Uni, C1>(5), Yes(Coproduct::Inr(Coproduct::Inl(()))));
-    assert_eq!(judge::<Uni, C2>(5), Yes(Coproduct::Inl(())));
-    type D1 = HList![Weak<6>, Errors<6>];
-    type D2 = HList![Errors<6>, Weak<6>];
-    assert_eq!(judge::<Uni, D1>(6), Error(FIRST));
-    assert_eq!(judge::<Uni, D2>(6), Error(FIRST));
-    // Two weak errors are still one weak error.
-    assert_eq!(
-        judge::<Uni, HList![Weak<6>, Weak<6>]>(6),
-        ErrorUnlessClaimed(WEAK)
-    );
-
-    // The same in the other three classes.
-    assert_eq!(
-        judge::<ServerInitiatedUnidirectional, C2>(5),
-        Yes(Coproduct::Inl(()))
-    );
-    assert_eq!(judge::<ClientInitiatedBidirectional, D1>(6), Error(FIRST));
-    assert_eq!(
-        judge::<ServerInitiatedBidirectional, HList![Weak<6>]>(6),
-        ErrorUnlessClaimed(WEAK)
-    );
-}
-
-#[test]
-fn the_parts_of_http3_judge_each_class_by_its_own_rules() {
-    use StreamVerdict::{Claimed as Yes, Error, ErrorUnlessClaimed, NotClaimed};
-    type L = Plain;
-    // Unidirectional, a client opens: everything but push.
-    for value in [0, 2, 3] {
-        assert!(matches!(
-            judge::<ClientInitiatedUnidirectional, L>(value),
-            Yes(_)
-        ));
-    }
-    assert_eq!(
-        judge::<ClientInitiatedUnidirectional, L>(1),
-        Error(ErrorCode::H3_STREAM_CREATION_ERROR)
-    );
-    // A server opens: all four.
-    for value in 0..4 {
-        assert!(matches!(
-            judge::<ServerInitiatedUnidirectional, L>(value),
-            Yes(_)
-        ));
-    }
-    for value in [4, 0x21, 0x40, 0x3fff] {
-        assert_eq!(judge::<ClientInitiatedUnidirectional, L>(value), NotClaimed);
-        assert_eq!(judge::<ServerInitiatedUnidirectional, L>(value), NotClaimed);
-    }
-    // A client opens a bidirectional stream: a frame type of the request
-    // stream is a request stream, and no more.
-    for value in [0, 1] {
-        assert!(matches!(
-            judge::<ClientInitiatedBidirectional, L>(value),
-            Yes(_)
-        ));
-    }
-    // The types of HTTP/2, PUSH_PROMISE, which a server does not receive,
-    // and the frames of HTTP/3 for other streams are errors.
-    for value in [2, 3, 4, 5, 6, 7, 8, 9, 0x0d] {
-        assert_eq!(
-            judge::<ClientInitiatedBidirectional, L>(value),
-            Error(ErrorCode::H3_FRAME_UNEXPECTED),
-            "{value}"
-        );
-    }
-    for value in [0x0a, 0x0b, 0x0c, 0x0e, 0x20, 0x33] {
-        assert_eq!(judge::<ClientInitiatedBidirectional, L>(value), NotClaimed);
-    }
-    // A server opens one: HTTP/3 leaves it to an extension.
-    for value in [0, 1, 0x33, 0x41] {
-        assert_eq!(
-            judge::<ServerInitiatedBidirectional, L>(value),
-            ErrorUnlessClaimed(ErrorCode::H3_STREAM_CREATION_ERROR)
-        );
-    }
 }

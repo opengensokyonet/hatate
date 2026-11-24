@@ -29,7 +29,10 @@ use frunk_core::HList;
 use hatate_wire::{
     Role,
     error_code::{ErrorCode, ErrorCodeOf},
-    frame::codec::{ReadFrameError, ReadFrameHeadError, WriteFrameError, WriteFrameExt as _},
+    frame::codec::{
+        ReadFrameError, ReadFrameHeadError, UnexpectedFrameTypeError, WriteFrameError,
+        WriteFrameExt as _,
+    },
     stream::{
         FrameStream, NextFrameError,
         kind::{ControlStreamKind, PushStreamKind, RequestStreamKind},
@@ -160,9 +163,15 @@ fn head_failure<E: ErrorCodeOf<ErrorCode>>(error: &ReadFrameHeadError<E>) -> Fai
         ReadFrameHeadError::Frame {
             source: ReadFrameError::Type { .. } | ReadFrameError::Length { .. },
         } => Failure::Head,
-        ReadFrameHeadError::Http2Type { .. } => Failure::Http2,
-        ReadFrameHeadError::NotAllowedOnStream { .. } => Failure::NotAllowed,
-        ReadFrameHeadError::NotReceivableByRole { .. } => Failure::NotReceivable,
+        ReadFrameHeadError::Unexpected {
+            source: UnexpectedFrameTypeError::Http2Type { .. },
+        } => Failure::Http2,
+        ReadFrameHeadError::Unexpected {
+            source: UnexpectedFrameTypeError::NotAllowedOnStream { .. },
+        } => Failure::NotAllowed,
+        ReadFrameHeadError::Unexpected {
+            source: UnexpectedFrameTypeError::NotReceivableByRole { .. },
+        } => Failure::NotReceivable,
     };
     assert_eq!(error.error_code(), Some(failure.code()));
     failure

@@ -57,6 +57,7 @@ pub async fn read_unidirectional_stream<L, C, I>(
     ReadUnidirectionalStreamError<
         <I::Family as Read>::Error,
         <L as StreamSet<C, L>>::ReadError<<I::Family as Read>::Error>,
+        <L as StreamSet<C, L>>::Rejection,
     >,
 >
 where
@@ -84,10 +85,10 @@ where
                 .context(read_unidirectional_stream_error::PartSnafu)?,
         ),
         StreamVerdict::NotClaimed => ReceivedStream::Unknown(UnknownStream::new(value, io)),
-        StreamVerdict::Error(code) | StreamVerdict::ErrorUnlessClaimed(code) => {
+        StreamVerdict::Error(rejection) | StreamVerdict::ErrorUnlessClaimed(rejection) => {
             return Err(ReadUnidirectionalStreamError::Rejected {
                 stream_type: value,
-                code,
+                source: PartsError::new(rejection),
             });
         }
     };
@@ -95,10 +96,10 @@ where
 }
 
 /// Failures of [`read_unidirectional_stream`]. `P` is the sum of the
-/// failures of the parts.
+/// failures of the parts, `R` the sum of their rejections.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-pub enum ReadUnidirectionalStreamError<E, P> {
+pub enum ReadUnidirectionalStreamError<E, P, R> {
     /// The type could not be read: the stream failed, or ended after the
     /// first byte of the type.
     #[snafu(display("could not read stream type"))]
@@ -114,8 +115,8 @@ pub enum ReadUnidirectionalStreamError<E, P> {
     Rejected {
         /// The type of the stream.
         stream_type: VarInt,
-        /// The connection error.
-        code: ErrorCode,
+        /// Why the part rejects it.
+        source: PartsError<R>,
     },
     /// The part that claims the type could not read what follows it.
     #[snafu(display("could not read the start of the stream"))]
@@ -130,13 +131,13 @@ pub enum ReadUnidirectionalStreamError<E, P> {
 /// receiver tolerates ([RFC 9114 §6.2]).
 ///
 /// [RFC 9114 §6.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2
-impl<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode>
-    for ReadUnidirectionalStreamError<E, P>
+impl<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>, R: ErrorCodeOf<ErrorCode>>
+    ErrorCodeOf<ErrorCode> for ReadUnidirectionalStreamError<E, P, R>
 {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Type { source } => source.host_error().and_then(ErrorCodeOf::error_code),
-            Self::Rejected { code, .. } => Some(*code),
+            Self::Rejected { source, .. } => source.error_code(),
             Self::Part { source } => source.error_code(),
         }
     }
@@ -165,6 +166,7 @@ pub async fn read_bidirectional_stream<L, C, I>(
     ReadBidirectionalStreamError<
         <I::Family as Read>::Error,
         <L as StreamSet<C, L>>::ReadError<<I::Family as Read>::Error>,
+        <L as StreamSet<C, L>>::Rejection,
     >,
 >
 where
@@ -204,17 +206,20 @@ where
                 .context(read_bidirectional_stream_error::PartSnafu)?,
         ),
         StreamVerdict::NotClaimed => ReceivedStream::Unknown(UnknownStream::new(value, io)),
-        StreamVerdict::Error(code) | StreamVerdict::ErrorUnlessClaimed(code) => {
-            return Err(ReadBidirectionalStreamError::Rejected { value, code });
+        StreamVerdict::Error(rejection) | StreamVerdict::ErrorUnlessClaimed(rejection) => {
+            return Err(ReadBidirectionalStreamError::Rejected {
+                value,
+                source: PartsError::new(rejection),
+            });
         }
     }))
 }
 
 /// Failures of [`read_bidirectional_stream`]. `P` is the sum of the
-/// failures of the parts.
+/// failures of the parts, `R` the sum of their rejections.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-pub enum ReadBidirectionalStreamError<E, P> {
+pub enum ReadBidirectionalStreamError<E, P, R> {
     /// The head of a frame at the start could not be read.
     #[snafu(display("could not read the start of the stream"))]
     Head {
@@ -236,8 +241,8 @@ pub enum ReadBidirectionalStreamError<E, P> {
     Rejected {
         /// The value.
         value: VarInt,
-        /// The connection error.
-        code: ErrorCode,
+        /// Why the part rejects it.
+        source: PartsError<R>,
     },
     /// The part that claims the value could not read the stream.
     #[snafu(display("could not read the start of the stream"))]
@@ -248,14 +253,14 @@ pub enum ReadBidirectionalStreamError<E, P> {
 }
 
 /// The code of the failure, the rejection, or the part's failure.
-impl<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode>
-    for ReadBidirectionalStreamError<E, P>
+impl<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>, R: ErrorCodeOf<ErrorCode>>
+    ErrorCodeOf<ErrorCode> for ReadBidirectionalStreamError<E, P, R>
 {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Head { source } => source.error_code(),
             Self::ReservedPayload { source } => source.error_code(),
-            Self::Rejected { code, .. } => Some(*code),
+            Self::Rejected { source, .. } => source.error_code(),
             Self::Part { source } => source.error_code(),
         }
     }

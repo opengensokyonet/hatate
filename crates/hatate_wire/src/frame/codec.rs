@@ -79,10 +79,10 @@ impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadFrameError<E> {
 /// whose list of parts is `L`, at an endpoint of role `role`: a type of
 /// HTTP/2, or one the list claims for other kinds of stream, is not
 /// allowed there, and some types only one role receives.
-pub(crate) fn check_frame_type<L: FrameSetOn<K>, K: StreamKind, E>(
+pub(crate) fn check_frame_type<L: FrameSetOn<K>, K: StreamKind>(
     value: VarInt,
     role: Role,
-) -> Result<FrameType<L::FrameType>, ReadFrameHeadError<E>> {
+) -> Result<FrameType<L::FrameType>, UnexpectedFrameTypeError> {
     // Evaluated when the function is generated for a concrete list, so a
     // list whose claims conflict does not build.
     const {
@@ -92,46 +92,39 @@ pub(crate) fn check_frame_type<L: FrameSetOn<K>, K: StreamKind, E>(
         );
     }
     if let Some(frame_type) = Http2FrameType::of(value) {
-        return Err(ReadFrameHeadError::Http2Type {
+        return Err(UnexpectedFrameTypeError::Http2Type {
             source: Http2FrameTypeError::new(frame_type),
         });
     }
     let frame_type = FrameType::<L::FrameType>::from(value);
     match frame_type {
         FrameType::Known(known) if !known.receivable_by(role) => {
-            Err(ReadFrameHeadError::NotReceivableByRole {
+            Err(UnexpectedFrameTypeError::NotReceivableByRole {
                 frame_type: value,
                 role,
             })
         }
         FrameType::Unknown(_) if L::FRAME_TYPES.contains(value) => {
-            Err(ReadFrameHeadError::NotAllowedOnStream { frame_type: value })
+            Err(UnexpectedFrameTypeError::NotAllowedOnStream { frame_type: value })
         }
         _ => Ok(frame_type),
     }
 }
 
-/// Failures of reading the head of a frame on a stream that carries frames
-/// ([`FrameStream`](crate::stream::FrameStream)).
-#[derive(Debug, Snafu)]
+/// A frame type that may not arrive where it arrived ([RFC 9114 §7.2]): at
+/// the start of a stream or later on it.
+///
+/// [RFC 9114 §7.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
 #[snafu(module)]
-pub enum ReadFrameHeadError<E> {
-    /// The Type or Length could not be read.
-    #[snafu(display("could not read frame head"))]
-    Frame {
-        /// The failure of reading it.
-        source: ReadFrameError<E>,
-    },
+pub enum UnexpectedFrameTypeError {
     /// The type is one HTTP/2 defines and HTTP/3 does not.
     #[snafu(display("received a frame type of HTTP/2"))]
     Http2Type {
         /// The type received.
         source: Http2FrameTypeError,
     },
-    /// A part of the list claims the type, but not on this kind of stream
-    /// ([RFC 9114 §7.2]).
-    ///
-    /// [RFC 9114 §7.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2
+    /// A part of the list claims the type, but not on this kind of stream.
     #[snafu(display("frame type {frame_type} is not allowed on this kind of stream"))]
     NotAllowedOnStream {
         /// The type received.
@@ -148,19 +141,43 @@ pub enum ReadFrameHeadError<E> {
     },
 }
 
-/// The code of [`ReadFrameError`] for a head that could not be read;
-/// H3_FRAME_UNEXPECTED for an HTTP/2 type ([RFC 9114 §7.2.8]) and for a
+/// H3_FRAME_UNEXPECTED, for an HTTP/2 type ([RFC 9114 §7.2.8]) and for a
 /// frame where it may not arrive ([RFC 9114 §7.2]).
 ///
 /// [RFC 9114 §7.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2
 /// [RFC 9114 §7.2.8]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
+impl ErrorCodeOf<ErrorCode> for UnexpectedFrameTypeError {
+    fn error_code(&self) -> Option<ErrorCode> {
+        Some(ErrorCode::H3_FRAME_UNEXPECTED)
+    }
+}
+
+/// Failures of reading the head of a frame on a stream that carries frames
+/// ([`FrameStream`](crate::stream::FrameStream)).
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum ReadFrameHeadError<E> {
+    /// The Type or Length could not be read.
+    #[snafu(display("could not read frame head"))]
+    Frame {
+        /// The failure of reading it.
+        source: ReadFrameError<E>,
+    },
+    /// The type may not arrive on this stream.
+    #[snafu(display("received an unexpected frame type"))]
+    Unexpected {
+        /// Why it may not.
+        source: UnexpectedFrameTypeError,
+    },
+}
+
+/// The code of [`ReadFrameError`] for a head that could not be read, and of
+/// [`UnexpectedFrameTypeError`].
 impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadFrameHeadError<E> {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Frame { source } => source.error_code(),
-            Self::Http2Type { .. }
-            | Self::NotAllowedOnStream { .. }
-            | Self::NotReceivableByRole { .. } => Some(ErrorCode::H3_FRAME_UNEXPECTED),
+            Self::Unexpected { source } => source.error_code(),
         }
     }
 }

@@ -14,7 +14,10 @@ use hatate_wire::{
     frame::{
         ControlFrameType, FrameType, FrameWidths, Http2FrameType, Http3FrameType, PushFrameType,
         RequestFrameType,
-        codec::{ReadFrameError, ReadFrameHeadError, WriteFrameHeadHostExt as _},
+        codec::{
+            ReadFrameError, ReadFrameHeadError, UnexpectedFrameTypeError,
+            WriteFrameHeadHostExt as _,
+        },
         set::FrameSetOn,
     },
     registry::{is_reserved, reserved},
@@ -151,7 +154,12 @@ fn a_list_of_no_parts_looks_nothing_up() {
     // A type of HTTP/2 is rejected whatever the list.
     let error = on_nothing(&[0x06, 0x00]).unwrap_err();
     assert!(
-        matches!(error, ReadFrameHeadError::Http2Type { .. }),
+        matches!(
+            error,
+            ReadFrameHeadError::Unexpected {
+                source: UnexpectedFrameTypeError::Http2Type { .. }
+            }
+        ),
         "{error:?}"
     );
 }
@@ -278,7 +286,7 @@ fn http2_types_are_a_frame_unexpected_error_before_the_length() {
                 on(PushStreamKind, Role::Client, &wire).unwrap_err(),
             ] {
                 assert!(
-                    matches!(&error, ReadFrameHeadError::Http2Type { source } if source.frame_type() == frame_type),
+                    matches!(&error, ReadFrameHeadError::Unexpected { source: UnexpectedFrameTypeError::Http2Type { source } } if source.frame_type() == frame_type),
                     "{error:?}"
                 );
                 assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_UNEXPECTED));
@@ -293,13 +301,13 @@ fn a_frame_where_it_may_not_arrive_is_a_frame_unexpected_error_before_the_length
     // on the stream of a kind that does not have it.
     let error = on(ControlStreamKind, Role::Client, &[0x00]).unwrap_err();
     assert!(
-        matches!(&error, ReadFrameHeadError::NotAllowedOnStream { frame_type } if frame_type.get() == 0x00),
+        matches!(&error, ReadFrameHeadError::Unexpected { source: UnexpectedFrameTypeError::NotAllowedOnStream { frame_type } } if frame_type.get() == 0x00),
         "{error:?}"
     );
     assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_UNEXPECTED));
     let error = on_request(&[0x04]).unwrap_err();
     assert!(
-        matches!(&error, ReadFrameHeadError::NotAllowedOnStream { frame_type } if frame_type.get() == 0x04),
+        matches!(&error, ReadFrameHeadError::Unexpected { source: UnexpectedFrameTypeError::NotAllowedOnStream { frame_type } } if frame_type.get() == 0x04),
         "{error:?}"
     );
     // PUSH_PROMISE on a push stream or a control stream; MAX_PUSH_ID on a
@@ -318,7 +326,7 @@ fn a_frame_where_it_may_not_arrive_is_a_frame_unexpected_error_before_the_length
         (0x03, on(PushStreamKind, Role::Client, &[0x03]).unwrap_err()),
     ] {
         assert!(
-            matches!(&error, ReadFrameHeadError::NotAllowedOnStream { frame_type: got } if got.get() == frame_type),
+            matches!(&error, ReadFrameHeadError::Unexpected { source: UnexpectedFrameTypeError::NotAllowedOnStream { frame_type: got } } if got.get() == frame_type),
             "{frame_type:#x}: {error:?}"
         );
         assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_UNEXPECTED));
@@ -326,7 +334,12 @@ fn a_frame_where_it_may_not_arrive_is_a_frame_unexpected_error_before_the_length
     // A frame wider than its value is rejected by the same rule.
     let error = on_request(&[0x40, 0x04]).unwrap_err();
     assert!(
-        matches!(error, ReadFrameHeadError::NotAllowedOnStream { .. }),
+        matches!(
+            error,
+            ReadFrameHeadError::Unexpected {
+                source: UnexpectedFrameTypeError::NotAllowedOnStream { .. }
+            }
+        ),
         "{error:?}"
     );
 }
@@ -336,13 +349,13 @@ fn a_role_that_may_not_receive_a_frame_is_a_frame_unexpected_error_before_the_le
     // PUSH_PROMISE received by a server; MAX_PUSH_ID received by a client.
     let error = on_request(&[0x05]).unwrap_err();
     assert!(
-        matches!(&error, ReadFrameHeadError::NotReceivableByRole { role, frame_type } if *role == Role::Server && frame_type.get() == 0x05),
+        matches!(&error, ReadFrameHeadError::Unexpected { source: UnexpectedFrameTypeError::NotReceivableByRole { role, frame_type } } if *role == Role::Server && frame_type.get() == 0x05),
         "{error:?}"
     );
     assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_UNEXPECTED));
     let error = on(ControlStreamKind, Role::Client, &[0x0d]).unwrap_err();
     assert!(
-        matches!(&error, ReadFrameHeadError::NotReceivableByRole { role, .. } if *role == Role::Client),
+        matches!(&error, ReadFrameHeadError::Unexpected { source: UnexpectedFrameTypeError::NotReceivableByRole { role, .. } } if *role == Role::Client),
         "{error:?}"
     );
     assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_UNEXPECTED));

@@ -13,7 +13,7 @@ use hatate_wire::{
     error_code::{ErrorCode, ErrorCodeOf},
     frame::{
         Http3FrameType,
-        codec::{ReadFrameError, ReadFrameHeadError, WriteFrameExt as _},
+        codec::{ReadFrameError, ReadFrameHeadError, UnexpectedFrameTypeError, WriteFrameExt as _},
         set::FrameSetOn,
     },
     registry::reserved,
@@ -76,9 +76,15 @@ fn head_failure<E>(error: &ReadFrameHeadError<E>) -> Failure {
         ReadFrameHeadError::Frame {
             source: ReadFrameError::Length { .. },
         } => Failure::Length,
-        ReadFrameHeadError::Http2Type { .. } => Failure::Http2Type,
-        ReadFrameHeadError::NotAllowedOnStream { .. } => Failure::NotAllowedOnStream,
-        ReadFrameHeadError::NotReceivableByRole { .. } => Failure::NotReceivableByRole,
+        ReadFrameHeadError::Unexpected {
+            source: UnexpectedFrameTypeError::Http2Type { .. },
+        } => Failure::Http2Type,
+        ReadFrameHeadError::Unexpected {
+            source: UnexpectedFrameTypeError::NotAllowedOnStream { .. },
+        } => Failure::NotAllowedOnStream,
+        ReadFrameHeadError::Unexpected {
+            source: UnexpectedFrameTypeError::NotReceivableByRole { .. },
+        } => Failure::NotReceivableByRole,
     }
 }
 

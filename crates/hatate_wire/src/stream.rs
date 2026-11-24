@@ -102,7 +102,8 @@ async fn read_after_type<L: FrameSetOn<K>, K: StreamKind, I: ReceiverAccess<Fami
     role: Role,
     r#type: VarIntField<VarInt>,
 ) -> Result<Head<L, K>, ReadFrameHeadError<<I::Family as Read>::Error>> {
-    let frame_type = check_frame_type::<L, K, _>(r#type.get(), role)?;
+    let frame_type = check_frame_type::<L, K>(r#type.get(), role)
+        .map_err(|source| ReadFrameHeadError::Unexpected { source })?;
     let length = read_length(io)
         .await
         .map_err(|source| ReadFrameHeadError::Frame { source })?;

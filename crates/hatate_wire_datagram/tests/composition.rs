@@ -8,7 +8,7 @@ use frunk_core::{
 };
 use hatate_wire::{
     Role,
-    error_code::{ErrorCode, ErrorCodeOf as _},
+    error_code::{ErrorCode, ErrorCodeOf},
     frame::{FrameWidths, payload::PayloadError, set::FramePartOn},
     settings::{
         Keyed, KeyedSetting, MaxFieldSectionSize, Setting,
@@ -584,12 +584,13 @@ enum Verdict {
     ErrorUnlessClaimed(ErrorCode),
 }
 
-fn verdict<T>(verdict: StreamVerdict<T>) -> Verdict {
+fn verdict<T, R: ErrorCodeOf<ErrorCode>>(verdict: StreamVerdict<T, R>) -> Verdict {
+    let code = |reason: R| reason.error_code().expect("a rejection has a code");
     match verdict {
         StreamVerdict::Claimed(_) => Verdict::Claimed,
         StreamVerdict::NotClaimed => Verdict::NotClaimed,
-        StreamVerdict::Error(code) => Verdict::Error(code),
-        StreamVerdict::ErrorUnlessClaimed(code) => Verdict::ErrorUnlessClaimed(code),
+        StreamVerdict::Error(reason) => Verdict::Error(code(reason)),
+        StreamVerdict::ErrorUnlessClaimed(reason) => Verdict::ErrorUnlessClaimed(code(reason)),
     }
 }
 

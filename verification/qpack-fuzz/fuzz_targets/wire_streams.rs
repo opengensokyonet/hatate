@@ -212,8 +212,12 @@ struct Failed {
 
 type Outcome = Result<Option<Started>, Failed>;
 
-fn unidirectional_failed<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>>(
-    error: &ReadUnidirectionalStreamError<E, P>,
+fn unidirectional_failed<
+    E: ErrorCodeOf<ErrorCode>,
+    P: ErrorCodeOf<ErrorCode>,
+    R: ErrorCodeOf<ErrorCode>,
+>(
+    error: &ReadUnidirectionalStreamError<E, P, R>,
 ) -> Failed {
     let kind = match error {
         ReadUnidirectionalStreamError::Type { source } => {
@@ -229,8 +233,12 @@ fn unidirectional_failed<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>>(
     }
 }
 
-fn bidirectional_failed<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>>(
-    error: &ReadBidirectionalStreamError<E, P>,
+fn bidirectional_failed<
+    E: ErrorCodeOf<ErrorCode>,
+    P: ErrorCodeOf<ErrorCode>,
+    R: ErrorCodeOf<ErrorCode>,
+>(
+    error: &ReadBidirectionalStreamError<E, P, R>,
 ) -> Failed {
     let kind = match error {
         ReadBidirectionalStreamError::Head { .. } => "head",
@@ -441,10 +449,9 @@ fn expected_unidirectional(
         0 => match head(after, 1, receiver) {
             // The first frame of a control stream is SETTINGS (RFC 9114
             // §6.2.1).
-            Ok((_, first)) if first.frame_type != 0x04 => (
-                failed("part", Some(ErrorCode::H3_MISSING_SETTINGS)),
-                None,
-            ),
+            Ok((_, first)) if first.frame_type != 0x04 => {
+                (failed("part", Some(ErrorCode::H3_MISSING_SETTINGS)), None)
+            }
             Ok((used, first)) => (
                 Ok(Some(Started::Control(field, first))),
                 Some(length + used),

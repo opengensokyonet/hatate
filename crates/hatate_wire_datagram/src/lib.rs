@@ -132,10 +132,11 @@ impl StreamTypePart for Part {
 /// No streams of its own, in any class.
 impl<C: StreamClass, L> StreamPart<C, L> for Part {
     type Claimed = CNil;
+    type Rejection = CNil;
     type Stream<I> = CNil;
     type ReadError<E> = CNil;
 
-    fn judge(_value: VarInt, _skipped: bool) -> StreamVerdict<CNil> {
+    fn judge(_value: VarInt, _skipped: bool) -> StreamVerdict<CNil, CNil> {
         StreamVerdict::NotClaimed
     }
 

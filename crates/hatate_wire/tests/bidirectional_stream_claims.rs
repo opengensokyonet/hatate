@@ -9,8 +9,11 @@ use frunk_core::{
 };
 use hatate_wire::{
     Part,
-    error_code::ErrorCode,
-    frame::set::{FramePart, FramePartOn},
+    error_code::{ErrorCode, ErrorCodeOf as _},
+    frame::{
+        codec::UnexpectedFrameTypeError,
+        set::{FramePart, FramePartOn},
+    },
     registry::ClaimedValues,
     stream::{
         ReceivedStream,
@@ -52,10 +55,11 @@ macro_rules! parts {
 
         impl<L> StreamPart<ClientInitiatedBidirectional, L> for $part {
             type Claimed = ();
+            type Rejection = CNil;
             type Stream<I> = Taken;
             type ReadError<E> = CNil;
 
-            fn judge(value: VarInt, _skipped: bool) -> StreamVerdict<()> {
+            fn judge(value: VarInt, _skipped: bool) -> StreamVerdict<(), CNil> {
                 if $claims && value.get() == u64::from(TYPE) {
                     StreamVerdict::Claimed(())
                 } else {
@@ -74,10 +78,11 @@ macro_rules! parts {
 
         impl<L> StreamPart<ServerInitiatedBidirectional, L> for $part {
             type Claimed = ();
+            type Rejection = CNil;
             type Stream<I> = Taken;
             type ReadError<E> = CNil;
 
-            fn judge(_value: VarInt, _skipped: bool) -> StreamVerdict<()> {
+            fn judge(_value: VarInt, _skipped: bool) -> StreamVerdict<(), CNil> {
                 StreamVerdict::NotClaimed
             }
 
@@ -101,7 +106,23 @@ enum Whose {
     Http3,
     Claiming,
     Unknown(u64),
-    Rejected(u64, ErrorCode),
+    Rejected(u64, ErrorCode, Rule),
+}
+
+/// Which rule of the frame types rejected the value.
+#[derive(Debug, PartialEq, Eq)]
+enum Rule {
+    Http2Type,
+    NotAllowedOnStream,
+    NotReceivableByRole,
+}
+
+fn rule(error: &UnexpectedFrameTypeError) -> Rule {
+    match error {
+        UnexpectedFrameTypeError::Http2Type { .. } => Rule::Http2Type,
+        UnexpectedFrameTypeError::NotAllowedOnStream { .. } => Rule::NotAllowedOnStream,
+        UnexpectedFrameTypeError::NotReceivableByRole { .. } => Rule::NotReceivableByRole,
+    }
 }
 
 macro_rules! start {
@@ -119,8 +140,14 @@ macro_rules! start {
                 Ok(Some(ReceivedStream::Known($known))) => $whose,
                 Ok(Some(ReceivedStream::Unknown(unknown))) => Whose::Unknown(unknown.value().get()),
                 Ok(None) => panic!("the stream is empty"),
-                Err(ReadBidirectionalStreamError::Rejected { value, code }) => {
-                    Whose::Rejected(value.get(), code)
+                Err(ReadBidirectionalStreamError::Rejected { value, source }) => {
+                    let code: Option<ErrorCode> = source.error_code();
+                    let code = code.expect("a rejection has a code");
+                    // HTTP/3's part is the first of every list here.
+                    let Coproduct::Inl(reason) = source.get() else {
+                        panic!("another part rejected")
+                    };
+                    Whose::Rejected(value.get(), code, rule(reason))
                 }
                 Err(_) => panic!("another failure"),
             }
@@ -165,7 +192,11 @@ fn a_stream_that_starts_with_a_frame_of_another_part_is_its_stream_if_it_claims_
         let mut input = &[value, 0x00][..];
         assert_eq!(
             input.sync_read_with_claiming_unpin(),
-            Whose::Rejected(u64::from(value), ErrorCode::H3_FRAME_UNEXPECTED)
+            Whose::Rejected(
+                u64::from(value),
+                ErrorCode::H3_FRAME_UNEXPECTED,
+                Rule::NotAllowedOnStream
+            )
         );
     }
 }
@@ -175,7 +206,11 @@ fn a_frame_type_a_part_has_but_no_part_claims_is_h3_frame_unexpected() {
     let mut input = &WIRE[..];
     assert_eq!(
         input.sync_read_with_listing_unpin(),
-        Whose::Rejected(0x41, ErrorCode::H3_FRAME_UNEXPECTED)
+        Whose::Rejected(
+            0x41,
+            ErrorCode::H3_FRAME_UNEXPECTED,
+            Rule::NotAllowedOnStream
+        )
     );
     // Only the value was read.
     assert_eq!(input.len(), 2);
@@ -192,7 +227,11 @@ fn the_frames_of_http3_and_of_http2_keep_their_verdicts_beside_a_claiming_part()
         let mut input = &[value, 0x00][..];
         assert_eq!(
             input.sync_read_with_claiming_unpin(),
-            Whose::Rejected(u64::from(value), ErrorCode::H3_FRAME_UNEXPECTED)
+            Whose::Rejected(
+                u64::from(value),
+                ErrorCode::H3_FRAME_UNEXPECTED,
+                Rule::Http2Type
+            )
         );
     }
     let mut input = &[0x33, 0x00][..];

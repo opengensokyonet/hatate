@@ -71,8 +71,12 @@ enum Started {
 enum Failed {
     /// The stream ended inside the type; how many bytes were read.
     Type { completed: usize },
-    /// A part rejected the type with a code.
-    Rejected { value: u64, code: ErrorCode },
+    /// A part rejected the type with a code, for this reason.
+    Rejected {
+        value: u64,
+        code: ErrorCode,
+        reason: String,
+    },
     /// The part that claims the type could not read the start: the code, if
     /// any, and the name of the failure.
     Part {
@@ -84,8 +88,9 @@ enum Failed {
 fn failed<
     E: hatate_wire::error_code::ErrorCodeOf<ErrorCode>,
     P: hatate_wire::error_code::ErrorCodeOf<ErrorCode> + core::fmt::Debug,
+    R: hatate_wire::error_code::ErrorCodeOf<ErrorCode> + core::fmt::Debug,
 >(
-    error: &ReadUnidirectionalStreamError<E, P>,
+    error: &ReadUnidirectionalStreamError<E, P, R>,
 ) -> Failed {
     match error {
         ReadUnidirectionalStreamError::Type { source } => {
@@ -95,13 +100,14 @@ fn failed<
                 completed: source.completed(),
             }
         }
-        ReadUnidirectionalStreamError::Rejected { stream_type, code } => {
-            assert_eq!(error.error_code(), Some(*code));
-            Failed::Rejected {
-                value: stream_type.get(),
-                code: *code,
-            }
-        }
+        ReadUnidirectionalStreamError::Rejected {
+            stream_type,
+            source,
+        } => Failed::Rejected {
+            value: stream_type.get(),
+            code: error.error_code().expect("a rejection has a code"),
+            reason: format!("{:?}", source.get()),
+        },
         ReadUnidirectionalStreamError::Part { source } => Failed::Part {
             code: error.error_code(),
             name: format!("{source:?}"),
@@ -311,7 +317,9 @@ fn a_client_may_not_open_a_push_stream() {
             started.unwrap_err(),
             Failed::Rejected {
                 value: 1,
-                code: ErrorCode::H3_STREAM_CREATION_ERROR
+                code: ErrorCode::H3_STREAM_CREATION_ERROR,
+                // The part of HTTP/3 is the only part of the list.
+                reason: "Inl(ClientPushStreamError)".to_owned()
             }
         );
         // Only the type was read.

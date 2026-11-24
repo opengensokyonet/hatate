@@ -13,10 +13,10 @@ use crate::{
     Part, Role,
     error_code::{ErrorCode, ErrorCodeOf},
     frame::{
-        Frame, FrameType, Http2FrameType, Http3FrameType, PushId,
-        codec::ReadFrameHeadError,
+        Frame, FrameType, Http3FrameType, PushId,
+        codec::{ReadFrameHeadError, UnexpectedFrameTypeError, check_frame_type},
         payload::FramePayload,
-        set::{FrameKind, FrameSetOn},
+        set::FrameSetOn,
     },
     registry::ClaimedValue,
     stream_type::Http3StreamType,
@@ -558,18 +558,65 @@ where
     })
 }
 
+/// A push stream that a client opened: only servers push ([RFC 9114
+/// §6.2.2]), so it is a connection error of type H3_STREAM_CREATION_ERROR.
+///
+/// [RFC 9114 §6.2.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.2
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClientPushStreamError;
+
+impl core::fmt::Display for ClientPushStreamError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("a client opened a push stream")
+    }
+}
+
+impl core::error::Error for ClientPushStreamError {}
+
+/// H3_STREAM_CREATION_ERROR.
+impl ErrorCodeOf<ErrorCode> for ClientPushStreamError {
+    fn error_code(&self) -> Option<ErrorCode> {
+        Some(ErrorCode::H3_STREAM_CREATION_ERROR)
+    }
+}
+
+/// A bidirectional stream that a server opened, which HTTP/3 does not use
+/// ([RFC 9114 §6.1]): a connection error of type H3_STREAM_CREATION_ERROR
+/// unless an extension claims it.
+///
+/// [RFC 9114 §6.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.1
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServerBidirectionalStreamError;
+
+impl core::fmt::Display for ServerBidirectionalStreamError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("a server opened a bidirectional stream")
+    }
+}
+
+impl core::error::Error for ServerBidirectionalStreamError {}
+
+/// H3_STREAM_CREATION_ERROR.
+impl ErrorCodeOf<ErrorCode> for ServerBidirectionalStreamError {
+    fn error_code(&self) -> Option<ErrorCode> {
+        Some(ErrorCode::H3_STREAM_CREATION_ERROR)
+    }
+}
+
 macro_rules! unidirectional_part {
-    ($class:ty, $judge:expr) => {
+    ($class:ty, $rejection:ty, $judge:expr) => {
         impl<L> StreamPart<$class, L> for Part
         where
             L: FrameSetOn<ControlStreamKind> + FrameSetOn<PushStreamKind>,
         {
             type Claimed = Http3StreamType;
+            type Rejection = $rejection;
             type Stream<I> = Http3UnidirectionalStreamOf<L, I>;
             type ReadError<E> = Http3UnidirectionalStreamError<E>;
 
-            fn judge(value: VarInt, _skipped: bool) -> StreamVerdict<Http3StreamType> {
-                let judge: fn(Http3StreamType) -> StreamVerdict<Http3StreamType> = $judge;
+            fn judge(value: VarInt, _skipped: bool) -> StreamVerdict<Http3StreamType, $rejection> {
+                let judge: fn(Http3StreamType) -> StreamVerdict<Http3StreamType, $rejection> =
+                    $judge;
                 Http3StreamType::of(value).map_or(StreamVerdict::NotClaimed, judge)
             }
 
@@ -589,12 +636,13 @@ macro_rules! unidirectional_part {
 // (RFC 9114 §6.2.2).
 unidirectional_part!(
     ClientInitiatedUnidirectional,
+    ClientPushStreamError,
     |stream_type| match stream_type {
-        Http3StreamType::Push => StreamVerdict::Error(ErrorCode::H3_STREAM_CREATION_ERROR),
+        Http3StreamType::Push => StreamVerdict::Error(ClientPushStreamError),
         stream_type => StreamVerdict::Claimed(stream_type),
     }
 );
-unidirectional_part!(ServerInitiatedUnidirectional, StreamVerdict::Claimed);
+unidirectional_part!(ServerInitiatedUnidirectional, CNil, StreamVerdict::Claimed);
 
 /// A client-initiated bidirectional stream is a request stream when its
 /// first frame that is not reserved has a type the list has on request
@@ -608,27 +656,23 @@ unidirectional_part!(ServerInitiatedUnidirectional, StreamVerdict::Claimed);
 /// [RFC 9114 §6.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.1
 impl<L: FrameSetOn<RequestStreamKind>> StreamPart<ClientInitiatedBidirectional, L> for Part {
     type Claimed = ();
+    type Rejection = UnexpectedFrameTypeError;
     type Stream<I> = FrameStream<L, RequestStreamKind, I>;
     type ReadError<E> = ReadFrameHeadError<E>;
 
-    fn judge(value: VarInt, _skipped: bool) -> StreamVerdict<()> {
+    fn judge(value: VarInt, _skipped: bool) -> StreamVerdict<(), UnexpectedFrameTypeError> {
         let receiver = <ClientInitiatedBidirectional as StreamClass>::RECEIVER;
-        if Http2FrameType::of(value).is_some() {
-            return StreamVerdict::Error(ErrorCode::H3_FRAME_UNEXPECTED);
-        }
-        match <L as FrameSetOn<RequestStreamKind>>::FrameType::of(value) {
-            Some(frame_type) if frame_type.receivable_by(receiver) => StreamVerdict::Claimed(()),
-            Some(_) => StreamVerdict::Error(ErrorCode::H3_FRAME_UNEXPECTED),
-            // A frame of HTTP/3 for other streams.
-            None if Http3FrameType::of(value).is_some() => {
-                StreamVerdict::Error(ErrorCode::H3_FRAME_UNEXPECTED)
-            }
+        match check_frame_type::<L, RequestStreamKind>(value, receiver) {
+            Ok(FrameType::Known(_)) => StreamVerdict::Claimed(()),
+            Ok(FrameType::Reserved(_) | FrameType::Unknown(_)) => StreamVerdict::NotClaimed,
             // Another part may take a stream that starts with a frame of its
-            // own, as WebTransport does with 0x41.
-            None if L::FRAME_TYPES.contains(value) => {
-                StreamVerdict::ErrorUnlessClaimed(ErrorCode::H3_FRAME_UNEXPECTED)
+            // own for other streams, as WebTransport does with 0x41.
+            Err(rejection @ UnexpectedFrameTypeError::NotAllowedOnStream { .. })
+                if Http3FrameType::of(value).is_none() =>
+            {
+                StreamVerdict::ErrorUnlessClaimed(rejection)
             }
-            None => StreamVerdict::NotClaimed,
+            Err(rejection) => StreamVerdict::Error(rejection),
         }
     }
 
@@ -650,11 +694,15 @@ impl<L: FrameSetOn<RequestStreamKind>> StreamPart<ClientInitiatedBidirectional, 
 /// [RFC 9114 §6.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.1
 impl<L> StreamPart<ServerInitiatedBidirectional, L> for Part {
     type Claimed = CNil;
+    type Rejection = ServerBidirectionalStreamError;
     type Stream<I> = CNil;
     type ReadError<E> = CNil;
 
-    fn judge(_value: VarInt, _skipped: bool) -> StreamVerdict<CNil> {
-        StreamVerdict::ErrorUnlessClaimed(ErrorCode::H3_STREAM_CREATION_ERROR)
+    fn judge(
+        _value: VarInt,
+        _skipped: bool,
+    ) -> StreamVerdict<CNil, ServerBidirectionalStreamError> {
+        StreamVerdict::ErrorUnlessClaimed(ServerBidirectionalStreamError)
     }
 
     async fn read<I: ReceiverAccess<Family: Read>>(
