@@ -26,7 +26,7 @@ async fn settings_then_goaway<F: Skip<Count = usize>, A: ReceiverAccess<Family =
 where
     <F as nitori_io::Read>::Error: core::fmt::Debug,
 {
-    let Some(UnidirectionalStream::Control(stream)) =
+    let Some(UnidirectionalStream::Control { stream, .. }) =
         read_unidirectional_stream::<Parts, _>(&mut *io, Role::Client)
             .await
             .unwrap()

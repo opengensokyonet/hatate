@@ -128,9 +128,8 @@ where
         .unwrap()
         .unwrap()
     {
-        UnidirectionalStream::Control(stream) | UnidirectionalStream::Push { stream, .. } => {
-            stream.into_parts().1.kind()
-        }
+        UnidirectionalStream::Control { stream, .. }
+        | UnidirectionalStream::Push { stream, .. } => stream.into_parts().1.kind(),
         UnidirectionalStream::Other(stream) => FrameStreamKind::of_stream_type(&stream.head()),
     }
 }

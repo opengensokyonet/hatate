@@ -270,11 +270,20 @@ pub enum UnidirectionalStream<I, L: crate::stream_type::StreamTypeSet> {
     /// A control stream (0x00,
     /// [RFC 9114 §6.2.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1)):
     /// frames follow the type.
-    Control(Composed<I, FrameStream<L>>),
+    Control {
+        /// The type, with its Stream Type field as it was on the wire, so
+        /// that a type sent in more bytes than it needs is written back
+        /// in as many.
+        head: StreamTypeHead<L::TypeValue>,
+        /// The stream, at its first frame.
+        stream: Composed<I, FrameStream<L>>,
+    },
     /// A push stream (0x01,
     /// [RFC 9114 §6.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.2)):
     /// its Push ID followed the type, and frames follow.
     Push {
+        /// The type, with its Stream Type field as it was on the wire.
+        head: StreamTypeHead<L::TypeValue>,
         /// The Push ID, at the width it had on the wire. Whether it is
         /// within the permitted range is a question for the connection.
         push_id: VarIntField<PushId>,

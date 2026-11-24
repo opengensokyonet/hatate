@@ -341,13 +341,14 @@ async fn unidirectional_frames<F: Skip<Count = usize> + Read<Error = Infallible>
 ) -> Unidirectional {
     match read_unidirectional_stream::<Parts, _>(&mut *io, role).await {
         Ok(None) => Unidirectional::Empty,
-        Ok(Some(UnidirectionalStream::Control(mut stream))) => {
+        Ok(Some(UnidirectionalStream::Control { mut stream, .. })) => {
             let (frames, end) = stream.frames(take).await;
             Unidirectional::Control(frames, end)
         }
         Ok(Some(UnidirectionalStream::Push {
             push_id,
             mut stream,
+            ..
         })) => {
             let (frames, end) = stream.frames(take).await;
             Unidirectional::Push(push_id.get().get().get(), frames, end)
@@ -375,12 +376,12 @@ async fn stream_start<F: Read<Error = Infallible>>(
 ) -> Start {
     match read_unidirectional_stream::<Parts, _>(&mut *io, role).await {
         Ok(None) => Start::Done(Unidirectional::Empty),
-        Ok(Some(UnidirectionalStream::Control(stream))) => {
+        Ok(Some(UnidirectionalStream::Control { stream, .. })) => {
             Start::Frames(stream.into_parts().1, None)
         }
-        Ok(Some(UnidirectionalStream::Push { push_id, stream })) => {
-            Start::Frames(stream.into_parts().1, Some(push_id.get().get().get()))
-        }
+        Ok(Some(UnidirectionalStream::Push {
+            push_id, stream, ..
+        })) => Start::Frames(stream.into_parts().1, Some(push_id.get().get().get())),
         Ok(Some(UnidirectionalStream::Other(stream))) => {
             let (head, io) = stream.into_parts();
             let rest = read_some(io, 100).await.unwrap();
@@ -435,7 +436,7 @@ fn a_control_stream_reads_settings_and_goaway() {
 async fn settings_and_goaway<F: Skip<Count = usize> + Read<Error = Infallible>>(
     io: &mut impl ReceiverAccess<Family = F>,
 ) -> (usize, u64) {
-    let Ok(Some(UnidirectionalStream::Control(stream))) =
+    let Ok(Some(UnidirectionalStream::Control { stream, .. })) =
         read_unidirectional_stream::<Parts, _>(&mut *io, Role::Server).await
     else {
         panic!("not a control stream");

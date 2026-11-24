@@ -28,7 +28,7 @@ use hatate_wire::{
         UnidirectionalStream,
         codec::{ReadUnidirectionalStreamError, read_unidirectional_stream},
     },
-    stream_type::{StreamType, StreamTypeSet},
+    stream_type::{StreamType, StreamTypeHead, StreamTypeSet},
 };
 use hatate_wire_datagram::{H3_DATAGRAM_ERROR, read_datagram, write_datagram};
 use libfuzzer_sys::fuzz_target;
@@ -115,8 +115,8 @@ type Value = <Parts as StreamTypeSet>::TypeValue;
 /// What reading the start of a unidirectional stream gave.
 #[derive(Debug)]
 enum Started {
-    Control,
-    Push(VarIntField<PushId>),
+    Control(StreamTypeHead<Value>),
+    Push(StreamTypeHead<Value>, VarIntField<PushId>),
     Other(StreamType<Value>, VarIntField<VarInt>),
 }
 
@@ -128,13 +128,27 @@ async fn start<F: Read, A: ReceiverAccess<Family = F>>(
     Ok(read_unidirectional_stream::<Parts, _>(&mut *io, role)
         .await?
         .map(|stream| match stream {
-            UnidirectionalStream::Control(_) => Started::Control,
-            UnidirectionalStream::Push { push_id, .. } => Started::Push(push_id),
+            UnidirectionalStream::Control { head, .. } => Started::Control(head),
+            UnidirectionalStream::Push { head, push_id, .. } => Started::Push(head, push_id),
             UnidirectionalStream::Other(stream) => {
                 let head = stream.head();
                 Started::Other(head.stream_type(), head.field())
             }
         }))
+}
+
+/// A head of a control or push stream is of its type, and writes back as the
+/// bytes it was read from, whatever their width.
+fn assert_head(head: StreamTypeHead<Value>, value: u64, bytes: &[u8], written: &mut Vec<u8>) {
+    let StreamType::Known(known) = head.stream_type() else {
+        panic!("{value} is a type of HTTP/3");
+    };
+    assert_eq!(<Parts as StreamTypeSet>::value_of(known).get(), value);
+    assert_eq!(head.field().get().get(), value);
+    assert_eq!(head.field().encoded_len(), bytes.len());
+    write_var_int_field(&mut *written, head.field());
+    assert_eq!(written, bytes);
+    written.clear();
 }
 
 fn stream_type(control: u8, wire: &[u8]) {
@@ -172,10 +186,14 @@ fn stream_type(control: u8, wire: &[u8]) {
             let mut consumed = length;
             let mut written = Vec::new();
             match started {
-                Started::Control => assert_eq!(value, 0),
-                Started::Push(push_id) => {
+                Started::Control(head) => {
+                    assert_eq!(value, 0);
+                    assert_head(head, value, &wire[..length], &mut written);
+                }
+                Started::Push(head, push_id) => {
                     assert_eq!(value, 1);
                     assert_eq!(role, Role::Client);
+                    assert_head(head, value, &wire[..length], &mut written);
                     let Ok((id_length, id)) = integer(&wire[length..]) else {
                         panic!("a Push ID was read from {wire:?}");
                     };

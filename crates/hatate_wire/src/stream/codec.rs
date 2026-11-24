@@ -20,7 +20,9 @@ use snafu::{ResultExt, Snafu};
 ///
 /// `io` is the stream and is passed through: a control or push stream
 /// comes back composed with its [`FrameStream`], at its first frame, and
-/// any other stream comes back as it is, after its type. `role` is the
+/// any other stream comes back as it is, after its type. Each comes with
+/// the head it was read from, which keeps the width of the Stream Type
+/// field. `role` is the
 /// role of this endpoint. Name the parts with a turbofish:
 /// `read_unidirectional_stream::<Parts, _>(io, role)`.
 ///
@@ -57,27 +59,31 @@ pub async fn read_unidirectional_stream<L: StreamTypeSet, I: ReceiverAccess<Fami
     {
         return Err(ReadUnidirectionalStreamError::NotAcceptableByRole { stream_type, role });
     }
+    let head = StreamTypeHead::new(stream_type, field);
     let frames = FrameStream::new(FrameStreamKind::Unidirectional(value), role);
     let framed = match stream_type {
         StreamType::Known(_) => Http3StreamType::of(value),
         StreamType::Unknown(_) => None,
     };
     Ok(Some(match framed {
-        Some(Http3StreamType::Control) => UnidirectionalStream::Control(Composed::new(io, frames)),
+        Some(Http3StreamType::Control) => UnidirectionalStream::Control {
+            head,
+            stream: Composed::new(io, frames),
+        },
         Some(Http3StreamType::Push) => {
             let push_id = io
                 .read_var_int_field::<PushId>()
                 .await
                 .context(read_unidirectional_stream_error::PushIdSnafu)?;
             UnidirectionalStream::Push {
+                head,
                 push_id,
                 stream: Composed::new(io, frames),
             }
         }
-        Some(Http3StreamType::Qpack(_)) | None => UnidirectionalStream::Other(ReceivedStream {
-            head: StreamTypeHead::new(stream_type, field),
-            io,
-        }),
+        Some(Http3StreamType::Qpack(_)) | None => {
+            UnidirectionalStream::Other(ReceivedStream { head, io })
+        }
     }))
 }
 

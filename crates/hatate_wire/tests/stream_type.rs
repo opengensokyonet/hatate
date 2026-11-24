@@ -14,7 +14,7 @@ use hatate_wire::{
         FrameStream, UnidirectionalStream,
         codec::{ReadUnidirectionalStreamError, read_unidirectional_stream},
     },
-    stream_type::{Http3StreamType, StreamType, StreamTypeKind, StreamTypeSet},
+    stream_type::{Http3StreamType, StreamType, StreamTypeHead, StreamTypeKind, StreamTypeSet},
 };
 use hatate_wire_qpack::QpackStreamType;
 use nitori_call::{ReceiverAccess, call};
@@ -28,8 +28,12 @@ type Value = <Parts as StreamTypeSet>::TypeValue;
 /// What reading the start of a unidirectional stream gave.
 #[derive(Debug, PartialEq)]
 enum Started {
-    Control(FrameStream<Parts>),
+    Control {
+        head: StreamTypeHead<Value>,
+        stream: FrameStream<Parts>,
+    },
     Push {
+        head: StreamTypeHead<Value>,
         push_id: VarIntField<PushId>,
         stream: FrameStream<Parts>,
     },
@@ -48,8 +52,16 @@ async fn start<F: Read, A: ReceiverAccess<Family = F>>(
 ) -> StartResult<<F as Read>::Error> {
     let stream = read_unidirectional_stream::<Parts, _>(&mut *io, role).await?;
     Ok(stream.map(|stream| match stream {
-        UnidirectionalStream::Control(stream) => Started::Control(stream.into_parts().1),
-        UnidirectionalStream::Push { push_id, stream } => Started::Push {
+        UnidirectionalStream::Control { head, stream } => Started::Control {
+            head,
+            stream: stream.into_parts().1,
+        },
+        UnidirectionalStream::Push {
+            head,
+            push_id,
+            stream,
+        } => Started::Push {
+            head,
             push_id,
             stream: stream.into_parts().1,
         },
@@ -92,10 +104,19 @@ fn the_four_types_of_http3_and_qpack_are_known() {
         let started = read(&[byte, 0x09, 0xaa]).unwrap().unwrap();
         let kind = FrameStreamKind::Unidirectional(VarInt::from_u32(u32::from(byte)));
         match (stream_type, started) {
-            (Http3StreamType::Control, Started::Control(stream)) => {
+            (Http3StreamType::Control, Started::Control { head, stream }) => {
+                assert_eq!(head.field().get().get(), u64::from(byte));
                 assert_eq!(stream, FrameStream::new(kind, Role::Client));
             }
-            (Http3StreamType::Push, Started::Push { push_id, stream }) => {
+            (
+                Http3StreamType::Push,
+                Started::Push {
+                    head,
+                    push_id,
+                    stream,
+                },
+            ) => {
+                assert_eq!(head.field().get().get(), u64::from(byte));
                 assert_eq!(push_id.get().get().get(), 9);
                 assert_eq!(stream, FrameStream::new(kind, Role::Client));
             }
@@ -200,6 +221,34 @@ fn the_width_of_the_type_and_of_the_push_id_is_kept() {
             StreamType::Known(Coproduct::Inl(Http3StreamType::Qpack(
                 QpackStreamType::Encoder
             )))
+        );
+
+        // The head of a control stream, and of a push stream, keeps the
+        // width of the type as well, and writes it back in as many bytes.
+        let (type_bytes, type_len) = VarIntField::new(VarInt::from_u32(0x00), width)
+            .unwrap()
+            .to_encoding();
+        let Some(Started::Control { head, .. }) = read(&type_bytes[..type_len]).unwrap() else {
+            panic!("not a control stream");
+        };
+        assert_eq!(head.field().width(), width);
+        assert_eq!(head.field().to_encoding(), (type_bytes, type_len));
+        assert_eq!(
+            head.stream_type(),
+            StreamType::Known(Coproduct::Inl(Http3StreamType::Control))
+        );
+        let (type_bytes, type_len) = VarIntField::new(VarInt::from_u32(0x01), width)
+            .unwrap()
+            .to_encoding();
+        let wire = [&type_bytes[..type_len], &[0x05][..]].concat();
+        let Some(Started::Push { head, .. }) = read(&wire).unwrap() else {
+            panic!("not a push stream");
+        };
+        assert_eq!(head.field().width(), width);
+        assert_eq!(head.field().to_encoding(), (type_bytes, type_len));
+        assert_eq!(
+            head.stream_type(),
+            StreamType::Known(Coproduct::Inl(Http3StreamType::Push))
         );
 
         let (bytes, len) = VarIntField::new(PushId::new(VarInt::from_u32(5)), width)
