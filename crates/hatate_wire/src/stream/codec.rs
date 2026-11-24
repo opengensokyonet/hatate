@@ -153,12 +153,18 @@ impl<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>, R: ErrorCodeOf<ErrorC
 /// frame. Name the parts and the class with a turbofish:
 /// `read_bidirectional_stream::<Parts, ClientInitiatedBidirectional, _>(io)`.
 ///
-/// Returns `None` if the stream ends before such a value.
+/// Returns `None` if the stream ends before such a value. The parts do not
+/// judge such a stream, so on a class that HTTP/3 does not use, the
+/// server-initiated bidirectional streams, the caller treats `None` as a
+/// connection error of type H3_STREAM_CREATION_ERROR unless an extension it
+/// negotiated uses the class ([RFC 9114 §6.1]).
 ///
 /// # Errors
 ///
 /// [`ReadBidirectionalStreamError`]; its [`ErrorCodeOf::error_code`]
 /// gives the connection error the failure calls for, if any.
+///
+/// [RFC 9114 §6.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.1
 pub async fn read_bidirectional_stream<L, C, I>(
     mut io: I,
 ) -> Result<
