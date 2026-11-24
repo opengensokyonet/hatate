@@ -275,7 +275,13 @@ where
         match result {
             Ok(Some(count)) => {
                 // invariant: the stream skipped at most the rest of the
-                // payload, so the minimum is the count itself.
+                // payload, so the minimum is the count itself. Reading
+                // panics on a source that reports more than it was given;
+                // here the minimum would hide it.
+                debug_assert!(
+                    Min::min(count.clone(), u64::MAX) <= state.remaining,
+                    "the stream skipped more than the rest of the payload"
+                );
                 state.remaining -= Min::min(count.clone(), state.remaining);
                 Poll::Ready(Ok(Some(count)))
             }

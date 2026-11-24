@@ -364,9 +364,13 @@ impl<E, R: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for NextFrameError<E, 
 
 /// Writes the Type and Length of a frame, each at its width.
 ///
-/// For the frames of a part's own; the frames of RFC 9114 have writers
-/// that compute the Length from the payload. The payload must follow, of
-/// exactly `length` bytes.
+/// The writers of the frames of RFC 9114 whose payload this crate
+/// structures (SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID and
+/// PUSH_PROMISE) compute the Length from it and write the head with this,
+/// and [`write_frame`] writes the head of a frame whose payload comes as a
+/// source, such as DATA and HEADERS. Use it directly for the frame of a
+/// part's own that has no writer. The payload must follow, of exactly
+/// `length` bytes.
 ///
 /// # Errors
 ///

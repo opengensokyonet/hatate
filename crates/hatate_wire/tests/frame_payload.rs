@@ -3,7 +3,7 @@
 mod common;
 
 use bytes::{Buf, Bytes};
-use common::{Boom, Broken, Dribble, run};
+use common::{Boom, Broken, Dribble, Overskip, run};
 use core::{future::poll_fn, num::NonZeroUsize, task::Poll};
 use hatate_wire::{
     error_code::{ErrorCode, ErrorCodeOf as _},
@@ -340,4 +340,16 @@ fn skipping_says_whether_the_payload_failed() {
     let mut payload = FramePayload::new(1);
     input.sync_read_all_unpin(&mut payload).unwrap();
     input.sync_skip_payload_unpin(&mut payload).unwrap();
+}
+
+/// A stream that reports more skipped than it was allowed breaks the
+/// contract with the payload, as one that reads more than it was given
+/// does; the payload does not silently cut the count.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "skipped more than the rest of the payload")]
+fn a_skip_that_passes_the_rest_of_the_payload_is_caught() {
+    let mut host = Overskip;
+    let mut payload = FramePayload::new(4);
+    let _ = run(host.skip_payload_unpin(&mut payload));
 }
