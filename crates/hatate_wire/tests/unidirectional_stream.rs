@@ -18,7 +18,7 @@ use hatate_wire::{
         codec::{ReadUnidirectionalStreamError, read_unidirectional_stream},
         http3::Http3UnidirectionalStream,
     },
-    stream_type::{Http3StreamType, StreamTypeKind as _},
+    stream_type::Http3StreamType,
 };
 use hatate_wire_qpack::{
     QpackStreamType,
@@ -590,20 +590,6 @@ fn the_types_of_http3_and_qpack_are_the_four_values() {
         [0, 1, 2, 3]
     );
     assert_eq!(Http3StreamType::of(VarInt::from_u32(4)), None);
-}
-
-#[test]
-fn a_push_stream_is_not_critical_and_the_others_are_critical_and_single() {
-    assert!(!Http3StreamType::Push.is_critical());
-    assert!(!Http3StreamType::Push.at_most_one());
-    for stream_type in [
-        Http3StreamType::Control,
-        Http3StreamType::Qpack(QpackStreamType::Encoder),
-        Http3StreamType::Qpack(QpackStreamType::Decoder),
-    ] {
-        assert!(stream_type.is_critical(), "{stream_type:?}");
-        assert!(stream_type.at_most_one(), "{stream_type:?}");
-    }
 }
 
 /// How reading a critical stream ended.

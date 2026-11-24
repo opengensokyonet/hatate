@@ -18,18 +18,6 @@ use frunk_core::hlist::{HCons, HNil};
 use hatate_wire_qpack::QpackStreamType;
 use sakuya_var_int::VarInt;
 
-/// The properties of a stream type that the rules on closing and opening
-/// unidirectional streams ask about. They hold without connection state.
-pub trait StreamTypeKind: Copy + Eq {
-    /// Whether closing a stream of this type is a connection error of type
-    /// H3_CLOSED_CRITICAL_STREAM.
-    fn is_critical(self) -> bool;
-
-    /// Whether each endpoint opens at most one stream of this type; a second
-    /// is a connection error of type H3_STREAM_CREATION_ERROR.
-    fn at_most_one(self) -> bool;
-}
-
 /// One part of the unidirectional stream types of a connection.
 pub trait StreamTypePart {
     /// The stream type values this part claims.
@@ -128,19 +116,5 @@ impl TryFrom<VarInt> for Http3StreamType {
 
     fn try_from(value: VarInt) -> Result<Self, UnclaimedValueError> {
         Self::of(value).ok_or(UnclaimedValueError::new(value))
-    }
-}
-
-/// The rules of [RFC 9114 §6.2.1, §6.2.2] and [RFC 9204 §4.2].
-///
-/// [RFC 9114 §6.2.1, §6.2.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
-/// [RFC 9204 §4.2]: https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
-impl StreamTypeKind for Http3StreamType {
-    fn is_critical(self) -> bool {
-        !matches!(self, Self::Push)
-    }
-
-    fn at_most_one(self) -> bool {
-        !matches!(self, Self::Push)
     }
 }
