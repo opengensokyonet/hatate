@@ -525,6 +525,11 @@ async fn copy_payload<
 /// `io` is the payload of the frame, a [`FramePayload`](crate::frame::payload::FramePayload) composed onto
 /// the request stream.
 ///
+/// A read dropped before it completes may have taken bytes of the Push ID,
+/// and a later read would give a wrong one without failing: after such a
+/// drop, do not read this frame again, and skip it with
+/// [`FrameStream::next_frame`](crate::stream::FrameStream::next_frame).
+///
 /// # Errors
 ///
 /// [`ReadPushPromisePushIdError`]; its [`ErrorCodeOf::error_code`] gives

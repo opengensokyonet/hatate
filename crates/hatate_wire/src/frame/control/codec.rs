@@ -23,6 +23,11 @@ macro_rules! integer_frame_codec {
         /// `io` is the payload, such as a [`FramePayload`](crate::frame::payload::FramePayload)
         /// composed onto the stream; the frame ends where it reports EOF.
         ///
+        /// A read dropped before it completes may have taken bytes of the
+        /// integer, and a later read would give a wrong one without failing:
+        /// after such a drop, do not read this frame again, and skip it with
+        /// [`FrameStream::next_frame`](crate::stream::FrameStream::next_frame).
+        ///
         /// # Errors
         ///
         /// [`ReadIntegerFrameError`].

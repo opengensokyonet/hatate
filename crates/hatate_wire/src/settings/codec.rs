@@ -55,6 +55,11 @@ impl DuplicateSettingError {
 ///
 /// Use a new [`Settings`] for each frame.
 ///
+/// A read dropped before it completes may have taken bytes of the setting
+/// it began, and a later read would start inside that setting and give a
+/// wrong one without failing: after such a drop, do not read this frame
+/// further, and skip it with [`FrameStream::next_frame`](crate::stream::FrameStream::next_frame).
+///
 /// # Errors
 ///
 /// [`ReadSettingError`]; its [`ErrorCodeOf::error_code`] gives the
