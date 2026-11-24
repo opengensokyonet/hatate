@@ -1,22 +1,39 @@
 //! Placement and role rules of frame types (RFC 9114 §7.2).
+use core::marker::PhantomData;
 use frunk_core::HList;
 use hatate_wire::{
     Role,
     frame::{
         Http2FrameType, Http3FrameType,
-        set::{FrameKind, FrameSet, StreamKind},
+        set::{FrameKind, FrameSet, FrameStreamKind},
     },
+    stream_type::codec::ReadStreamTypeHostExt as _,
 };
 use sakuya_var_int::VarInt;
 
+use FrameStreamKind::Request;
 use Http3FrameType::*;
-use StreamKind::{Control, Push, Request};
+
+const CONTROL: FrameStreamKind = FrameStreamKind::Unidirectional(VarInt::from_u32(0x00));
+const PUSH: FrameStreamKind = FrameStreamKind::Unidirectional(VarInt::from_u32(0x01));
+
+/// The request stream and unidirectional streams of the types of RFC 9114,
+/// QPACK, a reserved type and one no part here claims.
+const STREAMS: [FrameStreamKind; 7] = [
+    Request,
+    CONTROL,
+    PUSH,
+    FrameStreamKind::Unidirectional(VarInt::from_u32(0x02)),
+    FrameStreamKind::Unidirectional(VarInt::from_u32(0x03)),
+    FrameStreamKind::Unidirectional(VarInt::from_u32(0x21)),
+    FrameStreamKind::Unidirectional(VarInt::from_u32(0x54)),
+];
 
 /// RFC 9114 §7.2: where each frame may appear.
-fn allowed(frame: Http3FrameType) -> &'static [StreamKind] {
+fn allowed(frame: Http3FrameType) -> &'static [FrameStreamKind] {
     match frame {
-        Data | Headers => &[Request, Push],
-        CancelPush | Settings | Goaway | MaxPushId => &[Control],
+        Data | Headers => &[Request, PUSH],
+        CancelPush | Settings | Goaway | MaxPushId => &[CONTROL],
         PushPromise => &[Request],
     }
 }
@@ -24,7 +41,7 @@ fn allowed(frame: Http3FrameType) -> &'static [StreamKind] {
 #[test]
 fn every_frame_is_allowed_on_the_streams_of_rfc_9114_only() {
     for frame in Http3FrameType::ALL {
-        for stream in [Control, Request, Push] {
+        for stream in STREAMS {
             assert_eq!(
                 frame.allowed_on(stream),
                 allowed(frame).contains(&stream),
@@ -55,7 +72,7 @@ fn the_kind_of_a_frame_of_a_list_is_that_of_its_part() {
         let value = <Parts as FrameSet>::type_value_of(frame.value()).unwrap();
         assert_eq!(<Parts as FrameSet>::value_of(value), frame.value());
         let kind = <Parts as FrameSet>::kind_of(value);
-        for stream in [Control, Request, Push] {
+        for stream in STREAMS {
             assert_eq!(kind.allowed_on(stream), frame.allowed_on(stream));
         }
         for role in [Role::Client, Role::Server] {
@@ -92,4 +109,20 @@ fn the_types_left_by_http2_are_named_and_not_taken_by_http3() {
         assert_eq!(Http3FrameType::of(frame.value()), None);
     }
     assert_eq!(Http2FrameType::of(VarInt::from_u32(0x03)), None);
+}
+
+#[test]
+fn the_kind_of_a_unidirectional_stream_is_the_value_of_its_type() {
+    type Parts = HList![hatate_wire::Part];
+    // A control stream type in two bytes, and a type no part claims.
+    for (mut bytes, value) in [(&[0x40, 0x00][..], 0x00), (&[0x40, 0x54][..], 0x54)] {
+        let head = bytes
+            .sync_read_stream_type_unpin(PhantomData::<Parts>)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            FrameStreamKind::of_stream_type(&head),
+            FrameStreamKind::Unidirectional(VarInt::from_u32(value))
+        );
+    }
 }

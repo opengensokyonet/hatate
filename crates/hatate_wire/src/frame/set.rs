@@ -1,6 +1,7 @@
 //! The frame types of a list of parts.
 use crate::Role;
 use crate::registry::ClaimedValues;
+use crate::stream_type::StreamTypeHead;
 use frunk_core::{
     coproduct::{CNil, Coproduct},
     hlist::{HCons, HNil},
@@ -8,18 +9,30 @@ use frunk_core::{
 use sakuya_var_int::VarInt;
 
 /// The kind of stream a frame is on, for the placement rules of
-/// [RFC 9114 §7.2]: each frame type may appear on some of them.
+/// [RFC 9114 §7.2] and of extensions: a request stream, or a
+/// unidirectional stream of some type.
+///
+/// A unidirectional stream is named by the value of its type on the wire,
+/// which every part can compare with the types it knows, whichever part
+/// claims the type: the control stream (0x00) and push stream (0x01) of
+/// RFC 9114, or the stream type of an extension.
 ///
 /// [RFC 9114 §7.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum StreamKind {
-    /// A control stream ([RFC 9114 §6.2.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1)).
-    Control,
+pub enum FrameStreamKind {
     /// A request stream: a client-initiated bidirectional stream
     /// ([RFC 9114 §6.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-6.1)).
     Request,
-    /// A push stream ([RFC 9114 §6.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.2)).
-    Push,
+    /// A unidirectional stream whose type has this value
+    /// ([RFC 9114 §6.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2)).
+    Unidirectional(VarInt),
+}
+
+impl FrameStreamKind {
+    /// The kind of the unidirectional stream that starts with `head`.
+    pub const fn of_stream_type<T: Copy>(head: &StreamTypeHead<T>) -> Self {
+        Self::Unidirectional(head.field().get())
+    }
 }
 
 /// The properties of a frame type that the placement and role rules of
@@ -31,7 +44,7 @@ pub trait FrameKind: Copy + Eq {
     /// Whether a frame of this kind may appear on a stream of kind
     /// `stream`; elsewhere it is a connection error of type
     /// H3_FRAME_UNEXPECTED.
-    fn allowed_on(self, stream: StreamKind) -> bool;
+    fn allowed_on(self, stream: FrameStreamKind) -> bool;
 
     /// Whether an endpoint of role `role` may receive a frame of this kind.
     fn receivable_by(self, role: Role) -> bool;
@@ -156,7 +169,7 @@ impl<P: FramePart, Ps: FrameSet> FrameSet for HCons<P, Ps> {
 }
 
 impl FrameKind for CNil {
-    fn allowed_on(self, _stream: StreamKind) -> bool {
+    fn allowed_on(self, _stream: FrameStreamKind) -> bool {
         match self {}
     }
 
@@ -166,7 +179,7 @@ impl FrameKind for CNil {
 }
 
 impl<H: FrameKind, T: FrameKind> FrameKind for Coproduct<H, T> {
-    fn allowed_on(self, stream: StreamKind) -> bool {
+    fn allowed_on(self, stream: FrameStreamKind) -> bool {
         match self {
             Coproduct::Inl(kind) => kind.allowed_on(stream),
             Coproduct::Inr(kind) => kind.allowed_on(stream),

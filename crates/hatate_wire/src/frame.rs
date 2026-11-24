@@ -20,9 +20,10 @@
 //!
 //! [RFC 9114 §7]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7
 //! [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9
+use crate::stream_type::Http3StreamType;
 use crate::{Role, registry::ClaimedValues};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
-use set::{FrameKind, StreamKind};
+use set::{FrameKind, FrameStreamKind};
 use snafu::Snafu;
 
 #[allow(missing_docs)] // The call macro also generates operation and extension trait items.
@@ -96,14 +97,18 @@ impl Http3FrameType {
 ///
 /// [RFC 9114 §7.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2
 impl FrameKind for Http3FrameType {
-    fn allowed_on(self, stream: StreamKind) -> bool {
+    fn allowed_on(self, stream: FrameStreamKind) -> bool {
+        let unidirectional = match stream {
+            FrameStreamKind::Request => None,
+            FrameStreamKind::Unidirectional(value) => Some(Http3StreamType::of(value)),
+        };
         match self {
             Self::Data | Self::Headers => {
-                matches!(stream, StreamKind::Request | StreamKind::Push)
+                matches!(unidirectional, None | Some(Some(Http3StreamType::Push)))
             }
-            Self::PushPromise => stream == StreamKind::Request,
+            Self::PushPromise => unidirectional.is_none(),
             Self::CancelPush | Self::Settings | Self::Goaway | Self::MaxPushId => {
-                stream == StreamKind::Control
+                unidirectional == Some(Some(Http3StreamType::Control))
             }
         }
     }
