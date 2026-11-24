@@ -3,17 +3,15 @@
 mod common;
 
 use common::{Dribble, run};
-use core::{convert::Infallible, marker::PhantomData};
+use core::convert::Infallible;
 use frunk_core::{
     HList,
-    coproduct::{CoprodInjector, Coproduct, CoproductSelector},
+    coproduct::{CoprodInjector, CoproductSelector},
 };
 use hatate_wire::{
     Part,
     error_code::{ErrorCode, ErrorCodeOf as _},
-    frame::{
-        FrameType, FrameWidths, Http3FrameType, codec::ReadFrameHeadExt as _, payload::PayloadError,
-    },
+    frame::{FrameWidths, Http3FrameType, codec::read_frame, payload::PayloadError},
     settings::{
         Http2SettingIdentifier, Keyed, KeyedSetting, MaxFieldSectionSize, Setting, UnknownSetting,
         codec::{
@@ -40,14 +38,11 @@ async fn read_settings<L: SettingList, F: Read, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     settings: &mut Settings<L>,
 ) -> Result<Vec<Setting<L::Setting>>, ReadSettingError<PayloadError<F::Error>, L::ValueErrors>> {
-    let Ok(Some(head)) = io.read_frame_head(PhantomData::<Parts>).await else {
+    let Ok(Some(head)) = read_frame(&mut *io).await else {
         panic!("no frame head");
     };
-    assert_eq!(
-        head.frame_type(),
-        FrameType::Known(Coproduct::Inl(Http3FrameType::Settings))
-    );
-    let mut payload = head.payload();
+    assert_eq!(head.r#type().get(), Http3FrameType::Settings.value());
+    let mut payload = head.into_payload().into_parts().1;
     let mut read = Vec::new();
     {
         let mut source = io.compose(&mut payload);
@@ -55,8 +50,17 @@ async fn read_settings<L: SettingList, F: Read, A: ReceiverAccess<Family = F>>(
             read.push(setting);
         }
     }
-    payload.finish().expect("the payload was read to its end");
+    assert_eq!(payload.remaining(), 0, "the payload was read to its end");
     Ok(read)
+}
+
+/// The widths of Type and Length of the frame at the start of the stream.
+#[call(sync)]
+async fn head_widths<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> FrameWidths
+where
+    <F as Read>::Error: core::fmt::Debug,
+{
+    read_frame(&mut *io).await.unwrap().unwrap().widths()
 }
 
 fn frame(payload: &[u8]) -> Vec<u8> {
@@ -344,11 +348,7 @@ fn written_frames_read_back_with_the_same_bytes() {
     let mut input = &wire[..];
     let head_widths = {
         let mut peek = &wire[..];
-        use hatate_wire::frame::codec::ReadFrameHeadHostExt as _;
-        peek.sync_read_frame_head_unpin(PhantomData::<Parts>)
-            .unwrap()
-            .unwrap()
-            .widths()
+        peek.sync_head_widths_unpin()
     };
     assert_eq!(
         head_widths,

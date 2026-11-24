@@ -2,31 +2,39 @@
 //! datagrams, with the parts of HTTP/3, HTTP Datagrams and Extended CONNECT.
 //!
 //! The low bit of the first byte picks the mode. In stream mode the rest is a
-//! stream whose Stream Type is read, however it arrives (the high four bits
-//! of the first byte are the bytes given per read, minus one, and the
-//! period of a `Pending`), and checked against an independent decoding of
+//! stream whose Stream Type is read (and, on a push stream, the Push ID),
+//! however it arrives (bits 4 to 6 of the first byte are the bytes given per
+//! read, minus one, bits 1 to 3 the period of a `Pending`, and bit 7 the
+//! role of the endpoint: a server does not accept a push stream), and checked against an independent decoding of
 //! the first integer; the field is written back and must equal its bytes. In
 //! datagram mode the rest is the payload of a QUIC DATAGRAM frame, read as a
 //! datagram, written back, and compared; a failure must be the one the first
 //! bytes call for, and carry H3_DATAGRAM_ERROR.
 #![no_main]
+#![feature(impl_trait_in_assoc_type)]
 use bytes::BufMut;
 use core::{
     convert::Infallible,
     future::Future,
-    marker::PhantomData,
     pin::{Pin, pin},
     task::{Context, Poll, Waker},
 };
 use frunk_core::HList;
-use hatate_wire::stream_type::{
-    StreamType, StreamTypeSet, codec::ReadStreamTypeHostExt as _,
+use hatate_wire::{
+    Role,
+    error_code::ErrorCodeOf as _,
+    frame::PushId,
+    stream::{
+        UnidirectionalStream,
+        codec::{ReadUnidirectionalStreamError, read_unidirectional_stream},
+    },
+    stream_type::{StreamType, StreamTypeSet},
 };
-use hatate_wire::error_code::ErrorCodeOf as _;
 use hatate_wire_datagram::{H3_DATAGRAM_ERROR, read_datagram, write_datagram};
 use libfuzzer_sys::fuzz_target;
+use nitori_call::{ReceiverAccess, call};
 use nitori_io::Read;
-use sakuya_var_int::codec::write_var_int_field;
+use sakuya_var_int::{VarInt, VarIntField, codec::write_var_int_field};
 
 type Parts = HList![
     hatate_wire::Part,
@@ -102,6 +110,33 @@ fn integer(bytes: &[u8]) -> Result<(usize, u64), usize> {
     Ok((length, value))
 }
 
+type Value = <Parts as StreamTypeSet>::TypeValue;
+
+/// What reading the start of a unidirectional stream gave.
+#[derive(Debug)]
+enum Started {
+    Control,
+    Push(VarIntField<PushId>),
+    Other(StreamType<Value>, VarIntField<VarInt>),
+}
+
+#[call(sync)]
+async fn start<F: Read, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    role: Role,
+) -> Result<Option<Started>, ReadUnidirectionalStreamError<F::Error, Value>> {
+    Ok(read_unidirectional_stream::<Parts, _>(&mut *io, role)
+        .await?
+        .map(|stream| match stream {
+            UnidirectionalStream::Control(_) => Started::Control,
+            UnidirectionalStream::Push { push_id, .. } => Started::Push(push_id),
+            UnidirectionalStream::Other(stream) => {
+                let head = stream.head();
+                Started::Other(head.stream_type(), head.field())
+            }
+        }))
+}
+
 fn stream_type(control: u8, wire: &[u8]) {
     let mut arrival = Arrival {
         input: wire,
@@ -110,31 +145,65 @@ fn stream_type(control: u8, wire: &[u8]) {
         reads: 0,
         woken: false,
     };
-    let result = complete(arrival.read_stream_type_unpin(PhantomData::<Parts>));
+    let role = if control & 0x80 == 0 {
+        Role::Client
+    } else {
+        Role::Server
+    };
+    let result = complete(arrival.start_unpin(role));
     match (integer(wire), result) {
         (Err(_), Ok(None)) => assert!(wire.is_empty()),
-        (Err(_), Err(error)) => {
+        (Err(_), Err(ReadUnidirectionalStreamError::Type { source })) => {
             assert!(!wire.is_empty());
-            assert!(error.is_incomplete());
+            assert!(source.is_incomplete());
         }
-        (Ok((length, value)), Ok(Some(head))) => {
-            assert_eq!(head.field().get().get(), value);
-            assert_eq!(head.field().encoded_len(), length);
-            // The Stream Type bytes are consumed, and no others.
-            assert_eq!(arrival.input, &wire[length..]);
+        (Ok((length, 1)), Err(ReadUnidirectionalStreamError::NotAcceptableByRole { .. })) => {
+            assert_eq!(role, Role::Server);
+            let _ = length;
+        }
+        (Ok((length, 1)), Err(ReadUnidirectionalStreamError::PushId { source })) => {
+            assert_eq!(role, Role::Client);
+            assert!(source.is_incomplete());
+            assert!(integer(&wire[length..]).is_err());
+        }
+        (Ok((length, value)), Ok(Some(started))) => {
+            // The Stream Type bytes are consumed, and for a push stream the
+            // Push ID after them, and no others.
+            let mut consumed = length;
             let mut written = Vec::new();
-            write_var_int_field(&mut written, head.field());
-            assert_eq!(written, &wire[..length]);
-            match head.stream_type() {
-                StreamType::Known(known) => {
-                    assert!(value <= 3);
-                    assert_eq!(<Parts as StreamTypeSet>::value_of(known).get(), value);
+            match started {
+                Started::Control => assert_eq!(value, 0),
+                Started::Push(push_id) => {
+                    assert_eq!(value, 1);
+                    assert_eq!(role, Role::Client);
+                    let Ok((id_length, id)) = integer(&wire[length..]) else {
+                        panic!("a Push ID was read from {wire:?}");
+                    };
+                    assert_eq!(push_id.get().get().get(), id);
+                    assert_eq!(push_id.encoded_len(), id_length);
+                    write_var_int_field(&mut written, push_id);
+                    assert_eq!(written, &wire[length..length + id_length]);
+                    written.clear();
+                    consumed += id_length;
                 }
-                StreamType::Unknown(unknown) => {
-                    assert!(value > 3);
-                    assert_eq!(unknown.get(), value);
+                Started::Other(stream_type, field) => {
+                    assert_eq!(field.get().get(), value);
+                    assert_eq!(field.encoded_len(), length);
+                    write_var_int_field(&mut written, field);
+                    assert_eq!(written, &wire[..length]);
+                    match stream_type {
+                        StreamType::Known(known) => {
+                            assert!((2..=3).contains(&value));
+                            assert_eq!(<Parts as StreamTypeSet>::value_of(known).get(), value);
+                        }
+                        StreamType::Unknown(unknown) => {
+                            assert!(value > 3);
+                            assert_eq!(unknown.get(), value);
+                        }
+                    }
                 }
             }
+            assert_eq!(arrival.input, &wire[consumed..]);
         }
         (integer, result) => panic!("{integer:?} read as {result:?}"),
     }

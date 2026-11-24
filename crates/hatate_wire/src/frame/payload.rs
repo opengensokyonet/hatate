@@ -18,9 +18,9 @@ use nitori_call::{Compose, ReceiverFamily};
 use nitori_io::{ExactLen, Min, Read, ReadChunk, Skip};
 use snafu::Snafu;
 
-/// The part of a frame's payload not yet consumed. Compose it onto the
-/// stream the frame head was read from, and [`finish`](Self::finish) it
-/// before reading the next frame.
+/// The part of a frame's payload not yet consumed, composed onto the stream
+/// the frame is on. A frame read from a stream holds it
+/// ([`Frame`](super::Frame)); finishing the frame skips what is left.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FramePayload {
     remaining: u64,
@@ -39,21 +39,6 @@ impl FramePayload {
     /// The bytes of the payload not yet consumed.
     pub const fn remaining(&self) -> u64 {
         self.remaining
-    }
-
-    /// Checks that the payload was consumed to its end, so that the stream
-    /// is at the next frame.
-    ///
-    /// # Errors
-    ///
-    /// [`UnfinishedPayloadError`] if bytes remain or reading the payload
-    /// failed; the stream is then inside this frame.
-    pub fn finish(&self) -> Result<(), UnfinishedPayloadError> {
-        match NonZeroU64::new(self.remaining) {
-            None => Ok(()),
-            Some(remaining) if self.failed => Err(UnfinishedPayloadError::Failed { remaining }),
-            Some(remaining) => Err(UnfinishedPayloadError::Unconsumed { remaining }),
-        }
     }
 
     /// Takes `count` consumed bytes off the remaining length.
@@ -95,33 +80,6 @@ impl FramePayload {
                 self.failed = true;
                 Poll::Ready(Err(PayloadError::Host { source }))
             }
-        }
-    }
-}
-
-/// The payload was left before its end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
-#[snafu(module)]
-pub enum UnfinishedPayloadError {
-    /// Bytes of the payload were not consumed.
-    #[snafu(display("frame payload left with {remaining} bytes unconsumed"))]
-    Unconsumed {
-        /// The bytes not consumed.
-        remaining: NonZeroU64,
-    },
-    /// Reading the payload failed before its end.
-    #[snafu(display("frame payload failed with {remaining} bytes unread"))]
-    Failed {
-        /// The bytes not read.
-        remaining: NonZeroU64,
-    },
-}
-
-impl UnfinishedPayloadError {
-    /// The bytes of the payload not consumed.
-    pub const fn remaining(&self) -> NonZeroU64 {
-        match *self {
-            Self::Unconsumed { remaining } | Self::Failed { remaining } => remaining,
         }
     }
 }

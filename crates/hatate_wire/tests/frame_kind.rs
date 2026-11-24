@@ -1,5 +1,5 @@
+#![feature(impl_trait_in_assoc_type)]
 //! Placement and role rules of frame types (RFC 9114 §7.2).
-use core::marker::PhantomData;
 use frunk_core::HList;
 use hatate_wire::{
     Role,
@@ -7,8 +7,10 @@ use hatate_wire::{
         Http2FrameType, Http3FrameType,
         set::{FrameKind, FrameSet, FrameStreamKind},
     },
-    stream_type::codec::ReadStreamTypeHostExt as _,
+    stream::{UnidirectionalStream, codec::read_unidirectional_stream},
 };
+use nitori_call::{ReceiverAccess, call};
+use nitori_io::Read;
 use sakuya_var_int::VarInt;
 
 use FrameStreamKind::Request;
@@ -111,17 +113,40 @@ fn the_types_left_by_http2_are_named_and_not_taken_by_http3() {
     assert_eq!(Http2FrameType::of(VarInt::from_u32(0x03)), None);
 }
 
+type Parts = HList![hatate_wire::Part];
+
+/// The kind of frame stream the unidirectional stream at the start of the
+/// input is: a stream that carries frames reports it itself, and for one
+/// that does not, it is made from the type read.
+#[call(sync)]
+async fn kind_of_stream<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> FrameStreamKind
+where
+    <F as Read>::Error: core::fmt::Debug,
+{
+    match read_unidirectional_stream::<Parts, _>(&mut *io, Role::Client)
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        UnidirectionalStream::Control(stream) | UnidirectionalStream::Push { stream, .. } => {
+            stream.into_parts().1.kind()
+        }
+        UnidirectionalStream::Other(stream) => FrameStreamKind::of_stream_type(&stream.head()),
+    }
+}
+
 #[test]
 fn the_kind_of_a_unidirectional_stream_is_the_value_of_its_type() {
-    type Parts = HList![hatate_wire::Part];
-    // A control stream type in two bytes, and a type no part claims.
-    for (mut bytes, value) in [(&[0x40, 0x00][..], 0x00), (&[0x40, 0x54][..], 0x54)] {
-        let head = bytes
-            .sync_read_stream_type_unpin(PhantomData::<Parts>)
-            .unwrap()
-            .unwrap();
+    // A control stream type in two bytes, a push stream with its Push ID, a
+    // QPACK stream, and a type no part claims.
+    for (mut bytes, value) in [
+        (&[0x40, 0x00][..], 0x00),
+        (&[0x01, 0x03][..], 0x01),
+        (&[0x02][..], 0x02),
+        (&[0x40, 0x54][..], 0x54),
+    ] {
         assert_eq!(
-            FrameStreamKind::of_stream_type(&head),
+            bytes.sync_kind_of_stream_unpin(),
             FrameStreamKind::Unidirectional(VarInt::from_u32(value))
         );
     }

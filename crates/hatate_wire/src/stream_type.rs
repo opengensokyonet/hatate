@@ -3,8 +3,9 @@
 //! A unidirectional stream starts with its type, a variable-length integer.
 //! The types of a connection are those of a list of parts, as for frames; a
 //! type no part claims is [`StreamType::Unknown`], and the receiver
-//! discards the stream or stops reading it ([RFC 9114 §9]). Write a type
-//! with [`sakuya_var_int::call::write_var_int_field`].
+//! discards the stream or stops reading it ([RFC 9114 §9]). Read the type
+//! with [`read_unidirectional_stream`](crate::stream::codec::read_unidirectional_stream);
+//! write it with [`sakuya_var_int::call::write_var_int_field`].
 //!
 //! [RFC 9114 §6.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2
 //! [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9
@@ -15,9 +16,6 @@ use frunk_core::{
 };
 use hatate_wire_qpack::QpackStreamType;
 use sakuya_var_int::{VarInt, VarIntField};
-
-#[allow(missing_docs)] // The call macro also generates operation and extension trait items.
-pub mod codec;
 
 /// The properties of a stream type that the rules on opening and closing
 /// unidirectional streams ask about. They hold without connection state.
@@ -181,6 +179,11 @@ pub struct StreamTypeHead<T> {
 }
 
 impl<T: Copy> StreamTypeHead<T> {
+    /// The head of `stream_type`, read as `field`.
+    pub(crate) const fn new(stream_type: StreamType<T>, field: VarIntField<VarInt>) -> Self {
+        Self { stream_type, field }
+    }
+
     /// The type, as the list of parts reads it.
     pub const fn stream_type(&self) -> StreamType<T> {
         self.stream_type
@@ -201,10 +204,9 @@ pub enum Http3StreamType {
     /// [RFC 9114 §6.2.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
     Control,
     /// A push stream (0x01, [RFC 9114 §6.2.2]), which a server opens; its
-    /// Push ID follows the type. Read it as a field of
-    /// [`PushId`](crate::frame::PushId) with
-    /// [`sakuya_var_int::call::read_var_int_field`]; what a stream that
-    /// ends inside it calls for is for the connection to decide.
+    /// Push ID follows the type, and
+    /// [`read_unidirectional_stream`](crate::stream::codec::read_unidirectional_stream)
+    /// reads it.
     ///
     /// [RFC 9114 §6.2.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.2
     Push,

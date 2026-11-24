@@ -2,12 +2,16 @@
 //!
 //! A frame is a Type, a Length and a payload of Length bytes, on a stream
 //! where its bytes may arrive in pieces. Reading one has three steps, as for
-//! every object on a byte stream: [`codec::read_frame_head`] reads the Type
-//! and Length and finds the part that claims the type; the caller then
-//! consumes the payload through a [`payload::FramePayload`] composed onto
-//! the stream, either itself or with the reader of that frame type; and
-//! [`payload::FramePayload::finish`] checks that the payload was consumed
-//! to its end before the next frame starts.
+//! every object on a byte stream: [`codec::read_received_frame`] reads the
+//! Type and Length from a stream that carries frames, finds the part that
+//! claims the type and checks that the frame may arrive there; the caller
+//! then consumes the payload, the stream composed with a
+//! [`payload::FramePayload`], either itself or with the reader of that
+//! frame type; and [`ReceivedFrame::finish`] skips what is left of the
+//! payload and gives the stream back at the next frame, or
+//! [`ReceivedFrame::next`] also reads that frame. [`codec::read_frame`]
+//! reads a [`Frame`] from any source, without the type and placement
+//! checks.
 //!
 //! The types of a connection are those of a list of parts ([`set`]). A
 //! type no part claims, including the reserved types and those of
@@ -303,26 +307,44 @@ pub enum FrameType<T> {
     Unknown(VarInt),
 }
 
-/// The Type and Length of a frame, as read from a stream.
+/// A frame ([RFC 9114 §7.1]): its Type, its Length, and its payload `P`.
 ///
-/// `T` is the frame type value of the list of parts that read it
-/// ([`set::FrameSet::TypeValue`]).
+/// Read from a stream with [`codec::read_frame`], the payload is the
+/// stream composed with a [`FramePayload`](payload::FramePayload), which
+/// ends at the end of the payload; [`finish`](Self::finish) skips what is
+/// left of it and gives the stream back, at the next frame, and
+/// [`next`](Self::next) reads that frame too. To write a frame, the
+/// payload is a source of its bytes ([`codec::write_frame`]).
+///
+/// The stream stays inside a frame that is dropped before it is finished,
+/// and so does it when the call reading the frame is dropped: no frame can be
+/// read from it any more, and the stream is abandoned, with STOP_SENDING or
+/// by closing the connection, as HTTP/3 does with a stream it stops reading.
+///
+/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+#[must_use = "a stream stays inside a frame that is not finished"]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FrameHead<T> {
-    frame_type: FrameType<T>,
-    type_field: VarIntField<VarInt>,
+pub struct Frame<P> {
+    r#type: VarIntField<VarInt>,
     length: VarIntField<VarInt>,
+    payload: P,
 }
 
-impl<T: Copy> FrameHead<T> {
-    /// The frame type, as the list of parts reads it.
-    pub const fn frame_type(&self) -> FrameType<T> {
-        self.frame_type
+impl<P> Frame<P> {
+    /// The frame with the Type `r#type`, the Length `length` and the
+    /// payload `payload`. Whether the payload has that length is checked
+    /// where it is written.
+    pub const fn new(r#type: VarIntField<VarInt>, length: VarIntField<VarInt>, payload: P) -> Self {
+        Self {
+            r#type,
+            length,
+            payload,
+        }
     }
 
     /// The Type field.
-    pub const fn type_field(&self) -> VarIntField<VarInt> {
-        self.type_field
+    pub const fn r#type(&self) -> VarIntField<VarInt> {
+        self.r#type
     }
 
     /// The Length field: the length of the payload in bytes.
@@ -332,12 +354,58 @@ impl<T: Copy> FrameHead<T> {
 
     /// The widths of the Type and Length.
     pub const fn widths(&self) -> FrameWidths {
-        FrameWidths::new(self.type_field.width(), self.length.width())
+        FrameWidths::new(self.r#type.width(), self.length.width())
     }
 
-    /// The state that delimits the payload, to compose onto the stream the
-    /// head was read from.
-    pub fn payload(&self) -> payload::FramePayload {
-        payload::FramePayload::new(self.length.get().get())
+    /// The payload.
+    pub fn payload(&mut self) -> &mut P {
+        &mut self.payload
+    }
+
+    /// The payload, giving up the rest of the frame.
+    pub fn into_payload(self) -> P {
+        self.payload
+    }
+}
+
+/// A frame read from a stream that carries frames, with its type as the
+/// list of parts of the stream reads it.
+///
+/// [`codec::read_received_frame`] reads it from a stream composed with a
+/// [`FrameStream`](crate::stream::FrameStream), and checks that a frame of
+/// its type may arrive there. `T` is the frame type value of the list of
+/// parts ([`set::FrameSet::TypeValue`]). As with [`Frame`], the stream
+/// stays inside a frame that is dropped before it is finished.
+#[must_use = "a stream stays inside a frame that is not finished"]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ReceivedFrame<T, P> {
+    frame_type: FrameType<T>,
+    frame: Frame<P>,
+}
+
+impl<T: Copy, P> ReceivedFrame<T, P> {
+    /// The frame of type `frame_type`, which its stream allows.
+    pub(crate) const fn new(frame_type: FrameType<T>, frame: Frame<P>) -> Self {
+        Self { frame_type, frame }
+    }
+
+    /// The frame type, as the list of parts reads it.
+    pub const fn frame_type(&self) -> FrameType<T> {
+        self.frame_type
+    }
+
+    /// The frame.
+    pub const fn frame(&self) -> &Frame<P> {
+        &self.frame
+    }
+
+    /// The payload of the frame.
+    pub fn payload(&mut self) -> &mut P {
+        self.frame.payload()
+    }
+
+    /// The frame, without its type as the parts read it.
+    pub fn into_frame(self) -> Frame<P> {
+        self.frame
     }
 }

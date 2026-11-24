@@ -3,15 +3,13 @@
 mod common;
 
 use common::{Dribble, run};
-use core::marker::PhantomData;
-use frunk_core::{HList, coproduct::Coproduct};
 use hatate_wire::{
     error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
-        FrameType, FrameWidths, Http3FrameType, PushId,
+        FrameWidths, Http3FrameType, PushId,
         codec::{
-            ReadFrameHeadExt as _, ReadPushPromisePushIdError, ReadPushPromisePushIdExt as _,
-            WritePushPromiseFrameHostExt as _,
+            ReadPushPromisePushIdError, ReadPushPromisePushIdExt as _,
+            WritePushPromiseFrameHostExt as _, read_frame,
         },
         payload::PayloadError,
     },
@@ -19,8 +17,6 @@ use hatate_wire::{
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::{Read, prelude::*};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
-
-type Parts = HList![hatate_wire::Part];
 
 /// What a PUSH_PROMISE frame leaves after its Push ID was read.
 #[derive(Debug, PartialEq, Eq)]
@@ -42,16 +38,10 @@ async fn read_promise<F: Read, A: ReceiverAccess<Family = F>>(
 where
     <F as Read>::Error: core::fmt::Debug,
 {
-    let head = io
-        .read_frame_head(PhantomData::<Parts>)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        head.frame_type(),
-        FrameType::Known(Coproduct::Inl(Http3FrameType::PushPromise))
-    );
-    let mut payload = head.payload();
+    let frame = read_frame(&mut *io).await.unwrap().unwrap();
+    assert_eq!(frame.r#type().get(), Http3FrameType::PushPromise.value());
+    let widths = frame.widths();
+    let mut payload = frame.into_payload().into_parts().1;
     let push_id = {
         let mut source = io.compose(&mut payload);
         source.read_push_promise_push_id().await?
@@ -69,10 +59,10 @@ where
             section.extend_from_slice(&buffer[..count]);
         }
     }
-    payload.finish().unwrap();
+    assert_eq!(payload.remaining(), 0);
     Ok(Promise {
         push_id,
-        widths: head.widths(),
+        widths,
         remaining,
         section,
     })

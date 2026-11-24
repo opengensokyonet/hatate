@@ -42,14 +42,19 @@
 //!
 //! Reading follows the shape of every object on a byte stream: start (read
 //! the head and look it up), advance (consume the content through a
-//! composed source), finish (check that the content ended where it should).
-//! Every variable-length integer keeps the width it had on the wire.
+//! composed source), finish (skip what is left of the content and give the
+//! stream back). A stream that carries frames is told which one it is by a
+//! [`FrameStream`](stream::FrameStream) composed onto it; frames read from
+//! it are checked against its kind and the role of this endpoint
+//! ([`frame::codec::read_received_frame`]). Every variable-length integer
+//! keeps the width it had on the wire.
 //!
 //! A read that is dropped before it completes keeps nothing of what it
 //! read: the bytes the stream handed over stay consumed, and a
 //! [`FramePayload`](frame::payload::FramePayload) counts them, but the
 //! integer or setting they began is lost. Reading cannot resume from there;
-//! the stream is inside the object.
+//! the stream is inside the object. The same holds for a frame dropped
+//! before it is finished ([`frame::Frame`]).
 //!
 //! [RFC 9114]: https://www.rfc-editor.org/rfc/rfc9114.html
 //! [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9
@@ -71,6 +76,8 @@ mod part;
 pub mod parts;
 pub mod registry;
 pub mod settings;
+#[allow(missing_docs)] // The capability macro also generates extension trait items.
+pub mod stream;
 pub mod stream_type;
 
 pub use part::Part;

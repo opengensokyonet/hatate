@@ -61,6 +61,34 @@ impl nitori_io::Read for Dribble<'_> {
     }
 }
 
+/// Skips like it reads: at most `chunk` bytes, after one `Pending`.
+impl nitori_io::Skip for Dribble<'_> {
+    type Count = usize;
+    fn poll_skip<'visit, M: nitori_io::Min<usize, Output = usize> + Clone>(
+        host: Pin<&mut Self::ReceiverView<'visit>>,
+        cx: &mut Context<'_>,
+        maximum: M,
+    ) -> Poll<Result<Option<usize>, Self::Error>>
+    where
+        Self: 'visit,
+    {
+        let this = host.get_pin_mut().get_mut();
+        if !this.waiting {
+            this.waiting = true;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        this.waiting = false;
+        let allowed = nitori_io::Min::min(maximum, this.chunk);
+        if allowed != 0 && this.input.is_empty() {
+            return Poll::Ready(Ok(None));
+        }
+        let count = allowed.min(this.input.len());
+        this.input = &this.input[count..];
+        Poll::Ready(Ok(Some(count)))
+    }
+}
+
 /// Polls `future` to completion, returning how many times it was pending.
 pub fn run<T>(future: impl Future<Output = T>) -> (T, usize) {
     let mut future = pin!(future);
@@ -135,6 +163,20 @@ impl nitori_io::Read for Broken {
         _cx: &mut Context<'_>,
         _dst: &mut B,
     ) -> Poll<Result<usize, Self::Error>>
+    where
+        Self: 'visit,
+    {
+        Poll::Ready(Err(Boom))
+    }
+}
+
+impl nitori_io::Skip for Broken {
+    type Count = usize;
+    fn poll_skip<'visit, M: nitori_io::Min<usize, Output = usize> + Clone>(
+        _host: Pin<&mut Self::ReceiverView<'visit>>,
+        _cx: &mut Context<'_>,
+        _maximum: M,
+    ) -> Poll<Result<Option<usize>, Self::Error>>
     where
         Self: 'visit,
     {

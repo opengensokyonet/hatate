@@ -54,7 +54,7 @@ pub trait FrameKind: Copy + Eq {
 /// RFC 9114, or those of one extension.
 ///
 /// It is implemented by the marker type of each part. A list of parts
-/// implements [`FrameSet`], which [`read_frame_head`](super::codec::read_frame_head)
+/// implements [`FrameSet`], which [`read_received_frame`](super::codec::read_received_frame)
 /// reads with.
 pub trait FramePart {
     /// The kinds of the frames of this part.

@@ -12,7 +12,6 @@ mod common;
 use common::Dribble;
 use core::{
     future::Future,
-    marker::PhantomData,
     pin::pin,
     task::{Context, Poll, Waker},
 };
@@ -21,7 +20,7 @@ use hatate_wire::{
     error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
         FrameWidths,
-        codec::ReadFrameHeadExt as _,
+        codec::read_frame,
         control::{GoawayFrame, codec::*},
         payload::{FramePayload, PayloadError},
     },
@@ -50,11 +49,13 @@ async fn payload_of<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> Frame
 where
     <F as Read>::Error: core::fmt::Debug,
 {
-    io.read_frame_head(PhantomData::<Parts>)
+    read_frame(&mut *io)
         .await
         .unwrap()
         .unwrap()
-        .payload()
+        .into_payload()
+        .into_parts()
+        .1
 }
 
 /// Reads the GOAWAY integer from the payload.
@@ -125,7 +126,7 @@ fn a_goaway_dropped_in_the_middle_keeps_the_count_exact() {
         assert_eq!(payload.remaining(), 8 - consumed as u64, "polls {polls}");
         if done {
             // Read to its end before the drop: the payload is finished.
-            payload.finish().unwrap();
+            assert_eq!(payload.remaining(), 0);
             continue;
         }
         // Continue with a new read, as a caller that treats the drop as

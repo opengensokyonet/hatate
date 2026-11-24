@@ -1,16 +1,17 @@
 #![feature(impl_trait_in_assoc_type)]
 //! The parts of HTTP/3, HTTP Datagrams and Extended CONNECT in one list
 //! (RFC 9114 §9, RFC 9297 §2.1.1, RFC 8441 §3, RFC 9220 §3).
-use core::{convert::Infallible, marker::PhantomData};
+use core::convert::Infallible;
 use frunk_core::{
     HList,
     coproduct::{CoprodInjector, Coproduct},
 };
 use hatate_wire::{
+    Role,
     error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
         FrameType, FrameWidths, Http3FrameType,
-        codec::{ReadFrameHeadExt as _, ReadFrameHeadHostExt as _},
+        codec::{read_frame, read_received_frame},
         payload::PayloadError,
         set::FrameSet,
     },
@@ -21,7 +22,8 @@ use hatate_wire::{
         },
         set::{SettingList, Settings, SettingsOf},
     },
-    stream_type::{StreamType, StreamTypeSet, codec::ReadStreamTypeHostExt as _},
+    stream::{FrameStream, UnidirectionalStream, codec::read_unidirectional_stream},
+    stream_type::{StreamType, StreamTypeSet},
 };
 use hatate_wire_datagram::{H3Datagram, H3DatagramValueError};
 use hatate_wire_extended_connect::{EnableConnectProtocol, EnableConnectProtocolValueError};
@@ -54,12 +56,11 @@ async fn read_settings<L: SettingList, F: Read, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     settings: &mut Settings<L>,
 ) -> Result<Vec<Setting<L::Setting>>, ReadSettingError<PayloadError<F::Error>, L::ValueErrors>> {
-    let Ok(Some(head)) = io.read_frame_head(PhantomData::<All>).await else {
+    let Ok(Some(head)) = read_frame(&mut *io).await else {
         panic!("no frame head");
     };
-    assert_eq!(head.type_field().get().get(), 0x04);
-    assert!(matches!(head.frame_type(), FrameType::Known(_)));
-    let mut payload = head.payload();
+    assert_eq!(head.r#type().get().get(), 0x04);
+    let mut payload = head.into_payload().into_parts().1;
     let mut read = Vec::new();
     {
         let mut source = io.compose(&mut payload);
@@ -67,8 +68,40 @@ async fn read_settings<L: SettingList, F: Read, A: ReceiverAccess<Family = F>>(
             read.push(setting);
         }
     }
-    payload.finish().expect("the payload was read to its end");
+    assert_eq!(payload.remaining(), 0, "the payload was read to its end");
     Ok(read)
+}
+
+/// Whether the frame type at the start of the stream, read on a request
+/// stream with the parts of `All`, is unknown; with its value.
+#[call(sync)]
+async fn frame_type_on_request_stream<F: Read, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+) -> FrameType<<All as FrameSet>::TypeValue>
+where
+    <F as Read>::Error: core::fmt::Debug,
+{
+    let io = io.compose(FrameStream::<All>::request(Role::Server));
+    read_received_frame(io).await.unwrap().unwrap().frame_type()
+}
+
+/// The type of the unidirectional stream at the start of the stream, read
+/// with the parts of `All`, of a stream that carries no frames.
+#[call(sync)]
+async fn other_stream_type<F: Read, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+) -> StreamType<<All as StreamTypeSet>::TypeValue>
+where
+    <F as Read>::Error: core::fmt::Debug,
+{
+    match read_unidirectional_stream::<All, _>(&mut *io, Role::Client)
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        UnidirectionalStream::Other(stream) => stream.head().stream_type(),
+        _ => panic!("not a stream without frames"),
+    }
 }
 
 fn frame(payload: &[u8]) -> Vec<u8> {
@@ -420,21 +453,13 @@ fn frame_types_and_stream_types_of_the_extensions_are_none() {
         );
     }
     let mut input = &[0x33, 0x00][..];
-    let head = input
-        .sync_read_frame_head_unpin(PhantomData::<All>)
-        .unwrap()
-        .unwrap();
     assert_eq!(
-        head.frame_type(),
+        input.sync_frame_type_on_request_stream_unpin(),
         FrameType::Unknown(VarInt::from_u32(0x33))
     );
     let mut input = &[0x08][..];
-    let head = input
-        .sync_read_stream_type_unpin(PhantomData::<All>)
-        .unwrap()
-        .unwrap();
     assert_eq!(
-        head.stream_type(),
+        input.sync_other_stream_type_unpin(),
         StreamType::Unknown(VarInt::from_u32(0x08))
     );
 }

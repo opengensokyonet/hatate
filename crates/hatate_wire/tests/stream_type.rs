@@ -1,28 +1,82 @@
-//! Unidirectional stream types (RFC 9114 §6.2, RFC 9204 §4.2).
+#![feature(impl_trait_in_assoc_type)]
+//! Unidirectional stream types (RFC 9114 §6.2, RFC 9204 §4.2), and reading
+//! the start of a unidirectional stream.
 mod common;
 
 use common::{Dribble, run};
-use core::marker::PhantomData;
+use core::convert::Infallible;
 use frunk_core::{HList, coproduct::Coproduct};
 use hatate_wire::{
     Role,
-    stream_type::{
-        Http3StreamType, StreamType, StreamTypeHead, StreamTypeKind, StreamTypeSet,
-        codec::ReadStreamTypeHostExt as _,
+    error_code::{ErrorCode, ErrorCodeOf as _},
+    frame::{PushId, set::FrameStreamKind},
+    stream::{
+        FrameStream, UnidirectionalStream,
+        codec::{ReadUnidirectionalStreamError, read_unidirectional_stream},
     },
+    stream_type::{Http3StreamType, StreamType, StreamTypeKind, StreamTypeSet},
 };
 use hatate_wire_qpack::QpackStreamType;
-use sakuya_var_int::{VarInt, VarIntWidth};
+use nitori_call::{ReceiverAccess, call};
+use nitori_io::Read;
+use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
 type Parts = HList![hatate_wire::Part];
 hatate_wire::assert_claims_valid!(Parts);
+type Value = <Parts as StreamTypeSet>::TypeValue;
 
-type Head = StreamTypeHead<<Parts as StreamTypeSet>::TypeValue>;
+/// What reading the start of a unidirectional stream gave.
+#[derive(Debug, PartialEq)]
+enum Started {
+    Control(FrameStream<Parts>),
+    Push {
+        push_id: VarIntField<PushId>,
+        stream: FrameStream<Parts>,
+    },
+    Other {
+        stream_type: StreamType<Value>,
+        field: VarIntField<VarInt>,
+    },
+}
 
-fn read(
-    mut input: &[u8],
-) -> Result<Option<Head>, sakuya_var_int::call::ReadVarIntError<core::convert::Infallible>> {
-    input.sync_read_stream_type_unpin(PhantomData::<Parts>)
+type StartResult<E> = Result<Option<Started>, ReadUnidirectionalStreamError<E, Value>>;
+
+#[call(sync)]
+async fn start<F: Read, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    role: Role,
+) -> StartResult<<F as Read>::Error> {
+    let stream = read_unidirectional_stream::<Parts, _>(&mut *io, role).await?;
+    Ok(stream.map(|stream| match stream {
+        UnidirectionalStream::Control(stream) => Started::Control(stream.into_parts().1),
+        UnidirectionalStream::Push { push_id, stream } => Started::Push {
+            push_id,
+            stream: stream.into_parts().1,
+        },
+        UnidirectionalStream::Other(stream) => {
+            let head = stream.head();
+            Started::Other {
+                stream_type: head.stream_type(),
+                field: head.field(),
+            }
+        }
+    }))
+}
+
+fn read_as(mut input: &[u8], role: Role) -> StartResult<Infallible> {
+    input.sync_start_unpin(role)
+}
+
+fn read(input: &[u8]) -> StartResult<Infallible> {
+    read_as(input, Role::Client)
+}
+
+/// The type of the stream an `Other` start reports.
+fn other(started: Started) -> (StreamType<Value>, VarIntField<VarInt>) {
+    match started {
+        Started::Other { stream_type, field } => (stream_type, field),
+        started => panic!("{started:?}"),
+    }
 }
 
 #[test]
@@ -34,12 +88,24 @@ fn the_four_types_of_http3_and_qpack_are_known() {
         (0x03, Http3StreamType::Qpack(QpackStreamType::Decoder)),
     ];
     for (byte, stream_type) in expected {
-        let head = read(&[byte, 0xaa]).unwrap().unwrap();
-        assert_eq!(
-            head.stream_type(),
-            StreamType::Known(Coproduct::Inl(stream_type))
-        );
-        assert_eq!(head.field().get().get(), u64::from(byte));
+        // A push stream has its Push ID after the type.
+        let started = read(&[byte, 0x09, 0xaa]).unwrap().unwrap();
+        let kind = FrameStreamKind::Unidirectional(VarInt::from_u32(u32::from(byte)));
+        match (stream_type, started) {
+            (Http3StreamType::Control, Started::Control(stream)) => {
+                assert_eq!(stream, FrameStream::new(kind, Role::Client));
+            }
+            (Http3StreamType::Push, Started::Push { push_id, stream }) => {
+                assert_eq!(push_id.get().get().get(), 9);
+                assert_eq!(stream, FrameStream::new(kind, Role::Client));
+            }
+            (Http3StreamType::Qpack(_), started) => {
+                let (read_type, field) = other(started);
+                assert_eq!(read_type, StreamType::Known(Coproduct::Inl(stream_type)));
+                assert_eq!(field.get().get(), u64::from(byte));
+            }
+            (_, started) => panic!("{stream_type:?}: {started:?}"),
+        }
         assert_eq!(stream_type.value().get(), u64::from(byte));
         assert_eq!(
             Http3StreamType::of(VarInt::from_u32(u32::from(byte))),
@@ -64,11 +130,14 @@ fn other_and_reserved_types_are_unknown() {
         (&[0xff; 8], (1 << 62) - 1),
     ];
     for (wire, value) in cases {
-        let head = read(wire).unwrap().unwrap();
-        assert_eq!(
-            head.stream_type(),
-            StreamType::Unknown(VarInt::new(value).unwrap())
-        );
+        for role in [Role::Client, Role::Server] {
+            let (stream_type, field) = other(read_as(wire, role).unwrap().unwrap());
+            assert_eq!(
+                stream_type,
+                StreamType::Unknown(VarInt::new(value).unwrap())
+            );
+            assert_eq!(field.get().get(), value);
+        }
     }
 }
 
@@ -77,51 +146,113 @@ fn an_empty_stream_has_no_type_and_a_cut_type_is_an_error() {
     assert!(read(&[]).unwrap().is_none());
     for wire in [&[0x40][..], &[0x80, 0, 0], &[0xc0, 0, 0, 0]] {
         let error = read(wire).unwrap_err();
-        assert!(error.is_incomplete(), "{error:?}");
-        assert!(error.completed() > 0);
+        assert!(
+            matches!(&error, ReadUnidirectionalStreamError::Type { source }
+                if source.is_incomplete() && source.completed() > 0),
+            "{error:?}"
+        );
+        // A receiver tolerates a stream that ends inside the type.
+        assert_eq!(error.error_code(), None);
     }
 }
 
 #[test]
-fn the_width_of_the_type_is_kept() {
+fn a_cut_push_id_is_an_error_without_a_code() {
+    for wire in [&[0x01][..], &[0x01, 0x40], &[0x01, 0xc0, 0, 0]] {
+        let error = read(wire).unwrap_err();
+        assert!(
+            matches!(&error, ReadUnidirectionalStreamError::PushId { source }
+                if source.is_incomplete()),
+            "{error:?}"
+        );
+        assert_eq!(error.error_code(), None);
+    }
+}
+
+#[test]
+fn a_server_does_not_accept_a_push_stream() {
+    let error = read_as(&[0x01, 0x00], Role::Server).unwrap_err();
+    assert!(
+        matches!(&error, ReadUnidirectionalStreamError::NotAcceptableByRole { stream_type, role }
+            if *stream_type == Coproduct::Inl(Http3StreamType::Push) && *role == Role::Server),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.error_code(),
+        Some(ErrorCode::H3_STREAM_CREATION_ERROR)
+    );
+    // The other types are accepted by both roles.
+    for byte in [0x00, 0x02, 0x03] {
+        assert!(read_as(&[byte], Role::Server).unwrap().is_some());
+    }
+}
+
+#[test]
+fn the_width_of_the_type_and_of_the_push_id_is_kept() {
     for width in VarIntWidth::ALL {
-        let (bytes, len) = sakuya_var_int::VarIntField::new(VarInt::from_u32(0x02), width)
+        let (bytes, len) = VarIntField::new(VarInt::from_u32(0x02), width)
             .unwrap()
             .to_encoding();
-        let head = read(&bytes[..len]).unwrap().unwrap();
-        assert_eq!(head.field().width(), width);
+        let (stream_type, field) = other(read(&bytes[..len]).unwrap().unwrap());
+        assert_eq!(field.width(), width);
         assert_eq!(
-            head.stream_type(),
+            stream_type,
             StreamType::Known(Coproduct::Inl(Http3StreamType::Qpack(
                 QpackStreamType::Encoder
             )))
         );
+
+        let (bytes, len) = VarIntField::new(PushId::new(VarInt::from_u32(5)), width)
+            .unwrap()
+            .to_encoding();
+        let wire = [&[0x01][..], &bytes[..len]].concat();
+        let Some(Started::Push { push_id, .. }) = read(&wire).unwrap() else {
+            panic!("not a push stream");
+        };
+        assert_eq!(push_id.width(), width);
+        assert_eq!(push_id.get().get().get(), 5);
     }
 }
 
 #[test]
-fn only_the_type_is_consumed() {
-    let mut input = &[0x01, 0x07, 0x08][..];
-    input
-        .sync_read_stream_type_unpin(PhantomData::<Parts>)
-        .unwrap();
+fn only_the_type_and_the_push_id_are_consumed() {
+    let mut input = &[0x02, 0x07, 0x08][..];
+    input.sync_start_unpin(Role::Client).unwrap();
     assert_eq!(input, [0x07, 0x08]);
+    let mut input = &[0x00, 0x07, 0x08][..];
+    input.sync_start_unpin(Role::Client).unwrap();
+    assert_eq!(input, [0x07, 0x08]);
+    let mut input = &[0x01, 0x07, 0x08][..];
+    input.sync_start_unpin(Role::Client).unwrap();
+    assert_eq!(input, [0x08]);
 }
 
 #[test]
 fn a_pending_between_every_byte_changes_nothing() {
     let wire = [0xc0, 0, 0, 0, 0, 0, 0, 0x03, 0x55];
     let mut host = Dribble::new(&wire, 1);
-    let (head, pending) = run(host.read_stream_type_unpin(PhantomData::<Parts>));
-    let head = head.unwrap().unwrap();
-    assert_eq!(head.field().width(), VarIntWidth::Eight);
+    let (started, pending) = run(host.start_unpin(Role::Client));
+    let (stream_type, field) = other(started.unwrap().unwrap());
+    assert_eq!(field.width(), VarIntWidth::Eight);
     assert_eq!(
-        head.stream_type(),
+        stream_type,
         StreamType::Known(Coproduct::Inl(Http3StreamType::Qpack(
             QpackStreamType::Decoder
         )))
     );
     assert!(pending >= 8, "{pending}");
+    assert_eq!(host.rest(), [0x55]);
+
+    // A push stream: the type, then a Push ID in two bytes.
+    let wire = [0x01, 0x40, 0x07, 0x55];
+    let mut host = Dribble::new(&wire, 1);
+    let (started, pending) = run(host.start_unpin(Role::Client));
+    let Some(Started::Push { push_id, .. }) = started.unwrap() else {
+        panic!("not a push stream");
+    };
+    assert_eq!(push_id.width(), VarIntWidth::Two);
+    assert_eq!(push_id.get().get().get(), 7);
+    assert!(pending >= 3, "{pending}");
     assert_eq!(host.rest(), [0x55]);
 }
 

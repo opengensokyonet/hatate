@@ -3,13 +3,11 @@
 mod common;
 
 use common::{Broken, Dribble, run};
-use core::marker::PhantomData;
-use frunk_core::{HList, coproduct::Coproduct};
 use hatate_wire::{
     error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
-        FrameType, FrameWidths, GoawayId, Http3FrameType, PushId,
-        codec::ReadFrameHeadExt as _,
+        FrameWidths, GoawayId, Http3FrameType, PushId,
+        codec::read_frame,
         control::{codec::*, *},
         payload::PayloadError,
     },
@@ -18,7 +16,6 @@ use nitori_call::{ReceiverAccess, call};
 use nitori_io::Read;
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
-type Parts = HList![hatate_wire::Part];
 type E = PayloadError<core::convert::Infallible>;
 
 macro_rules! frame_reader {
@@ -28,16 +25,17 @@ macro_rules! frame_reader {
         async fn $name<F: Read, A: ReceiverAccess<Family = F>>(
             io: &mut A,
         ) -> Result<$frame, ReadIntegerFrameError<PayloadError<F::Error>>> {
-            let Ok(Some(head)) = io.read_frame_head(PhantomData::<Parts>).await else {
+            let Ok(Some(head)) = read_frame(&mut *io).await else {
                 panic!("no frame head");
             };
-            assert_eq!(head.frame_type(), FrameType::Known(Coproduct::Inl($kind)));
-            let mut payload = head.payload();
+            assert_eq!(head.r#type().get(), $kind.value());
+            let widths = head.widths();
+            let mut payload = head.into_payload().into_parts().1;
             let frame = {
                 let mut source = io.compose(&mut payload);
-                source.$method(head.widths()).await?
+                source.$method(widths).await?
             };
-            payload.finish().expect("the payload was read to its end");
+            assert_eq!(payload.remaining(), 0, "the payload was read to its end");
             Ok(frame)
         }
     };

@@ -7,13 +7,10 @@ use common::{Boom, Broken, Dribble, run};
 use core::{future::poll_fn, num::NonZeroUsize, task::Poll};
 use hatate_wire::{
     error_code::{ErrorCode, ErrorCodeOf as _},
-    frame::{
-        codec::{DiscardExt as _, DiscardHostExt as _},
-        payload::{FramePayload, PayloadError, UnfinishedPayloadError},
-    },
+    frame::payload::{FramePayload, PayloadError},
 };
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::{Read, ReadChunk, prelude::*};
+use nitori_io::{Read, ReadChunk, Skip, prelude::*};
 
 /// One read of at most `size` bytes from the payload.
 #[call(sync)]
@@ -84,14 +81,14 @@ async fn lengths<F: Read, A: ReceiverAccess<Family = F>>(
     lengths
 }
 
-/// Discards the rest of the payload.
+/// Skips the rest of the payload.
 #[call(sync)]
-async fn discard_payload<F: Read, A: ReceiverAccess<Family = F>>(
+async fn skip_payload<F: Skip<Count = usize>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     payload: &mut FramePayload,
-) -> Result<u64, PayloadError<F::Error>> {
+) -> Result<(), PayloadError<F::Error>> {
     let mut source = io.compose(payload);
-    source.discard().await
+    source.skip_to_end().await
 }
 
 #[test]
@@ -101,14 +98,13 @@ fn the_payload_ends_where_its_length_ends() {
     assert_eq!(input.sync_read_all_unpin(&mut payload).unwrap(), [1, 2, 3]);
     assert_eq!(input, [4, 5, 6]);
     assert_eq!(payload.remaining(), 0);
-    payload.finish().unwrap();
 }
 
 #[test]
 fn an_empty_payload_reads_nothing_and_is_finished() {
     let mut input = &[9, 9][..];
     let mut payload = FramePayload::new(0);
-    payload.finish().unwrap();
+    assert_eq!(payload.remaining(), 0);
     assert!(input.sync_read_all_unpin(&mut payload).unwrap().is_empty());
     assert_eq!(input, [9, 9]);
 }
@@ -139,7 +135,7 @@ fn chunks_are_cut_at_the_length_and_the_maximum() {
         [vec![1, 2], vec![3, 4], vec![5]]
     );
     assert_eq!(input, [6, 7][..]);
-    payload.finish().unwrap();
+    assert_eq!(payload.remaining(), 0);
 
     let mut input = Bytes::from_static(&[1, 2, 3, 4]);
     let mut payload = FramePayload::new(3);
@@ -173,11 +169,11 @@ fn a_stream_that_ends_inside_the_payload_is_truncated_and_then_failed() {
     );
     let error = input.sync_read_some_unpin(&mut payload, 8).unwrap_err();
     assert!(matches!(error, PayloadError::Failed), "{error:?}");
-    let unfinished = payload.finish().unwrap_err();
-    assert!(
-        matches!(unfinished, UnfinishedPayloadError::Failed { remaining } if remaining.get() == 3),
-        "{unfinished:?}"
-    );
+    // Skipping the rest of a failed payload is the same failure, with the
+    // missing bytes still unconsumed.
+    let error = input.sync_skip_payload_unpin(&mut payload).unwrap_err();
+    assert!(matches!(error, PayloadError::Failed), "{error:?}");
+    assert_eq!(payload.remaining(), 3);
 }
 
 #[test]
@@ -196,9 +192,10 @@ fn truncation_is_reported_for_chunks_with_the_missing_count() {
         .unwrap_err();
     assert!(matches!(error, PayloadError::Failed), "{error:?}");
     assert!(matches!(
-        payload.finish().unwrap_err(),
-        UnfinishedPayloadError::Failed { .. }
+        input.sync_skip_payload_unpin(&mut payload).unwrap_err(),
+        PayloadError::Failed
     ));
+    assert_eq!(payload.remaining(), 3);
 }
 
 #[test]
@@ -213,22 +210,18 @@ fn a_stream_that_ends_at_the_start_of_a_payload_is_truncated() {
 }
 
 #[test]
-fn finish_checks_that_the_payload_was_read_to_its_end() {
-    let mut input = &[1, 2, 3, 4][..];
+fn skipping_takes_the_unread_rest_of_the_payload() {
+    let mut input = &[1, 2, 3, 4, 5][..];
     let mut payload = FramePayload::new(4);
-    let error = payload.finish().unwrap_err();
-    assert!(
-        matches!(error, UnfinishedPayloadError::Unconsumed { remaining } if remaining.get() == 4)
-    );
-    assert_eq!(error.remaining().get(), 4);
+    assert_eq!(payload.remaining(), 4);
     input.sync_read_some_unpin(&mut payload, 3).unwrap();
-    let error = payload.finish().unwrap_err();
-    assert!(
-        matches!(error, UnfinishedPayloadError::Unconsumed { remaining } if remaining.get() == 1)
-    );
-    assert_eq!(error.remaining().get(), 1);
-    input.sync_read_some_unpin(&mut payload, 3).unwrap();
-    payload.finish().unwrap();
+    assert_eq!(payload.remaining(), 1);
+    input.sync_skip_payload_unpin(&mut payload).unwrap();
+    assert_eq!(payload.remaining(), 0);
+    assert_eq!(input, [5]);
+    // Nothing is left to skip, and the stream is not touched.
+    input.sync_skip_payload_unpin(&mut payload).unwrap();
+    assert_eq!(input, [5]);
 }
 
 #[test]
@@ -239,26 +232,30 @@ fn the_exact_length_is_the_remaining_payload() {
 }
 
 #[test]
-fn discard_drops_the_rest_of_the_payload_only() {
+fn skipping_drops_the_rest_of_the_payload_only() {
     let mut input = &[1, 2, 3, 4, 5, 6][..];
     let mut payload = FramePayload::new(5);
     input.sync_read_some_unpin(&mut payload, 2).unwrap();
-    assert_eq!(input.sync_discard_payload_unpin(&mut payload).unwrap(), 3);
+    input.sync_skip_payload_unpin(&mut payload).unwrap();
     assert_eq!(input, [6]);
-    payload.finish().unwrap();
+    assert_eq!(payload.remaining(), 0);
 
     let mut input = &[1, 2][..];
     let mut payload = FramePayload::new(5);
-    let error = input.sync_discard_payload_unpin(&mut payload).unwrap_err();
-    assert!(matches!(error, PayloadError::Truncated { .. }), "{error:?}");
+    let error = input.sync_skip_payload_unpin(&mut payload).unwrap_err();
+    assert!(
+        matches!(error, PayloadError::Truncated { missing } if missing.get() == 3),
+        "{error:?}"
+    );
+    assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
 }
 
 #[test]
-fn discard_on_a_plain_stream_counts_every_byte() {
+fn skipping_a_plain_stream_to_its_end_takes_every_byte() {
     let mut input = &[0; 1000][..];
-    assert_eq!(input.sync_discard_unpin().unwrap(), 1000);
+    input.sync_skip_to_end_unpin().unwrap();
     assert!(input.is_empty());
-    assert_eq!((&[][..]).sync_discard_unpin().unwrap(), 0);
+    (&[][..]).sync_skip_to_end_unpin().unwrap();
 }
 
 #[test]
@@ -270,7 +267,7 @@ fn a_pending_between_every_byte_changes_nothing() {
     assert_eq!(result.unwrap(), [1, 2, 3, 4]);
     assert!(pending >= 4, "{pending}");
     assert_eq!(host.rest(), [5, 6]);
-    payload.finish().unwrap();
+    assert_eq!(payload.remaining(), 0);
 
     let mut host = Dribble::new(&wire[..2], 1);
     let mut payload = FramePayload::new(4);
@@ -311,45 +308,36 @@ fn only_a_truncated_payload_calls_for_a_connection_error() {
 }
 
 #[test]
-fn an_unfinished_payload_says_whether_it_failed() {
-    // Not read: Unconsumed, with the length.
+fn skipping_says_whether_the_payload_failed() {
+    // Partly read: skipping takes the rest.
     let mut input = &[1, 2, 3, 4][..];
     let mut payload = FramePayload::new(4);
     input.sync_read_some_unpin(&mut payload, 1).unwrap();
-    let error = payload.finish().unwrap_err();
-    assert_eq!(
-        error,
-        UnfinishedPayloadError::Unconsumed {
-            remaining: 3.try_into().unwrap()
-        }
-    );
-    assert_eq!(error.remaining().get(), 3);
-    assert_eq!(
-        error.to_string(),
-        "frame payload left with 3 bytes unconsumed"
-    );
+    assert_eq!(payload.remaining(), 3);
+    input.sync_skip_payload_unpin(&mut payload).unwrap();
+    assert_eq!(payload.remaining(), 0);
 
-    // A failure of the stream: Failed, whatever was read before it.
+    // A failure of the stream: skipping is Failed, whatever was read
+    // before it, with the length still unread.
     let mut host = Broken;
     let mut payload = FramePayload::new(4);
     let _ = run(host.read_some_unpin(&mut payload, 4));
-    let error = payload.finish().unwrap_err();
-    assert_eq!(
-        error,
-        UnfinishedPayloadError::Failed {
-            remaining: 4.try_into().unwrap()
-        }
-    );
-    assert_eq!(error.remaining().get(), 4);
-    assert_eq!(
-        error.to_string(),
-        "frame payload failed with 4 bytes unread"
-    );
+    let (result, _) = run(host.skip_payload_unpin(&mut payload));
+    let error = result.unwrap_err();
+    assert!(matches!(error, PayloadError::Failed), "{error:?}");
+    assert_eq!(error.to_string(), "frame payload has already failed");
+    assert_eq!(payload.remaining(), 4);
 
-    // A failure after the payload's bytes were all read does not exist, so
-    // a finished payload is Ok.
+    // A failure of the stream met by the skip itself is the stream's to
+    // report.
+    let mut host = Broken;
+    let mut payload = FramePayload::new(4);
+    let (result, _) = run(host.skip_payload_unpin(&mut payload));
+    assert!(matches!(result, Err(PayloadError::Host { source: Boom })));
+
+    // A payload whose bytes were all read has nothing left to fail on.
     let mut input = &[1][..];
     let mut payload = FramePayload::new(1);
     input.sync_read_all_unpin(&mut payload).unwrap();
-    payload.finish().unwrap();
+    input.sync_skip_payload_unpin(&mut payload).unwrap();
 }

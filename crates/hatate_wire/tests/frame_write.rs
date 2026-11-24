@@ -1,22 +1,59 @@
 //! Writing frames whose payload comes from a source: DATA, HEADERS, unknown
 //! types and PUSH_PROMISE (RFC 9114 §7.1, §7.2.1, §7.2.2, §7.2.5).
+#![feature(impl_trait_in_assoc_type)]
 mod common;
 
 use bytes::Bytes;
 use common::Liar;
-use core::marker::PhantomData;
-use frunk_core::HList;
 use hatate_wire::frame::{
-    FrameType, FrameWidths, Http2FrameType, Http3FrameType, PushId,
+    Frame, FrameWidths, Http2FrameType, PushId,
     codec::{
-        CopyPayloadError, FrameLengthError, ReadFrameHeadHostExt as _, WriteFrameHeadError,
-        WriteFrameHeadHostExt as _, WritePayloadFrameError, WritePayloadFrameHostExt as _,
-        WritePushPromiseFrameError, WritePushPromiseFrameHostExt as _,
+        CopyPayloadError, FrameLengthError, WriteFrameError, WriteFrameExt as _,
+        WriteFrameHeadError, WriteFrameHeadHostExt as _, WritePushPromiseFrameError,
+        WritePushPromiseFrameHostExt as _, read_frame,
     },
 };
+use nitori_call::{ReceiverAccess, call};
+use nitori_io::{ExactLen, Read, Write};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
-type Parts = HList![hatate_wire::Part];
+/// Writes a frame with this Type and Length whose payload comes from the
+/// second receiver of the host, the output being the first.
+#[call(sync)]
+async fn write_payload<R: Read + ExactLen, F: Write>(
+    out: &mut impl ReceiverAccess<Family = F>,
+    payload: &mut impl ReceiverAccess<Family = R>,
+    r#type: VarIntField<VarInt>,
+    length: VarIntField<VarInt>,
+) -> Result<(), WriteFrameError<R::Error, F::Error>>
+where
+    <R as ExactLen>::Length: TryInto<u64>,
+{
+    out.write_frame(Frame::new(r#type, length, payload)).await
+}
+
+/// The Type, Length, widths and unread payload of the frame at the start of
+/// `input`.
+#[call(sync)]
+async fn read_head<F: Read>(
+    io: &mut impl ReceiverAccess<Family = F>,
+) -> (VarIntField<VarInt>, VarIntField<VarInt>, FrameWidths, u64)
+where
+    <F as Read>::Error: core::fmt::Debug,
+{
+    let frame = read_frame(&mut *io).await.unwrap().unwrap();
+    let (r#type, length, widths) = (frame.r#type(), frame.length(), frame.widths());
+    (
+        r#type,
+        length,
+        widths,
+        frame.into_payload().into_parts().1.remaining(),
+    )
+}
+
+fn length_field(value: u64, width: VarIntWidth) -> VarIntField<VarInt> {
+    VarIntField::new(VarInt::new(value).unwrap(), width).unwrap()
+}
 
 fn type_field(value: u32, width: VarIntWidth) -> VarIntField<VarInt> {
     VarIntField::new(VarInt::from_u32(value), width).unwrap()
@@ -33,10 +70,12 @@ fn encoded(value: u64, width: VarIntWidth) -> Vec<u8> {
 fn a_slice_source_gives_type_length_and_payload() {
     let payload = b"hello, world";
     let mut hosts = (Vec::new(), &payload[..]);
-    let length = hosts
-        .sync_write_payload_frame_unpin(type_field(0x00, VarIntWidth::One), VarIntWidth::One)
+    hosts
+        .sync_write_payload_unpin(
+            type_field(0x00, VarIntWidth::One),
+            length_field(12, VarIntWidth::One),
+        )
         .unwrap();
-    assert_eq!(length, 12);
     assert_eq!(hosts.0, [&[0x00, 12][..], payload].concat());
     assert!(hosts.1.is_empty());
 }
@@ -47,10 +86,12 @@ fn a_bytes_source_gives_the_same_frame_at_every_width() {
     for type_width in VarIntWidth::ALL {
         for length_width in [VarIntWidth::Two, VarIntWidth::Four, VarIntWidth::Eight] {
             let mut hosts = (Vec::new(), Bytes::from(payload.clone()));
-            let length = hosts
-                .sync_write_payload_frame_unpin(type_field(0x01, type_width), length_width)
+            hosts
+                .sync_write_payload_unpin(
+                    type_field(0x01, type_width),
+                    length_field(256, length_width),
+                )
                 .unwrap();
-            assert_eq!(length, 256);
             let expected = [
                 encoded(0x01, type_width),
                 encoded(256, length_width),
@@ -60,12 +101,10 @@ fn a_bytes_source_gives_the_same_frame_at_every_width() {
             assert_eq!(hosts.0, expected);
             // And the head reads back with the same widths.
             let mut written = &hosts.0[..];
-            let head = written
-                .sync_read_frame_head_unpin(PhantomData::<Parts>)
-                .unwrap()
-                .unwrap();
-            assert_eq!(head.widths(), FrameWidths::new(type_width, length_width));
-            assert_eq!(head.length().get().get(), 256);
+            let (_, length, widths, remaining) = written.sync_read_head_unpin();
+            assert_eq!(widths, FrameWidths::new(type_width, length_width));
+            assert_eq!(length.get().get(), 256);
+            assert_eq!(remaining, 256);
             assert_eq!(written, &payload[..]);
         }
     }
@@ -75,12 +114,12 @@ fn a_bytes_source_gives_the_same_frame_at_every_width() {
 fn a_payload_longer_than_the_copy_buffer_is_written_whole() {
     let payload: Vec<u8> = (0..5000u32).map(|n| (n % 251) as u8).collect();
     let mut hosts = (Vec::new(), &payload[..]);
-    assert_eq!(
-        hosts
-            .sync_write_payload_frame_unpin(type_field(0x00, VarIntWidth::One), VarIntWidth::Two)
-            .unwrap(),
-        5000
-    );
+    hosts
+        .sync_write_payload_unpin(
+            type_field(0x00, VarIntWidth::One),
+            length_field(5000, VarIntWidth::Two),
+        )
+        .unwrap();
     assert_eq!(hosts.0, [&[0x00, 0x53, 0x88][..], &payload].concat());
 }
 
@@ -88,43 +127,68 @@ fn a_payload_longer_than_the_copy_buffer_is_written_whole() {
 fn an_empty_payload_and_a_type_of_an_extension_are_written() {
     let mut hosts = (Vec::new(), &[][..]);
     hosts
-        .sync_write_payload_frame_unpin(type_field(0x21, VarIntWidth::Two), VarIntWidth::One)
+        .sync_write_payload_unpin(
+            type_field(0x21, VarIntWidth::Two),
+            length_field(0, VarIntWidth::One),
+        )
         .unwrap();
     assert_eq!(hosts.0, [0x40, 0x21, 0x00]);
 }
 
 #[test]
-fn a_length_that_does_not_fit_its_width_is_reported_before_any_byte() {
-    let payload = [0u8; 64];
-    let mut hosts = (Vec::new(), &payload[..]);
-    let error = hosts
-        .sync_write_payload_frame_unpin(type_field(0x00, VarIntWidth::One), VarIntWidth::One)
-        .unwrap_err();
-    assert!(
-        matches!(&error, WritePayloadFrameError::Length {
-            source: FrameLengthError::Width { source }
-        } if source.value().get() == 64 && source.width() == VarIntWidth::One),
-        "{error:?}"
-    );
-    assert!(hosts.0.is_empty());
-    assert_eq!(hosts.1.len(), 64);
+fn a_length_that_does_not_fit_its_width_cannot_be_made() {
+    // 63 is the largest length of one byte; the field cannot hold 64.
+    let error = VarIntField::new(VarInt::from_u32(64), VarIntWidth::One).unwrap_err();
+    assert_eq!(error.value().get(), 64);
+    assert_eq!(error.width(), VarIntWidth::One);
 
-    // 63 is the largest length of one byte.
+    let payload = [0u8; 64];
     let mut hosts = (Vec::new(), &payload[..63]);
     hosts
-        .sync_write_payload_frame_unpin(type_field(0x00, VarIntWidth::One), VarIntWidth::One)
+        .sync_write_payload_unpin(
+            type_field(0x00, VarIntWidth::One),
+            length_field(63, VarIntWidth::One),
+        )
         .unwrap();
     assert_eq!(hosts.0.len(), 2 + 63);
+}
+
+#[test]
+fn a_length_that_is_not_the_payload_length_is_reported_before_any_byte() {
+    let payload = [0u8; 64];
+    for length in [0, 63, 65, 1000] {
+        let mut hosts = (Vec::new(), &payload[..]);
+        let error = hosts
+            .sync_write_payload_unpin(
+                type_field(0x00, VarIntWidth::One),
+                length_field(length, VarIntWidth::Two),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, WriteFrameError::Length { source }
+                if source.length().get() == length && source.payload() == Some(64)),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("frame payload length is not the Length {length}")
+        );
+        assert!(hosts.0.is_empty());
+        assert_eq!(hosts.1.len(), 64);
+    }
 }
 
 #[test]
 fn a_source_shorter_than_its_reported_length_is_reported() {
     let mut hosts = (Vec::new(), Liar::new(&[1, 2, 3, 4], 10));
     let error = hosts
-        .sync_write_payload_frame_unpin(type_field(0x00, VarIntWidth::One), VarIntWidth::One)
+        .sync_write_payload_unpin(
+            type_field(0x00, VarIntWidth::One),
+            length_field(10, VarIntWidth::One),
+        )
         .unwrap_err();
     assert!(
-        matches!(&error, WritePayloadFrameError::Payload {
+        matches!(&error, WriteFrameError::Payload {
             source: CopyPayloadError::ShortSource { missing }
         } if missing.get() == 6),
         "{error:?}"
@@ -155,18 +219,10 @@ fn push_promise_writes_the_push_id_before_the_section() {
             .concat()
         );
         let mut written = &hosts.0[..];
-        let head = written
-            .sync_read_frame_head_unpin(PhantomData::<Parts>)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            head.frame_type(),
-            FrameType::Known(frunk_core::coproduct::Coproduct::Inl(
-                Http3FrameType::PushPromise
-            ))
-        ));
-        assert_eq!(head.length().get().get(), total);
-        assert_eq!(head.payload().remaining(), written.len() as u64);
+        let (r#type, length, _, remaining) = written.sync_read_head_unpin();
+        assert_eq!(r#type.get().get(), 0x05);
+        assert_eq!(length.get().get(), total);
+        assert_eq!(remaining, total);
     }
 }
 
@@ -256,10 +312,13 @@ fn a_payload_frame_of_a_type_of_http2_is_refused_before_any_byte() {
         for width in VarIntWidth::ALL {
             let mut hosts = (Vec::new(), &payload[..]);
             let error = hosts
-                .sync_write_payload_frame_unpin(type_field(value, width), VarIntWidth::One)
+                .sync_write_payload_unpin(
+                    type_field(value, width),
+                    length_field(7, VarIntWidth::One),
+                )
                 .unwrap_err();
             assert!(
-                matches!(&error, WritePayloadFrameError::Head {
+                matches!(&error, WriteFrameError::Head {
                     source: WriteFrameHeadError::Http2Type { source }
                 } if source.frame_type() == frame_type),
                 "{error:?}"
