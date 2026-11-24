@@ -258,9 +258,13 @@ fn integer_state_and_budget_survive_pending_between_every_octet() {
     assert_eq!(host.input, [0x48]);
 }
 
-/// Drops the read after `polls` pending polls, then asks again.
+/// Drops the read after `polls` pending polls, then asks again: the
+/// instruction, or `None` if the stream was left interrupted.
 #[call(sync)]
-async fn dropped_read<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A, polls: usize) -> bool {
+async fn dropped_read<F: Read, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    polls: usize,
+) -> Option<D> {
     use core::{
         future::{Future, poll_fn},
         pin::pin,
@@ -277,35 +281,54 @@ async fn dropped_read<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A, polls:
         })
         .await;
     }
-    matches!(
-        stream.next_instruction(8).await,
-        Err(ReadError::Interrupted)
-    )
+    match stream.next_instruction(8).await {
+        Ok(instruction) => Some(instruction.unwrap()),
+        Err(ReadError::Interrupted) => None,
+        Err(_) => panic!("a read failed other than by interruption"),
+    }
+}
+
+/// Drives the call to completion, whatever the host makes it wait for.
+fn finish<T>(call: impl core::future::Future<Output = T>) -> T {
+    use core::{
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+    let mut call = pin!(call);
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..64 {
+        if let Poll::Ready(value) = call.as_mut().poll(&mut cx) {
+            return value;
+        }
+    }
+    panic!("the call did not finish");
 }
 
 #[test]
-fn dropped_read_interrupts_even_before_the_first_octet() {
-    use core::{
-        future::Future,
-        pin::{Pin, pin},
-        task::{Context, Poll, Waker},
-    };
+fn dropped_read_before_the_first_octet_leaves_the_stream_at_the_boundary() {
+    use core::pin::Pin;
     use nitori_call::CallExecutor;
 
-    // One poll: the host has not produced the opcode yet. Two: the opcode is
-    // consumed and a continuation is awaited. Both leave the stream
-    // interrupted (a known, conservative behavior for the first case).
-    for polls in [1, 2, 3] {
+    let read_after = |polls| {
         let mut host = Fragmented {
             input: &[0xff, 0x80, 0, 0x48],
             waiting: false,
         };
-        let mut call = pin!(CallExecutor::execute(
+        finish(CallExecutor::execute(
             Pin::new(&mut host),
-            DroppedRead::new(polls)
-        ));
-        let mut cx = Context::from_waker(Waker::noop());
-        assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(true), "{polls}");
+            DroppedRead::new(polls),
+        ))
+    };
+    let section_127 = Some(D::SectionAcknowledgment(StreamId::try_from(127).unwrap()));
+    // No poll, or one in which the host has not produced the opcode yet:
+    // nothing was read, so the next call reads the instruction as if the
+    // first had not been made.
+    assert_eq!(read_after(0), section_127);
+    assert_eq!(read_after(1), section_127);
+    // Once the opcode is consumed, a dropped read leaves the stream
+    // interrupted.
+    for polls in [2, 3] {
+        assert_eq!(read_after(polls), None, "{polls}");
     }
 }
 

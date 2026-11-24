@@ -439,6 +439,12 @@ fn expected_unidirectional(
             None,
         ),
         0 => match head(after, 1, receiver) {
+            // The first frame of a control stream is SETTINGS (RFC 9114
+            // §6.2.1).
+            Ok((_, first)) if first.frame_type != 0x04 => (
+                failed("part", Some(ErrorCode::H3_MISSING_SETTINGS)),
+                None,
+            ),
             Ok((used, first)) => (
                 Ok(Some(Started::Control(field, first))),
                 Some(length + used),

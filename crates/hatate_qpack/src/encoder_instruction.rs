@@ -41,6 +41,8 @@ pub enum NameReference {
 /// finished, because it failed or because it or the call reading it was
 /// dropped, leaves the stream interrupted: what is left of the instruction is
 /// never skipped, since the dynamic table would no longer match the peer's.
+/// A call dropped before the first octet of an instruction has read nothing
+/// and leaves the stream at the boundary.
 /// An interrupted stream reports an error on every later instruction and is
 /// abandoned; [`into_io`](Self::into_io) gives the access back.
 #[derive(Debug)]
@@ -92,18 +94,20 @@ where
         if self.state == StreamState::Interrupted {
             return Err(codec::StartError::Interrupted);
         }
-        // Until the instruction is complete, dropping this call or the state
-        // it returns leaves the stream interrupted.
-        self.state = StreamState::Interrupted;
+        // A call dropped before the first octet has read nothing: the stream
+        // stays at the boundary.
         let mut wire = WireBudget::new(max_wire_len);
         let first = match crate::instruction::octet(&mut self.io, &mut wire).await {
             Ok(first) => first,
-            Err(error) if error.ended_before_first_octet() => {
-                self.state = StreamState::Boundary;
-                return Ok(None);
+            Err(error) if error.ended_before_first_octet() => return Ok(None),
+            Err(source) => {
+                self.state = StreamState::Interrupted;
+                return Err(codec::StartError::Prefix { source });
             }
-            Err(source) => return Err(codec::StartError::Prefix { source }),
         };
+        // Until the instruction is complete, dropping this call or the state
+        // it returns leaves the stream interrupted.
+        self.state = StreamState::Interrupted;
         let head = codec::read_head(&mut self.io, &mut wire, max_decoded_len, first).await?;
         Ok(Some(match head {
             codec::Head::Capacity(n) => {

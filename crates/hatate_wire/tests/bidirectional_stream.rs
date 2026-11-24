@@ -813,6 +813,8 @@ fn the_parts_of_http3_judge_each_class_by_its_own_rules() {
             Yes(_)
         ));
     }
+    // The types of HTTP/2, PUSH_PROMISE, which a server does not receive,
+    // and the frames of HTTP/3 for other streams are errors.
     for value in [2, 3, 4, 5, 6, 7, 8, 9, 0x0d] {
         assert_eq!(
             judge::<ClientInitiatedBidirectional, L>(value),

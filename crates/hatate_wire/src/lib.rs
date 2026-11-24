@@ -32,8 +32,8 @@
 //! read: the bytes the stream handed over stay consumed, and a
 //! [`FramePayload`](frame::payload::FramePayload) counts them, but the
 //! integer or setting they began is lost. Reading cannot resume from there;
-//! the stream is inside the object. The same holds for a frame dropped
-//! before it is finished ([`frame::Frame`]).
+//! the stream is inside the object. A frame needs no finishing: the next
+//! frame of a [`FrameStream`](stream::FrameStream) skips what is left of it.
 //!
 //! [RFC 9114]: https://www.rfc-editor.org/rfc/rfc9114.html
 //! [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9
@@ -55,7 +55,6 @@ mod part;
 pub mod parts;
 pub mod registry;
 pub mod settings;
-#[allow(missing_docs)] // The capability macro also generates extension trait items.
 pub mod stream;
 pub mod stream_type;
 

@@ -13,7 +13,7 @@ use crate::{
     Part, Role,
     error_code::{ErrorCode, ErrorCodeOf},
     frame::{
-        Frame, FrameType, Http2FrameType, PushId,
+        Frame, FrameType, Http2FrameType, Http3FrameType, PushId,
         codec::ReadFrameHeadError,
         payload::FramePayload,
         set::{FrameKind, FrameSetOn},
@@ -26,7 +26,7 @@ use hatate_qpack::{
     decoder_instruction::codec::ReadError as DecoderInstructionError,
     encoder_instruction::{
         codec::{LiteralHeaderError, StartError, ValueError},
-        literal::{HuffmanReadError, InputError},
+        literal::{FinishError, HuffmanReadError, InputError},
     },
     huffman::DecodeError,
     instruction::{NumberError, OctetError},
@@ -281,6 +281,27 @@ qpack_error_code!(
 );
 qpack_error_code!(DecoderStreamError, "QPACK_DECODER_STREAM_ERROR": DecoderInstructionError);
 
+/// QPACK_ENCODER_STREAM_ERROR for a Huffman literal whose ending cannot be
+/// interpreted ([RFC 9204 §6]); `None` for a literal left unread or already
+/// failed, and a limit of this endpoint.
+///
+/// [RFC 9204 §6]: https://www.rfc-editor.org/rfc/rfc9204.html#section-6
+impl ErrorCodeOf<ErrorCode> for FinishError {
+    fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Coding {
+                source:
+                    DecodeError::EndOfString | DecodeError::ExcessPadding | DecodeError::InvalidPadding,
+            } => Some(QpackErrorCode::EncoderStreamError.into()),
+            Self::Coding {
+                source: DecodeError::ReserveOutput { .. } | DecodeError::OutputTooLong { .. },
+            }
+            | Self::Unread
+            | Self::Failed => None,
+        }
+    }
+}
+
 /// A control stream of the peer ([RFC 9114 §6.2.1]), which is critical: it
 /// is read through [`CriticalStream`], so its end, at a frame boundary or
 /// inside a frame, is a failure of the stream with the code
@@ -317,8 +338,7 @@ where
     Composed<I, CriticalStream>: ReceiverAccess<Family: Read>,
 {
     /// The current frame, as [`FrameStream::frame`] gives it. The first one
-    /// is required to be SETTINGS ([RFC 9114 §6.2.1]), which the connection
-    /// checks.
+    /// is SETTINGS ([RFC 9114 §6.2.1]): the stream is read only if it is.
     ///
     /// [RFC 9114 §6.2.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
     pub fn frame(&mut self) -> ControlFrame<'_, L, I> {
@@ -436,6 +456,17 @@ pub enum Http3UnidirectionalStreamError<E> {
         /// failure of the stream, [`CriticalStreamError::Closed`].
         source: ReadFrameHeadError<CriticalStreamError<E>>,
     },
+    /// The first frame of a control stream is not SETTINGS ([RFC 9114
+    /// §6.2.1]).
+    ///
+    /// [RFC 9114 §6.2.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
+    #[snafu(display(
+        "the first frame of a control stream has the type {frame_type:?}, not SETTINGS"
+    ))]
+    MissingSettings {
+        /// The type of the first frame.
+        frame_type: VarInt,
+    },
     /// The Push ID of a push stream could not be read.
     #[snafu(display("could not read the push ID of a push stream"))]
     PushId {
@@ -453,13 +484,15 @@ pub enum Http3UnidirectionalStreamError<E> {
     PushEnded,
 }
 
-/// H3_CLOSED_CRITICAL_STREAM for a control stream that ended; the code of a
-/// frame head that was rejected or cut short. `None` when the stream fails,
+/// H3_CLOSED_CRITICAL_STREAM for a control stream that ended, and
+/// H3_MISSING_SETTINGS for one whose first frame is not SETTINGS; the code of
+/// a frame head that was rejected or cut short. `None` when the stream fails,
 /// or a push stream ends before its frames, which a receiver tolerates.
 impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for Http3UnidirectionalStreamError<E> {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Control { source } => source.error_code(),
+            Self::MissingSettings { .. } => Some(ErrorCode::H3_MISSING_SETTINGS),
             Self::Push { source } => source.error_code(),
             Self::PushId { source } => source.host_error().and_then(ErrorCodeOf::error_code),
             Self::PushEnded => None,
@@ -481,15 +514,28 @@ where
     L: FrameSetOn<ControlStreamKind> + FrameSetOn<PushStreamKind>,
     I: ReceiverAccess<Family: Read>,
 {
-    use http3_unidirectional_stream_error::{ControlSnafu, PushIdSnafu, PushSnafu};
+    use http3_unidirectional_stream_error::{
+        ControlSnafu, MissingSettingsSnafu, PushIdSnafu, PushSnafu,
+    };
     Ok(match stream_type {
-        Http3StreamType::Control => Http3UnidirectionalStream::Control(ControlStream {
+        Http3StreamType::Control => {
             // invariant: a critical stream reports its end as a failure.
-            frames: FrameStream::read(Composed::new(io, CriticalStream), role)
-                .await
-                .context(ControlSnafu)?
-                .expect("a critical stream does not end"),
-        }),
+            let frames: FrameStream<L, ControlStreamKind, _> =
+                FrameStream::read(Composed::new(io, CriticalStream), role)
+                    .await
+                    .context(ControlSnafu)?
+                    .expect("a critical stream does not end");
+            // The first frame is SETTINGS; a reserved or unknown one is not.
+            let settings = Http3FrameType::Settings.value();
+            if !matches!(frames.r#type.get(), FrameType::Known(known) if known.value() == settings)
+            {
+                return MissingSettingsSnafu {
+                    frame_type: frames.r#type.to_var_int(),
+                }
+                .fail();
+            }
+            Http3UnidirectionalStream::Control(ControlStream { frames })
+        }
         Http3StreamType::Push => {
             let push_id = io
                 .read_var_int_field::<PushId>()
@@ -554,9 +600,10 @@ unidirectional_part!(ServerInitiatedUnidirectional, StreamVerdict::Claimed);
 /// first frame that is not reserved has a type the list has on request
 /// streams ([RFC 9114 §6.1]); HTTP/3 does not take a stream that starts with
 /// any other frame, so an application that reads such frames adds the part
-/// that has them on request streams. A type of HTTP/2, or one a part claims
-/// for other streams, is a connection error of type H3_FRAME_UNEXPECTED, as
-/// is a frame type the server does not receive.
+/// that has them on request streams. A type of HTTP/2, a frame type of
+/// HTTP/3 for other streams, or one the server does not receive, is a
+/// connection error of type H3_FRAME_UNEXPECTED; so is a frame type another
+/// part has for other streams, unless a part claims the stream.
 ///
 /// [RFC 9114 §6.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.1
 impl<L: FrameSetOn<RequestStreamKind>> StreamPart<ClientInitiatedBidirectional, L> for Part {
@@ -572,8 +619,14 @@ impl<L: FrameSetOn<RequestStreamKind>> StreamPart<ClientInitiatedBidirectional, 
         match <L as FrameSetOn<RequestStreamKind>>::FrameType::of(value) {
             Some(frame_type) if frame_type.receivable_by(receiver) => StreamVerdict::Claimed(()),
             Some(_) => StreamVerdict::Error(ErrorCode::H3_FRAME_UNEXPECTED),
-            None if L::FRAME_TYPES.contains(value) => {
+            // A frame of HTTP/3 for other streams.
+            None if Http3FrameType::of(value).is_some() => {
                 StreamVerdict::Error(ErrorCode::H3_FRAME_UNEXPECTED)
+            }
+            // Another part may take a stream that starts with a frame of its
+            // own, as WebTransport does with 0x41.
+            None if L::FRAME_TYPES.contains(value) => {
+                StreamVerdict::ErrorUnlessClaimed(ErrorCode::H3_FRAME_UNEXPECTED)
             }
             None => StreamVerdict::NotClaimed,
         }

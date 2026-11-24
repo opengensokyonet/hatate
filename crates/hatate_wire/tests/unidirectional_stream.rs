@@ -452,15 +452,21 @@ fn the_first_frame_of_a_control_stream_is_checked_for_the_stream_and_the_receive
         }
     }
     // MAX_PUSH_ID is received by a server only, and the stream a client
-    // opened is received by one.
+    // opened is received by one: its head is accepted there, and it is not
+    // SETTINGS (see `control_stream.rs`). The client rejects the head.
     let wire = [0x00, 0x0d, 0x01, 0x00];
     let (started, _) = read_from_client(&wire, false);
-    assert!(matches!(started, Ok(Some(Started::Control { .. }))));
+    let Failed::Part { code, name } = started.unwrap_err() else {
+        panic!("not a failure of the part");
+    };
+    assert_eq!(code, Some(ErrorCode::H3_MISSING_SETTINGS));
+    assert!(name.contains("MissingSettings"), "{name}");
     let (started, _) = read_from_server(&wire, false);
-    let Failed::Part { code, .. } = started.unwrap_err() else {
+    let Failed::Part { code, name } = started.unwrap_err() else {
         panic!("not a failure of the part");
     };
     assert_eq!(code, Some(ErrorCode::H3_FRAME_UNEXPECTED));
+    assert!(name.contains("Control"), "{name}");
 }
 
 #[test]

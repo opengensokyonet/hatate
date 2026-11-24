@@ -8,20 +8,17 @@ use nitori_call::{ReceiverAccess, call};
 use nitori_io::{calls::WriteAllError, prelude::*};
 use snafu::{ResultExt, Snafu};
 
-/// Read exactly one RFC 9204 §4.4 instruction: the step
+/// Read the rest of one RFC 9204 §4.4 instruction whose first octet `first`
+/// was read: the step
 /// [`DecoderStream::next_instruction`](super::DecoderStream::next_instruction)
-/// takes. The limit counts the first octet and all continuations. EOF before
-/// the opcode is a prefix error; EOF inside a number is attributed to that
-/// instruction's field.
+/// takes after the first octet. `budget` has already counted the first
+/// octet. EOF inside a number is attributed to that instruction's field.
 #[call(sync)]
 pub(crate) async fn read_decoder_instruction<F: Read, A: ReceiverAccess<Family = F>>(
     io: &mut A,
-    max_wire_len: usize,
+    mut budget: WireBudget,
+    first: u8,
 ) -> Result<DecoderInstruction, ReadError<F::Error>> {
-    let mut budget = WireBudget::new(max_wire_len);
-    let first = instruction::octet(io, &mut budget)
-        .await
-        .context(PrefixSnafu)?;
     Ok(match first {
         0x80..=0xff => {
             let value = instruction::number::<7, F>(io, &mut budget, first)

@@ -1,5 +1,8 @@
 //! Instructions on the QPACK decoder stream (RFC 9204 §4.4).
-use crate::encoder_instruction::StreamState;
+use crate::{
+    encoder_instruction::StreamState,
+    instruction::{self, WireBudget},
+};
 use core::num::NonZeroU64;
 use nitori_call::ReceiverAccess;
 use nitori_io::Read;
@@ -46,8 +49,9 @@ impl StreamIdError {
 ///
 /// It is made at an instruction boundary and reads nothing until asked for
 /// the next instruction. Each instruction is read whole and handed over by
-/// value. An instruction that fails, or whose read is dropped after it
-/// began, leaves the stream interrupted: it reports an error on every later
+/// value. A read dropped before the first octet of an instruction has read
+/// nothing and leaves the stream at the boundary. An instruction that fails,
+/// or whose read is dropped after it began, leaves the stream interrupted: it reports an error on every later
 /// instruction and is abandoned; [`into_io`](Self::into_io) gives the access
 /// back.
 #[derive(Debug)]
@@ -87,18 +91,21 @@ where
         if self.state == StreamState::Interrupted {
             return Err(codec::ReadError::Interrupted);
         }
+        // A call dropped before the first octet has read nothing: the stream
+        // stays at the boundary.
+        let mut budget = WireBudget::new(max_wire_len);
+        let first = match instruction::octet(&mut self.io, &mut budget).await {
+            Ok(first) => first,
+            Err(source) if source.ended_before_first_octet() => return Ok(None),
+            Err(source) => {
+                self.state = StreamState::Interrupted;
+                return Err(codec::ReadError::Prefix { source });
+            }
+        };
         self.state = StreamState::Interrupted;
-        match codec::read_decoder_instruction(&mut self.io, max_wire_len).await {
-            Ok(instruction) => {
-                self.state = StreamState::Boundary;
-                Ok(Some(instruction))
-            }
-            Err(codec::ReadError::Prefix { source }) if source.ended_before_first_octet() => {
-                self.state = StreamState::Boundary;
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
+        let instruction = codec::read_decoder_instruction(&mut self.io, budget, first).await?;
+        self.state = StreamState::Boundary;
+        Ok(Some(instruction))
     }
 }
 

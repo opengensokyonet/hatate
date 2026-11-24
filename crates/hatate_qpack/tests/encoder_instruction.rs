@@ -701,9 +701,14 @@ fn zero_budget_failure_interrupts_without_reading() {
     assert_eq!(input, [2, 0x20]);
 }
 
-/// Drops the call after `polls` pending polls, then asks again.
+/// Drops the call after `polls` pending polls, then asks again: the
+/// capacity the next instruction sets, or `None` if the stream was left
+/// interrupted.
 #[call(sync)]
-async fn dropped_start<F: Read>(io: &mut impl ReceiverAccess<Family = F>, polls: usize) -> bool
+async fn dropped_start<F: Read>(
+    io: &mut impl ReceiverAccess<Family = F>,
+    polls: usize,
+) -> Option<u64>
 where
     <F as Read>::Error: Debug,
 {
@@ -723,24 +728,23 @@ where
         })
         .await;
     }
-    matches!(
-        reader.next_instruction(8, 8).await,
-        Err(StartError::Interrupted)
-    )
+    match reader.next_instruction(8, 8).await {
+        Ok(Some(Started::SetDynamicTableCapacity(capacity))) => Some(capacity),
+        Err(StartError::Interrupted) => None,
+        _ => panic!("the next instruction was not a capacity or an interruption"),
+    }
 }
 
 #[test]
-fn dropped_call_interrupts_even_before_the_first_octet() {
+fn dropped_call_before_the_first_octet_leaves_the_stream_at_the_boundary() {
     use core::{
         future::Future,
         pin::{Pin, pin},
         task::{Context, Poll, Waker},
     };
     use nitori_call::CallExecutor;
-    // One poll: the opcode has not arrived. Two and three: the opcode is
-    // consumed and a continuation is awaited. All leave the stream
-    // interrupted (a known, conservative behavior for the first case).
-    for polls in [1, 2, 3] {
+
+    let read_after = |polls| {
         let mut host = Trickle {
             rest: &[0x3f, 0xbd, 0x01, 0x20],
             waiting: false,
@@ -750,7 +754,22 @@ fn dropped_call_interrupts_even_before_the_first_octet() {
             DroppedStart::new(polls)
         ));
         let mut cx = Context::from_waker(Waker::noop());
-        assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(true), "{polls}");
+        for _ in 0..64 {
+            if let Poll::Ready(value) = call.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+        panic!("the call did not finish");
+    };
+    // No poll, or one in which the opcode has not arrived: nothing was read,
+    // so the next call reads the instruction as if the first had not been
+    // made.
+    assert_eq!(read_after(0), Some(220));
+    assert_eq!(read_after(1), Some(220));
+    // Once the opcode is consumed, a dropped call leaves the stream
+    // interrupted.
+    for polls in [2, 3] {
+        assert_eq!(read_after(polls), None, "{polls}");
     }
 }
 

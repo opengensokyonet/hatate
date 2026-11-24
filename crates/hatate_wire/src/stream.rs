@@ -34,7 +34,7 @@ use core::marker::PhantomData;
 use frunk_core::coproduct::{CNil, Coproduct};
 use kind::StreamKind;
 use nitori_call::{Composed, ReceiverAccess};
-use nitori_io::{Infinite, Min, Read, Skip, prelude::*};
+use nitori_io::{Infinite, Min, Read, Skip, adapters::ReadLimit, prelude::*};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth, VarIntWidthError};
 use snafu::Snafu;
 
@@ -57,16 +57,19 @@ pub mod part;
 /// The frame [`frame`](Self::frame) gives borrows the stream, so its payload
 /// is read before the next frame is: [`next_frame`](Self::next_frame) skips
 /// what is left of it. Skipping resumes where it stopped if the call is
-/// dropped; reading the head of the next frame does not, and a stream whose
-/// next head was not read whole, because the call was dropped or the head was
-/// rejected, is interrupted and is abandoned. [`into_io`](Self::into_io)
-/// gives the access back.
+/// dropped, and so does a call dropped before it read any byte of the next
+/// head. A stream whose next head was begun but not read whole, because the
+/// call was dropped or the head was rejected, is interrupted and is
+/// abandoned. [`into_io`](Self::into_io) gives the access back.
 pub struct FrameStream<L: FrameSetOn<K>, K: StreamKind, I> {
     io: I,
     role: Role,
     r#type: VarIntField<FrameType<L::FrameType>>,
     length: VarIntField<VarInt>,
     payload: FramePayload,
+    /// What may still be read of the next head: unlimited, and unchanged
+    /// until a byte of it is read.
+    head: ReadLimit<u64>,
     state: FrameStreamState,
     marker: PhantomData<fn() -> (L, K)>,
 }
@@ -76,9 +79,13 @@ pub struct FrameStream<L: FrameSetOn<K>, K: StreamKind, I> {
 enum FrameStreamState {
     /// Inside the current frame.
     InFrame,
+    /// At the boundary after the current frame, reading the head of the
+    /// next one: nothing of it is read while `head` is unchanged.
+    AtHead,
     /// The stream ended at the boundary after the current frame.
     Ended,
-    /// Reading the head of the next frame did not complete.
+    /// Skipping the payload failed, or the head of the next frame was begun
+    /// and not read whole.
     Interrupted,
 }
 
@@ -162,6 +169,7 @@ impl<L: FrameSetOn<K>, K: StreamKind, I: ReceiverAccess<Family: Read>> FrameStre
             r#type,
             payload: FramePayload::new(length.get().get()),
             length,
+            head: ReadLimit(u64::MAX),
             state: FrameStreamState::InFrame,
             marker: PhantomData,
         }
@@ -252,19 +260,26 @@ where
     /// Moves to the next frame; `false` at the end of the stream.
     async fn advance(&mut self) -> Result<bool, NextFrameError<<I::Family as Read>::Error>> {
         match self.state {
-            FrameStreamState::InFrame => {}
+            FrameStreamState::InFrame => {
+                // A dropped skip resumes: the payload counts what it skipped.
+                let mut payload = Composed::new(&mut self.io, &mut self.payload);
+                if let Err(source) = payload.skip_to_end().await {
+                    self.state = FrameStreamState::Interrupted;
+                    return Err(NextFrameError::Skip { source });
+                }
+                self.head = ReadLimit(u64::MAX);
+                self.state = FrameStreamState::AtHead;
+            }
+            // A dropped read of the head that read nothing of it starts over.
+            FrameStreamState::AtHead if self.head.0 == u64::MAX => {}
+            FrameStreamState::AtHead | FrameStreamState::Interrupted => {
+                self.state = FrameStreamState::Interrupted;
+                return Err(NextFrameError::Interrupted);
+            }
             FrameStreamState::Ended => return Ok(false),
-            FrameStreamState::Interrupted => return Err(NextFrameError::Interrupted),
         }
-        // A dropped skip resumes: the payload counts what it skipped.
-        let mut payload = Composed::new(&mut self.io, &mut self.payload);
-        if let Err(source) = payload.skip_to_end().await {
-            self.state = FrameStreamState::Interrupted;
-            return Err(NextFrameError::Skip { source });
-        }
-        // Until the head is read whole, the stream is inside it.
-        self.state = FrameStreamState::Interrupted;
-        match read_head::<L, K, I>(&mut self.io, self.role).await {
+        let mut head = Composed::new(&mut self.io, &mut self.head);
+        match read_head::<L, K, _>(&mut head, self.role).await {
             Ok(Some((r#type, length))) => {
                 self.r#type = r#type;
                 self.length = length;
@@ -276,7 +291,10 @@ where
                 self.state = FrameStreamState::Ended;
                 Ok(false)
             }
-            Err(source) => Err(NextFrameError::Head { source }),
+            Err(source) => {
+                self.state = FrameStreamState::Interrupted;
+                Err(NextFrameError::Head { source })
+            }
         }
     }
 }

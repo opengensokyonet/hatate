@@ -401,7 +401,7 @@ fn next_frame_dropped_in_the_middle_never_passes_what_it_reached() {
 }
 
 #[test]
-fn next_frame_dropped_while_skipping_resumes_and_while_reading_a_head_is_interrupted() {
+fn next_frame_dropped_before_the_first_byte_of_a_head_resumes_and_after_it_is_interrupted() {
     for polls in 0..60 {
         let mut host = Dribble::new(&FRAMES, 1);
         let (dropped, _) = run(host.drop_next_unpin(vec![polls], false));
@@ -414,9 +414,11 @@ fn next_frame_dropped_while_skipping_resumes_and_while_reading_a_head_is_interru
             // The second frame was reached before the drop.
             assert_eq!(*step, Step::Frame(known(Http3FrameType::Headers), 1));
             assert_eq!(resumed.rest, [0xaa, 0xbb]);
-        } else if consumed < FIRST_END {
-            // The drop was in the middle of skipping the first payload: the
-            // next call skips what is left, and reads the second frame.
+        } else if consumed <= FIRST_END {
+            // The drop was in the middle of skipping the first payload, or
+            // at its end before the first byte of the next head: nothing of
+            // the head was read, so the next call skips what is left and
+            // reads the second frame, as if the first had not been made.
             assert_eq!(
                 *step,
                 Step::Frame(known(Http3FrameType::Headers), 1),
@@ -424,9 +426,9 @@ fn next_frame_dropped_while_skipping_resumes_and_while_reading_a_head_is_interru
             );
             assert_eq!(resumed.rest, [0xaa, 0xbb]);
         } else {
-            // The drop was in the head of the second frame, even before its
-            // first byte: the stream is abandoned, and the access is where
-            // the dropped call left it.
+            // The drop was in the head of the second frame, after its first
+            // byte: the stream is abandoned, and the access is where the
+            // dropped call left it.
             assert_eq!(
                 *step,
                 Step::Interrupted,
@@ -438,7 +440,7 @@ fn next_frame_dropped_while_skipping_resumes_and_while_reading_a_head_is_interru
 }
 
 #[test]
-fn next_frame_dropped_twice_in_the_middle_of_skipping_still_resumes() {
+fn next_frame_dropped_twice_before_the_first_byte_of_a_head_still_resumes() {
     for first in 0..14 {
         for second in 0..14 {
             let drops = vec![first, second];
@@ -454,7 +456,7 @@ fn next_frame_dropped_twice_in_the_middle_of_skipping_still_resumes() {
                 FIRST_END.saturating_sub(consumed) as u64
             };
             assert_eq!(dropped.remaining, expected, "{first} {second}");
-            if dropped.completed || consumed < FIRST_END {
+            if dropped.completed || consumed <= FIRST_END {
                 assert_eq!(
                     step,
                     Step::Frame(known(Http3FrameType::Headers), 1),
@@ -466,6 +468,36 @@ fn next_frame_dropped_twice_in_the_middle_of_skipping_still_resumes() {
             }
         }
     }
+}
+
+#[test]
+fn a_next_frame_dropped_at_the_boundary_gives_what_one_never_dropped_gives() {
+    let (undropped, _) = run(Dribble::new(&FRAMES, 1).drop_next_unpin(vec![], true));
+    assert_eq!(
+        undropped.step,
+        Some(Step::Frame(known(Http3FrameType::Headers), 1))
+    );
+    let mut boundary_drops = 0;
+    for polls in 0..60 {
+        let mut host = Dribble::new(&FRAMES, 1);
+        let (dropped, _) = run(host.drop_next_unpin(vec![polls], false));
+        if consumed(&host) != FIRST_END {
+            continue;
+        }
+        // The payload is skipped and no byte of the head was read.
+        boundary_drops += 1;
+        let (resumed, _) = run(Dribble::new(&FRAMES, 1).drop_next_unpin(vec![polls], true));
+        assert_eq!(resumed.step, undropped.step, "polls {polls}");
+        assert_eq!(resumed.rest, undropped.rest, "polls {polls}");
+        assert!(!dropped.completed);
+    }
+    // The host suspends before each byte, so some polls end exactly there.
+    assert!(boundary_drops > 0);
+    // After the first byte of the head, the drop is an interruption.
+    let mut host = Dribble::new(&FRAMES, 1);
+    let (dropped, _) = run(host.drop_next_unpin(vec![FIRST_END - FIRST_HEAD_END + 2], true));
+    assert_eq!(dropped.step, Some(Step::Interrupted));
+    assert_eq!(dropped.rest, &FRAMES[FIRST_END + 1..]);
 }
 
 /// Skips the rest of the payload of the first frame, dropping the skip

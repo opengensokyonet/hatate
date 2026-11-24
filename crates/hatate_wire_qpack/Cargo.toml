@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
-description = "QPACK's entries in the HTTP/3 registries: settings, stream types and error codes"
+description = "QPACK's entries in the HTTP/3 registries: settings, stream types and error codes, and the critical QPACK streams"
 
 [dependencies]
 bytes.workspace = true

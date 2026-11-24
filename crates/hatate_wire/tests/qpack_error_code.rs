@@ -78,8 +78,8 @@ macro_rules! encoder_ended {
                     if let Err(code) = read {
                         break Err(code);
                     }
-                    if value.finish().is_err() {
-                        break Err(None);
+                    if let Err(error) = value.finish() {
+                        break Err(error.error_code());
                     }
                 }
                 Started::InsertWithLiteralName(mut name) => {
@@ -96,8 +96,9 @@ macro_rules! encoder_ended {
                     if let Err(code) = read {
                         break Err(code);
                     }
-                    let Ok(start) = name.finish() else {
-                        break Err(None);
+                    let start = match name.finish() {
+                        Ok(start) => start,
+                        Err(error) => break Err(error.error_code()),
                     };
                     let mut value = match run(start.open()).0 {
                         Ok(value) => value,
@@ -116,8 +117,8 @@ macro_rules! encoder_ended {
                     if let Err(code) = read {
                         break Err(code);
                     }
-                    if value.finish().is_err() {
-                        break Err(None);
+                    if let Err(error) = value.finish() {
+                        break Err(error.error_code());
                     }
                 }
             }
@@ -216,6 +217,82 @@ fn an_instruction_that_cannot_be_interpreted_is_an_encoder_stream_error() {
         assert_eq!(plain, Err(encoder_error()), "{name}: not critical");
         assert_eq!(critical, Err(encoder_error()), "{name}: critical");
     }
+}
+
+/// Which literal of an insertion with a literal name `finish` is asked of.
+#[derive(Clone, Copy)]
+enum Literal {
+    Name,
+    Value,
+}
+
+/// Reads `take` bytes of the literal `which` of the insertion in `wire`
+/// (the name of which is raw, if the value is asked for), and the code of
+/// the failure of finishing it. The literal is read to its decoded length and
+/// no further, so a Huffman ending that is not valid is found by `finish`.
+fn finish_code(wire: &[u8], which: Literal, take: usize) -> Option<ErrorCode> {
+    let mut reader = EncoderStream::new(ConstructedAccess::new(wire));
+    let Some(Started::InsertWithLiteralName(mut name)) = plain!(reader, 64, 64).unwrap() else {
+        panic!("not an insertion with a literal name");
+    };
+    let read = |source: LiteralSource<'_, _>, take| match source {
+        LiteralSource::Raw(mut source) => run(read_some(&mut source, take)).0.unwrap().len(),
+        LiteralSource::Huffman(mut source) => run(read_some(&mut source, take)).0.unwrap().len(),
+    };
+    match which {
+        Literal::Name => {
+            assert_eq!(read(name.source(), take), take);
+            name.finish().err().expect("finish fails").error_code()
+        }
+        Literal::Value => {
+            assert_eq!(read(name.source(), 1), 1);
+            let mut value = run(name.finish().unwrap().open()).0.unwrap();
+            if take > 0 {
+                assert_eq!(read(value.source(), take), take);
+            }
+            value.finish().expect_err("finish fails").error_code()
+        }
+    }
+}
+
+#[test]
+fn a_huffman_ending_found_only_by_finish_is_an_encoder_stream_error() {
+    // Each literal is one octet of Huffman code, read to its decoded length
+    // of one byte: 'a' is 00011, so the padding after it is 000, which is
+    // not the prefix of the EOS code; a second octet of ones is more
+    // than seven bits of padding.
+    let invalid_name = [0x61, 0x18];
+    let excess_name = [0x62, 0x1f, 0xff];
+    let invalid_value = [0x41, b'x', 0x81, 0x18];
+    let excess_value = [0x41, b'x', 0x82, 0x1f, 0xff];
+    assert_eq!(
+        finish_code(&invalid_name, Literal::Name, 1),
+        encoder_error()
+    );
+    assert_eq!(finish_code(&excess_name, Literal::Name, 1), encoder_error());
+    assert_eq!(
+        finish_code(&invalid_value, Literal::Value, 1),
+        encoder_error()
+    );
+    assert_eq!(
+        finish_code(&excess_value, Literal::Value, 1),
+        encoder_error()
+    );
+}
+
+#[test]
+fn a_literal_left_unread_has_no_code_when_finished() {
+    // Raw and Huffman, a name and a value, with a byte of each unread.
+    assert_eq!(finish_code(&[0x42, b'x', b'y'], Literal::Name, 1), None);
+    assert_eq!(finish_code(&[0x62, 0x1f, 0xff], Literal::Name, 0), None);
+    assert_eq!(
+        finish_code(&[0x41, b'x', 0x02, b'a', b'b'], Literal::Value, 1),
+        None
+    );
+    assert_eq!(
+        finish_code(&[0x41, b'x', 0x81, 0x1f], Literal::Value, 0),
+        None
+    );
 }
 
 #[test]

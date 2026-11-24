@@ -1,6 +1,9 @@
 //! Hosts shared by the integration tests.
 #![allow(dead_code)]
 
+#[macro_use]
+pub mod receiver_layer;
+
 use bytes::BufMut;
 use core::{
     convert::Infallible,

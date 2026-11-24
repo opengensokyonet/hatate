@@ -30,7 +30,8 @@ pub enum StreamVerdict<T> {
     Error(ErrorCode),
     /// A connection error with this code, unless another part claims the
     /// value; HTTP/3 gives it on server-initiated bidirectional streams,
-    /// which extensions may use.
+    /// which extensions may use, and on a client-initiated one that starts
+    /// with a frame type another part has for other streams.
     ErrorUnlessClaimed(ErrorCode),
 }
 
@@ -57,6 +58,14 @@ pub trait StreamPart<C: StreamClass, L> {
     /// The verdict on `value` at the start of a stream of class `C`.
     /// `skipped` tells whether reserved frames preceded it, on a
     /// bidirectional stream.
+    ///
+    /// A part gives [`StreamVerdict::Claimed`] or [`StreamVerdict::Error`]
+    /// only for values of its own: on a unidirectional stream the stream
+    /// types it declares ([`StreamTypePart::STREAM_TYPES`]), on a
+    /// bidirectional one frame types it declares or values no other part
+    /// declares. The list does not check this.
+    ///
+    /// [`StreamTypePart::STREAM_TYPES`]: crate::stream_type::StreamTypePart::STREAM_TYPES
     fn judge(value: VarInt, skipped: bool) -> StreamVerdict<Self::Claimed>;
 
     /// Reads what follows the value `claimed`, read as `field`, from `io`,
