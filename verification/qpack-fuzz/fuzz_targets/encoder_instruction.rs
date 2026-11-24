@@ -7,7 +7,8 @@ use bytes::{Buf, BufMut};
 use core::num::NonZeroUsize;
 use hatate_qpack::{
     encoder_instruction::{
-        NameReference, Reader, Started,
+        EncoderStream, NameReference, Started,
+        codec::StartError,
         literal::LiteralSource,
         write::{Payload, Writer},
     },
@@ -91,15 +92,38 @@ where
     Some(out)
 }
 
-#[call(sync)]
-async fn parse<F: ReadChunk, A: ReceiverAccess<Family = F>>(
-    io: &mut A,
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The stream ended at the instruction boundary.
+    End,
+    Item(Parsed),
+    Failed,
+}
+
+async fn one<A: ReceiverAccess>(
+    stream: &mut EncoderStream<A>,
     wire: usize,
     decoded: usize,
     block: NonZeroUsize,
-) -> Option<Parsed> {
-    let mut reader = Reader::new(io);
-    let start = reader.start(wire, decoded).await.ok()?;
+) -> Outcome
+where
+    A::Family: ReadChunk,
+{
+    let start = match stream.next_instruction(wire, decoded).await {
+        Ok(Some(start)) => start,
+        Ok(None) => return Outcome::End,
+        Err(_) => return Outcome::Failed,
+    };
+    match item(start, block).await {
+        Some(parsed) => Outcome::Item(parsed),
+        None => Outcome::Failed,
+    }
+}
+
+async fn item<A: ReceiverAccess>(start: Started<'_, A>, block: NonZeroUsize) -> Option<Parsed>
+where
+    A::Family: ReadChunk,
+{
     match start {
         Started::SetDynamicTableCapacity(n) => Some(Parsed::Capacity(n)),
         Started::Duplicate(n) => Some(Parsed::Duplicate(n)),
@@ -117,6 +141,25 @@ async fn parse<F: ReadChunk, A: ReceiverAccess<Family = F>>(
             Some(Parsed::Literal(key, data))
         }
     }
+}
+
+#[call(sync)]
+async fn parse<F: ReadChunk, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    wire: usize,
+    decoded: usize,
+    block: NonZeroUsize,
+) -> Outcome {
+    let mut stream = EncoderStream::new(io);
+    let outcome = one(&mut stream, wire, decoded, block).await;
+    if outcome == Outcome::Failed {
+        // A failed or unfinished instruction leaves the stream interrupted.
+        assert!(matches!(
+            stream.next_instruction(wire, decoded).await,
+            Err(StartError::Interrupted)
+        ));
+    }
+    outcome
 }
 
 #[call(sync)]
@@ -210,13 +253,24 @@ fuzz_target!(|data: &[u8]| {
         let expected = reference(&mut bounded, decoded);
         let mut input = src;
         let actual = input.sync_parse_unpin(wire, decoded, block);
-        assert_eq!(actual, expected);
+        // The stream is not empty, so it cannot end at the boundary.
+        assert_eq!(
+            actual,
+            expected.map_or(Outcome::Failed, Outcome::Item)
+        );
         assert!(before.len() - input.len() <= size);
-        if actual.is_none() {
-            break;
+        if actual == Outcome::Failed {
+            return;
         }
         assert_eq!(input.len(), before.len() - (size - bounded.len()));
         assert!(input.len() < before.len());
         src = input;
+    }
+    // Every instruction was taken: the end is at the boundary.
+    if wire > 0 {
+        assert_eq!(
+            (&[][..]).sync_parse_unpin(wire, decoded, block),
+            Outcome::End
+        );
     }
 });

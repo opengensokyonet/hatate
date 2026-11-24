@@ -4,7 +4,7 @@ use core::fmt::Debug;
 use core::num::NonZeroUsize;
 use hatate_qpack::{
     encoder_instruction::{
-        NameReference, Reader, Started,
+        EncoderStream, NameReference, Started,
         codec::{LiteralHeaderError, StartError, ValueError},
         literal::{FinishError, HuffmanReadError, InputError, LiteralSource},
     },
@@ -18,8 +18,10 @@ async fn insertion<F: ReadChunk, A: ReceiverAccess<Family = F>>(io: &mut A, bad:
 where
     <F as Read>::Error: Debug,
 {
-    let mut reader = Reader::new(io);
-    let Started::InsertWithLiteralName(mut name) = reader.start(4, 2).await.unwrap() else {
+    let mut reader = EncoderStream::new(io);
+    let Started::InsertWithLiteralName(mut name) =
+        reader.next_instruction(4, 2).await.unwrap().unwrap()
+    else {
         panic!()
     };
     {
@@ -58,13 +60,13 @@ where
             })
         ));
         assert!(matches!(
-            reader.start(8, 8).await,
-            Err(StartError::NotAtBoundary)
+            reader.next_instruction(8, 8).await,
+            Err(StartError::Interrupted)
         ));
     } else {
         value.finish().unwrap();
         assert!(matches!(
-            reader.start(1, 0).await.unwrap(),
+            reader.next_instruction(1, 0).await.unwrap().unwrap(),
             Started::Duplicate(0)
         ));
     }
@@ -85,8 +87,10 @@ async fn unread<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A, drop_name: b
 where
     <F as Read>::Error: Debug,
 {
-    let mut reader = Reader::new(io);
-    let Started::InsertWithLiteralName(name) = reader.start(32, 32).await.unwrap() else {
+    let mut reader = EncoderStream::new(io);
+    let Started::InsertWithLiteralName(name) =
+        reader.next_instruction(32, 32).await.unwrap().unwrap()
+    else {
         panic!()
     };
     if drop_name {
@@ -95,8 +99,8 @@ where
         assert!(matches!(name.finish(), Err(FinishError::Unread)))
     }
     assert!(matches!(
-        reader.start(32, 32).await,
-        Err(StartError::NotAtBoundary)
+        reader.next_instruction(32, 32).await,
+        Err(StartError::Interrupted)
     ));
 }
 
@@ -114,8 +118,12 @@ async fn limits<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A, wire: usize,
 where
     <F as Read>::Error: Debug,
 {
-    let mut reader = Reader::new(io);
-    let Started::InsertWithLiteralName(mut name) = reader.start(wire, decoded).await.unwrap()
+    let mut reader = EncoderStream::new(io);
+    let Started::InsertWithLiteralName(mut name) = reader
+        .next_instruction(wire, decoded)
+        .await
+        .unwrap()
+        .unwrap()
     else {
         panic!()
     };
@@ -180,15 +188,15 @@ async fn reference<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A, truncated
 where
     <F as Read>::Error: Debug,
 {
-    let mut reader = Reader::new(io);
+    let mut reader = EncoderStream::new(io);
     assert!(matches!(
-        reader.start(3, 0).await.unwrap(),
+        reader.next_instruction(3, 0).await.unwrap().unwrap(),
         Started::SetDynamicTableCapacity(220)
     ));
     let Started::InsertWithNameReference {
         name: NameReference::Static(index),
         value,
-    } = reader.start(64, 64).await.unwrap()
+    } = reader.next_instruction(64, 64).await.unwrap().unwrap()
     else {
         panic!()
     };
@@ -262,8 +270,10 @@ where
     <F as Read>::Error: Debug,
 {
     use nitori_io::adapters::ReadLimit;
-    let mut reader = Reader::new(io);
-    let Started::InsertWithLiteralName(mut name) = reader.start(16, 16).await.unwrap() else {
+    let mut reader = EncoderStream::new(io);
+    let Started::InsertWithLiteralName(mut name) =
+        reader.next_instruction(16, 16).await.unwrap().unwrap()
+    else {
         panic!()
     };
     {
@@ -283,7 +293,7 @@ where
     assert_eq!(raw.read_array::<1>().await.unwrap(), *b"x");
     value.finish().unwrap();
     assert!(matches!(
-        reader.start(1, 0).await.unwrap(),
+        reader.next_instruction(1, 0).await.unwrap().unwrap(),
         Started::Duplicate(0)
     ));
 }
@@ -322,11 +332,11 @@ async fn raw_chunks<F: ReadChunk, A: ReceiverAccess<Family = F>>(
 where
     <F as Read>::Error: Debug,
 {
-    let mut reader = Reader::new(io);
+    let mut reader = EncoderStream::new(io);
     let Started::InsertWithNameReference {
         name: NameReference::Relative(0),
         value,
-    } = reader.start(5, 3).await.unwrap()
+    } = reader.next_instruction(5, 3).await.unwrap().unwrap()
     else {
         panic!()
     };
@@ -367,9 +377,11 @@ where
     F::Error: Debug,
     G::Error: Debug,
 {
-    let mut reader = Reader::new(input);
+    let mut reader = EncoderStream::new(input);
     let mut writer = Writer::new(output);
-    let Started::InsertWithLiteralName(mut name) = reader.start(256, 256).await.unwrap() else {
+    let Started::InsertWithLiteralName(mut name) =
+        reader.next_instruction(256, 256).await.unwrap().unwrap()
+    else {
         panic!("expected literal name")
     };
     let pending = {
@@ -660,7 +672,38 @@ fn pending_on_both_sides_does_not_repeat_octets_or_restart_huffman_state() {
 }
 
 #[call(sync)]
-async fn retry_before_opcode<F: Read>(io: &mut impl ReceiverAccess<Family = F>)
+async fn zero_budget<F: Read>(io: &mut impl ReceiverAccess<Family = F>)
+where
+    <F as Read>::Error: Debug,
+{
+    let mut reader = EncoderStream::new(io);
+    assert!(matches!(
+        reader.next_instruction(0, 0).await,
+        Err(StartError::Prefix {
+            source: hatate_qpack::instruction::OctetError::WireLimit { .. }
+        })
+    ));
+    // The failed call left the stream interrupted.
+    assert!(matches!(
+        reader.next_instruction(1, 0).await,
+        Err(StartError::Interrupted)
+    ));
+    assert!(matches!(
+        reader.next_instruction(1, 0).await,
+        Err(StartError::Interrupted)
+    ));
+}
+
+#[test]
+fn zero_budget_failure_interrupts_without_reading() {
+    let mut input = &[2, 0x20][..];
+    input.sync_zero_budget_unpin();
+    assert_eq!(input, [2, 0x20]);
+}
+
+/// Drops the call after `polls` pending polls, then asks again.
+#[call(sync)]
+async fn dropped_start<F: Read>(io: &mut impl ReceiverAccess<Family = F>, polls: usize) -> bool
 where
     <F as Read>::Error: Debug,
 {
@@ -669,55 +712,139 @@ where
         pin::pin,
         task::Poll,
     };
-    let mut reader = Reader::new(io);
-    assert!(matches!(
-        reader.start(0, 0).await,
-        Err(StartError::Prefix {
-            source: hatate_qpack::instruction::OctetError::WireLimit { .. }
-        })
-    ));
+    let mut reader = EncoderStream::new(io);
     {
-        // The Trickle host's first read waits without advancing its cursor.
-        let mut first = pin!(reader.start(1, 0));
+        let mut first = pin!(reader.next_instruction(8, 8));
         poll_fn(|cx| {
-            assert!(first.as_mut().poll(cx).is_pending());
+            for _ in 0..polls {
+                assert!(first.as_mut().poll(cx).is_pending());
+            }
             Poll::Ready(())
         })
         .await;
     }
-    assert!(matches!(
-        reader.start(1, 0).await.unwrap(),
-        Started::Duplicate(2)
-    ));
+    matches!(
+        reader.next_instruction(8, 8).await,
+        Err(StartError::Interrupted)
+    )
 }
 
 #[test]
-fn zero_budget_and_cancelled_first_read_preserve_boundary() {
+fn dropped_call_interrupts_even_before_the_first_octet() {
     use core::{
         future::Future,
         pin::{Pin, pin},
         task::{Context, Poll, Waker},
     };
     use nitori_call::CallExecutor;
-    let mut host = Trickle {
-        rest: &[2, 0x20],
-        waiting: false,
-    };
-    {
+    // One poll: the opcode has not arrived. Two and three: the opcode is
+    // consumed and a continuation is awaited. All leave the stream
+    // interrupted (a known, conservative behavior for the first case).
+    for polls in [1, 2, 3] {
+        let mut host = Trickle {
+            rest: &[0x3f, 0xbd, 0x01, 0x20],
+            waiting: false,
+        };
         let mut call = pin!(CallExecutor::execute(
             Pin::new(&mut host),
-            RetryBeforeOpcode::new()
+            DroppedStart::new(polls)
         ));
         let mut cx = Context::from_waker(Waker::noop());
-        assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(()));
+        assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(true), "{polls}");
     }
-    assert_eq!(host.rest, [0x20]);
+}
+
+/// What each of `count` successive instructions came to.
+#[call(sync)]
+async fn walk<F: Read, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    count: usize,
+) -> Vec<&'static str> {
+    let mut stream = EncoderStream::new(io);
+    let mut outcomes = Vec::new();
+    for _ in 0..count {
+        outcomes.push(match stream.next_instruction(64, 64).await {
+            Ok(None) => "end",
+            Ok(Some(Started::SetDynamicTableCapacity(_))) => "capacity",
+            Ok(Some(Started::Duplicate(_))) => "duplicate",
+            Ok(Some(_)) => "insertion",
+            Err(StartError::Interrupted) => "interrupted",
+            Err(_) => "error",
+        });
+    }
+    outcomes
+}
+
+#[test]
+fn stream_ending_at_a_boundary_gives_none() {
+    let mut empty = &[][..];
+    assert_eq!(empty.sync_walk_unpin(2), ["end", "end"]);
+    // Instructions and then the end.
+    let mut input = &[0x02, 0x3f, 0xbd, 0x01][..];
+    assert_eq!(
+        input.sync_walk_unpin(4),
+        ["duplicate", "capacity", "end", "end"]
+    );
+    assert!(input.is_empty());
+}
+
+#[test]
+fn unfinished_failed_or_truncated_instruction_interrupts_the_stream() {
+    // The end inside a number: an error, not the end.
+    let mut input = &[0x02, 0x3f][..];
+    assert_eq!(
+        input.sync_walk_unpin(4),
+        ["duplicate", "error", "interrupted", "interrupted"]
+    );
+    // An insertion state dropped unread.
+    let mut input = &[0x41, b'x', 0x02][..];
+    assert_eq!(
+        input.sync_walk_unpin(3),
+        ["insertion", "interrupted", "interrupted"]
+    );
+    assert_eq!(input, [b'x', 0x02]);
+}
+
+#[call(sync)]
+async fn handed_back<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> [&'static str; 4] {
+    let mut stream = EncoderStream::new(io);
+    let first = match stream.next_instruction(64, 64).await {
+        Ok(Some(Started::Duplicate(2))) => "duplicate",
+        _ => "other",
+    };
+    let mut stream = EncoderStream::new(stream.into_io());
+    // This one fails on its wire limit before the opcode is read; the
+    // interrupted stream still gives the access back.
+    let second = match stream.next_instruction(0, 0).await {
+        Err(StartError::Prefix { .. }) => "limit error",
+        _ => "other",
+    };
+    let third = match stream.next_instruction(64, 64).await {
+        Err(StartError::Interrupted) => "interrupted",
+        _ => "other",
+    };
+    let mut stream = EncoderStream::new(stream.into_io());
+    let fourth = match stream.next_instruction(64, 64).await {
+        Ok(Some(Started::SetDynamicTableCapacity(32))) => "capacity",
+        _ => "other",
+    };
+    [first, second, third, fourth]
+}
+
+#[test]
+fn into_io_gives_back_the_access_at_the_cursor() {
+    let mut input = &[0x02, 0x3f, 0x01, 0x20][..];
+    assert_eq!(
+        input.sync_handed_back_unpin(),
+        ["duplicate", "limit error", "interrupted", "capacity"]
+    );
+    assert_eq!(input, [0x20]);
 }
 
 #[call(sync)]
 async fn short_insertion<F: Read>(io: &mut impl ReceiverAccess<Family = F>, limit: usize) -> u128 {
-    let mut reader = Reader::new(io);
-    match reader.start(limit, usize::MAX).await {
+    let mut reader = EncoderStream::new(io);
+    match reader.next_instruction(limit, usize::MAX).await {
         Err(StartError::WireLimit { source }) => {
             assert_eq!(source.limit(), limit);
             source.required()

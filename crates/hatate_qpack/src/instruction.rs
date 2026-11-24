@@ -74,6 +74,14 @@ pub enum OctetError<E> {
     },
 }
 
+impl<E> OctetError<E> {
+    /// Whether the stream ended cleanly before this octet, with nothing of it
+    /// read: at an instruction boundary, the end of the stream.
+    pub(crate) fn ended_before_first_octet(&self) -> bool {
+        matches!(self, Self::Read { source: ReadArrayError::Incomplete { source } } if source.completed() == 0)
+    }
+}
+
 pub(crate) async fn octet<F: Read>(
     io: &mut impl ReceiverAccess<Family = F>,
     budget: &mut WireBudget,

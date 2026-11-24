@@ -1,14 +1,37 @@
 //! Check opcode dispatch, wire budget, cursor movement and canonical writing.
 #![no_main]
+#![feature(impl_trait_in_assoc_type)]
 use core::num::NonZeroU64;
 use hatate_qpack::{
     decoder_instruction::{
-        DecoderInstruction as D, StreamId,
-        codec::{ReadDecoderInstructionHostExt, WriteDecoderInstructionHostExt},
+        DecoderInstruction as D, DecoderStream, StreamId,
+        codec::{ReadError, WriteDecoderInstructionHostExt},
     },
     integer,
 };
 use libfuzzer_sys::fuzz_target;
+use nitori_call::{ReceiverAccess, call};
+use nitori_io::Read;
+
+/// One instruction from a fresh stream; after a failure the same stream must
+/// report the interruption.
+#[call(sync)]
+async fn read_one<F: Read, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    max_wire_len: usize,
+) -> Result<Option<D>, ()> {
+    let mut stream = DecoderStream::new(io);
+    match stream.next_instruction(max_wire_len).await {
+        Ok(instruction) => Ok(instruction),
+        Err(_) => {
+            assert!(matches!(
+                stream.next_instruction(max_wire_len).await,
+                Err(ReadError::Interrupted)
+            ));
+            Err(())
+        }
+    }
+}
 
 fn reference(first: u8, rest: &mut &[u8]) -> Option<D> {
     match first {
@@ -37,19 +60,21 @@ fuzz_target!(|data: &[u8]| {
             bounded = tail;
             reference(first, &mut bounded)
         });
-        let actual = stream.sync_read_decoder_instruction_unpin(budget).ok();
-        assert_eq!(actual, expected);
+        let actual = stream.sync_read_one_unpin(budget);
+        // The stream is not empty, so it cannot end at the boundary.
+        assert_eq!(actual, expected.map(Some).ok_or(()));
         assert_eq!(stream.len(), before.len() - (available - bounded.len()));
-        let Some(instruction) = actual else { break };
+        let Ok(Some(instruction)) = actual else {
+            return;
+        };
         let mut encoded = Vec::new();
         encoded
             .sync_write_decoder_instruction_unpin(instruction, budget)
             .unwrap();
         let mut replay = encoded.as_slice();
-        assert_eq!(
-            replay.sync_read_decoder_instruction_unpin(budget).unwrap(),
-            instruction
-        );
+        assert_eq!(replay.sync_read_one_unpin(budget), Ok(Some(instruction)));
+        // The end after the instruction is at the boundary.
+        assert_eq!(replay.sync_read_one_unpin(budget), Ok(None));
         assert!(replay.is_empty());
         let mut short = vec![0xa5];
         assert!(
@@ -58,5 +83,8 @@ fuzz_target!(|data: &[u8]| {
                 .is_err()
         );
         assert_eq!(short, [0xa5]);
+    }
+    if budget > 0 {
+        assert_eq!((&[][..]).sync_read_one_unpin(budget), Ok(None));
     }
 });

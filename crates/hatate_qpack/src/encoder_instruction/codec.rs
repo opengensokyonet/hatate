@@ -77,8 +77,10 @@ pub enum StartError<E> {
     /// The name payload and the value prefix have not been consumed.
     #[snafu(transparent)]
     WireLimit { source: WireLimitError },
+    /// An earlier instruction was not finished, or failed: the stream is
+    /// inside it and is abandoned.
     #[snafu(display("encoder stream is inside an unfinished or failed instruction"))]
-    NotAtBoundary,
+    Interrupted,
     #[snafu(display("could not read encoder instruction prefix"))]
     Prefix { source: OctetError<E> },
     #[snafu(display("invalid dynamic table capacity encoding"))]

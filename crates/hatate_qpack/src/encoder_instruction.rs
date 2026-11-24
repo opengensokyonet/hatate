@@ -1,7 +1,8 @@
 //! Instructions sent on the QPACK encoder stream (RFC 9204 §4.3).
 //!
-//! Inside a `nitori_call` operation, create a [`Reader`] over the current
-//! access. Start an instruction and match its state. For a literal name,
+//! Inside a `nitori_call` operation, create an [`EncoderStream`] over the
+//! current access, at an instruction boundary. Take the next instruction and
+//! match its state. For a literal name,
 //! borrow [`Name::source`] and read it to its boundary. [`Name::finish`]
 //! validates the ending and releases a [`ValueStart`]. Open and consume the
 //! value in the same way. Commit an insertion only after [`Value::finish`]
@@ -31,51 +32,86 @@ pub enum NameReference {
     Relative(u64),
 }
 
-/// Sequential access to one encoder stream from within a call. Create this
-/// reader at an instruction boundary and retain it for the parsing loop.
-/// On error or cancellation after the opcode has been consumed, abandon the stream: dropping an
-/// unfinished state never consumes, skips, or reinterprets its remaining data.
-pub struct Reader<A> {
+/// One encoder stream, read instruction by instruction from within a call.
+///
+/// It is made at an instruction boundary and reads nothing until asked for
+/// the next instruction: a peer that does not use the dynamic table may never
+/// send one. An insertion borrows the stream until its value is finished, so
+/// the next instruction cannot be read before. An instruction that is not
+/// finished, because it failed or because it or the call reading it was
+/// dropped, leaves the stream interrupted: what is left of the instruction is
+/// never skipped, since the dynamic table would no longer match the peer's.
+/// An interrupted stream reports an error on every later instruction and is
+/// abandoned; [`into_io`](Self::into_io) gives the access back.
+#[derive(Debug)]
+pub struct EncoderStream<A> {
     io: A,
-    at_boundary: bool,
+    state: StreamState,
 }
 
-impl<A: ReceiverAccess> Reader<A>
+/// Where an instruction stream is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamState {
+    /// At an instruction boundary.
+    Boundary,
+    /// Inside an instruction that was not finished, or one that failed.
+    Interrupted,
+}
+
+impl<A: ReceiverAccess> EncoderStream<A>
 where
     A::Family: Read,
 {
-    /// Take ownership of an access or an exclusive borrow of it.
+    /// The stream on `io`, an access or an exclusive borrow of one, at an
+    /// instruction boundary. Nothing is read.
     pub fn new(io: A) -> Self {
         Self {
             io,
-            at_boundary: true,
+            state: StreamState::Boundary,
         }
     }
 
-    /// Start exactly one instruction. Numeric instructions finish here.
-    /// Insertions lend this reader to their first state. Limits apply to all
-    /// wire octets and to the sum of the decoded literal octets, respectively.
-    pub async fn start(
+    /// Reads the start of the next instruction. Numeric instructions finish
+    /// here. Insertions lend this stream to their first state. Limits apply to
+    /// all wire octets and to the sum of the decoded literal octets,
+    /// respectively.
+    ///
+    /// Returns `None` if the stream ends at the instruction boundary. Whether
+    /// that is an error is a question for the stream's place in the connection.
+    ///
+    /// # Errors
+    ///
+    /// [`StartError`](codec::StartError); after any of them, and after
+    /// [`StartError::Interrupted`](codec::StartError::Interrupted) itself, the
+    /// stream is interrupted.
+    pub async fn next_instruction(
         &mut self,
         max_wire_len: usize,
         max_decoded_len: usize,
-    ) -> Result<Started<'_, A>, codec::StartError<<A::Family as Read>::Error>> {
-        if !self.at_boundary {
-            return Err(codec::StartError::NotAtBoundary);
+    ) -> Result<Option<Started<'_, A>>, codec::StartError<<A::Family as Read>::Error>> {
+        if self.state == StreamState::Interrupted {
+            return Err(codec::StartError::Interrupted);
         }
+        // Until the instruction is complete, dropping this call or the state
+        // it returns leaves the stream interrupted.
+        self.state = StreamState::Interrupted;
         let mut wire = WireBudget::new(max_wire_len);
-        let first = crate::instruction::octet(&mut self.io, &mut wire)
-            .await
-            .map_err(|source| codec::StartError::Prefix { source })?;
-        self.at_boundary = false;
+        let first = match crate::instruction::octet(&mut self.io, &mut wire).await {
+            Ok(first) => first,
+            Err(error) if error.ended_before_first_octet() => {
+                self.state = StreamState::Boundary;
+                return Ok(None);
+            }
+            Err(source) => return Err(codec::StartError::Prefix { source }),
+        };
         let head = codec::read_head(&mut self.io, &mut wire, max_decoded_len, first).await?;
-        Ok(match head {
+        Ok(Some(match head {
             codec::Head::Capacity(n) => {
-                self.at_boundary = true;
+                self.state = StreamState::Boundary;
                 Started::SetDynamicTableCapacity(n)
             }
             codec::Head::Duplicate(n) => {
-                self.at_boundary = true;
+                self.state = StreamState::Boundary;
                 Started::Duplicate(n)
             }
             codec::Head::Reference(name) => Started::InsertWithNameReference {
@@ -96,7 +132,14 @@ where
                 },
                 literal: name,
             }),
-        })
+        }))
+    }
+}
+
+impl<A> EncoderStream<A> {
+    /// The access, giving up the stream.
+    pub fn into_io(self) -> A {
+        self.io
     }
 }
 
@@ -119,7 +162,7 @@ pub enum Started<'s, A: ReceiverAccess> {
 }
 
 struct Context<'s, A> {
-    reader: &'s mut Reader<A>,
+    reader: &'s mut EncoderStream<A>,
     wire: WireBudget,
     decoded_left: usize,
 }
@@ -187,7 +230,7 @@ impl<A: ReceiverAccess> Value<'_, A> {
     /// Validate the consumed value's ending and enable the next instruction.
     pub fn finish(self) -> Result<(), FinishError> {
         self.literal.finish()?;
-        self.ctx.reader.at_boundary = true;
+        self.ctx.reader.state = StreamState::Boundary;
         Ok(())
     }
 }

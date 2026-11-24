@@ -8,13 +8,13 @@ use nitori_call::{ReceiverAccess, call};
 use nitori_io::{calls::WriteAllError, prelude::*};
 use snafu::{ResultExt, Snafu};
 
-/// Read exactly one RFC 9204 §4.4 instruction. The limit counts the first
-/// octet and all continuations. EOF before the opcode is a prefix error;
-/// EOF inside a number is attributed to that instruction's field.
-/// Resume the same future across waits. If it is dropped after consuming an
-/// octet, abandon the input stream: the cursor may point to a continuation.
+/// Read exactly one RFC 9204 §4.4 instruction: the step
+/// [`DecoderStream::next_instruction`](super::DecoderStream::next_instruction)
+/// takes. The limit counts the first octet and all continuations. EOF before
+/// the opcode is a prefix error; EOF inside a number is attributed to that
+/// instruction's field.
 #[call(sync)]
-pub async fn read_decoder_instruction<F: Read, A: ReceiverAccess<Family = F>>(
+pub(crate) async fn read_decoder_instruction<F: Read, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     max_wire_len: usize,
 ) -> Result<DecoderInstruction, ReadError<F::Error>> {
@@ -67,6 +67,10 @@ pub enum ReadError<E> {
     IncrementNumber { source: NumberError<E> },
     #[snafu(display("insert count increment is zero"))]
     ZeroIncrement,
+    /// An earlier instruction failed, or its read was dropped: the stream is
+    /// inside it and is abandoned.
+    #[snafu(display("decoder stream is inside an unfinished or failed instruction"))]
+    Interrupted,
 }
 
 /// Encode one complete instruction. The wire limit is checked before any
