@@ -5,9 +5,10 @@
 //! together with QPACK is one part, [`Part`]; each extension is another, in
 //! its own package. A connection's wire format is the list of the parts it
 //! uses, such as `HList![hatate_wire::Part, hatate_wire_datagram::Part]`:
-//! [`frame::set::FrameSet`], [`settings::set::SettingsOf`] and
-//! [`stream_type::StreamTypeSet`] are implemented for such lists, and what
-//! a list reads is a `Coproduct` of what its parts read. A value that no part
+//! [`frame::set::FrameSet`], [`settings::set::SettingsOf`],
+//! [`stream_type::StreamTypeSet`] and [`stream::part::StreamSet`] are
+//! implemented for such lists, and what a list reads is a `Coproduct` of what
+//! its parts read. A value that no part
 //! of the list claims is handed to the caller as unknown rather than
 //! rejected, as HTTP/3 requires.
 //!
@@ -18,36 +19,14 @@
 //! the list, so `cargo build` reports it and `cargo check` does not; write
 //! [`assert_claims_valid!`] where a list is defined.
 //!
-//! A list of two parts that claim the same frame type does not read, without
-//! `assert_claims_valid!`: looking up a type in it fails to build.
-//!
-//! ```compile_fail,E0080
-//! # use frunk_core::{HList, coproduct::CNil};
-//! # use hatate_wire::{frame::set::{FramePart, FrameSet}, registry::ClaimedValues};
-//! # use sakuya_var_int::VarInt;
-//! # /// A part that claims the frame type `FRAME`.
-//! # struct Claims<const FRAME: u32>;
-//! # impl<const FRAME: u32> FramePart for Claims<FRAME> {
-//! #     type Kind = CNil;
-//! #     type TypeValue = CNil;
-//! #     const FRAME_TYPES: &'static ClaimedValues =
-//! #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
-//! #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-//! #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-//! #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
-//! # }
-//! type Parts = HList![Claims<0x0a>, Claims<0x0a>];
-//! let _ = <Parts as FrameSet>::type_value_of(VarInt::from_u32(0x0a));
-//! ```
-//!
 //! Reading follows the shape of every object on a byte stream: start (read
 //! the head and look it up), advance (consume the content through a
-//! composed source), finish (skip what is left of the content and give the
-//! stream back). A stream that carries frames is told which one it is by a
-//! [`FrameStream`](stream::FrameStream) composed onto it; frames read from
-//! it are checked against its kind and the role of this endpoint
-//! ([`frame::codec::read_received_frame`]). Every variable-length integer
-//! keeps the width it had on the wire.
+//! composed source), finish (skip what is left of the content). A stream the
+//! peer opened is told apart at its start by the parts ([`stream`]), and a
+//! stream that carries frames is a [`FrameStream`](stream::FrameStream) of its
+//! kind, which holds the current frame and checks each frame against the
+//! kind and the role of this endpoint. Every variable-length integer keeps
+//! the width it had on the wire.
 //!
 //! A read that is dropped before it completes keeps nothing of what it
 //! read: the bytes the stream handed over stay consumed, and a
@@ -118,13 +97,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const FRAME_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// # #[derive(Clone, Copy)]
 /// # struct Claimed<const SETTING: u32>;
@@ -142,13 +116,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const STREAM_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// hatate_wire::assert_claims_valid!(HList![Claims<0x0a, 0x0a, 0x0a>, Claims<0x0a, 0x0b, 0x0b>]);
 /// ```
@@ -170,13 +139,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const FRAME_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// # #[derive(Clone, Copy)]
 /// # struct Claimed<const SETTING: u32>;
@@ -194,13 +158,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const STREAM_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// hatate_wire::assert_claims_valid!(HList![Claims<0x21, 0x0a, 0x0a>]);
 /// ```
@@ -222,13 +181,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const FRAME_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// # #[derive(Clone, Copy)]
 /// # struct Claimed<const SETTING: u32>;
@@ -246,13 +200,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const STREAM_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// hatate_wire::assert_claims_valid!(HList![Claims<0x02, 0x0a, 0x0a>]);
 /// ```
@@ -274,13 +223,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const FRAME_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// # #[derive(Clone, Copy)]
 /// # struct Claimed<const SETTING: u32>;
@@ -298,13 +242,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const STREAM_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// hatate_wire::assert_claims_valid!(HList![Claims<0x0a, 0x00, 0x0a>]);
 /// ```
@@ -326,13 +265,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const FRAME_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// # #[derive(Clone, Copy)]
 /// # struct Claimed<const SETTING: u32>;
@@ -350,13 +284,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const STREAM_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// hatate_wire::assert_claims_valid!(HList![Claims<0x0a, 0x04, 0x0a>]);
 /// ```
@@ -378,13 +307,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const FRAME_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// # #[derive(Clone, Copy)]
 /// # struct Claimed<const SETTING: u32>;
@@ -402,13 +326,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const STREAM_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// hatate_wire::assert_claims_valid!(HList![hatate_wire::Part, Claims<0x0a, 0x07, 0x0a>]);
 /// ```
@@ -430,13 +349,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const FRAME_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// # #[derive(Clone, Copy)]
 /// # struct Claimed<const SETTING: u32>;
@@ -454,13 +368,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const STREAM_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// hatate_wire::assert_claims_valid!(HList![hatate_wire::Part, Claims<0x0a, 0x0a, 0x02>]);
 /// ```
@@ -482,13 +391,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const FRAME_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// # #[derive(Clone, Copy)]
 /// # struct Claimed<const SETTING: u32>;
@@ -506,13 +410,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const STREAM_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// hatate_wire::assert_claims_valid!(HList![Claims<0x0a, 0x0a, 0x21>]);
 /// ```
@@ -534,13 +433,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> FramePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const FRAME_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(FRAME)..=VarInt::from_u32(FRAME)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// # #[derive(Clone, Copy)]
 /// # struct Claimed<const SETTING: u32>;
@@ -558,13 +452,8 @@ pub enum Role {
 /// # impl<const FRAME: u32, const SETTING: u32, const STREAM: u32> StreamTypePart
 /// #     for Claims<FRAME, SETTING, STREAM>
 /// # {
-/// #     type Kind = CNil;
-/// #     type TypeValue = CNil;
 /// #     const STREAM_TYPES: &'static ClaimedValues =
 /// #         &ClaimedValues::new(&[VarInt::from_u32(STREAM)..=VarInt::from_u32(STREAM)]);
-/// #     fn type_value_of(_value: VarInt) -> Option<CNil> { None }
-/// #     fn value_of(type_value: CNil) -> VarInt { match type_value {} }
-/// #     fn kind_of(type_value: CNil) -> CNil { match type_value {} }
 /// # }
 /// hatate_wire::assert_claims_valid!(HList![hatate_wire::Part, Claims<0x0a, 0x0a, 0x0a>, Claims<0x0b, 0x0b, 0x0b>]);
 /// ```

@@ -3,20 +3,23 @@
 mod common;
 
 use common::{Broken, Dribble, run};
+use frunk_core::HList;
 use hatate_wire::{
+    Role,
     error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
         FrameWidths, GoawayId, Http3FrameType, PushId,
-        codec::read_frame,
         control::{codec::*, *},
         payload::PayloadError,
     },
+    stream::{FrameStream, kind::ControlStreamKind},
 };
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::Read;
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
 type E = PayloadError<core::convert::Infallible>;
+type Parts = HList![hatate_wire::Part];
 
 macro_rules! frame_reader {
     ($name:ident, $frame:ty, $kind:expr, $method:ident) => {
@@ -25,17 +28,21 @@ macro_rules! frame_reader {
         async fn $name<F: Read, A: ReceiverAccess<Family = F>>(
             io: &mut A,
         ) -> Result<$frame, ReadIntegerFrameError<PayloadError<F::Error>>> {
-            let Ok(Some(head)) = read_frame(&mut *io).await else {
+            // A server receives every frame of a control stream.
+            let Ok(Some(mut stream)) =
+                FrameStream::<Parts, ControlStreamKind, _>::read(&mut *io, Role::Server).await
+            else {
                 panic!("no frame head");
             };
-            assert_eq!(head.r#type().get(), $kind.value());
+            let mut head = stream.frame();
+            assert_eq!(head.frame_type().value(), $kind.value());
             let widths = head.widths();
-            let mut payload = head.into_payload().into_parts().1;
-            let frame = {
-                let mut source = io.compose(&mut payload);
-                source.$method(widths).await?
-            };
-            assert_eq!(payload.remaining(), 0, "the payload was read to its end");
+            let frame = head.payload().$method(widths).await?;
+            assert_eq!(
+                stream.frame().into_payload().into_parts().1.remaining(),
+                0,
+                "the payload was read to its end"
+            );
             Ok(frame)
         }
     };

@@ -1,13 +1,22 @@
 //! The claimed values of each part agree with what the part reads, for the
 //! parts of the extensions too (the package of RFC 9114 cannot test them,
-//! which would need a dependency on them).
+//! which would need a dependency on them): the frame types a part claims are
+//! those it has on some kind of stream, and the stream types it claims are
+//! the unidirectional stream values it does not leave to others.
+use frunk_core::HList;
 use hatate_wire::{
-    frame::set::{FramePart, FrameSet},
+    frame::set::{FrameSet, FrameSetOn},
+    registry::ClaimedValue,
     settings::{
         KeyedSetting,
         set::{SettingList, SettingsOf, SettingsPart},
     },
-    stream_type::{StreamTypePart, StreamTypeSet},
+    stream::{
+        class::{ClientInitiatedUnidirectional, ServerInitiatedUnidirectional},
+        kind::{ControlStreamKind, PushStreamKind, RequestStreamKind},
+        part::{StreamSet, StreamVerdict},
+    },
+    stream_type::StreamTypeSet,
 };
 use sakuya_var_int::VarInt;
 
@@ -30,50 +39,74 @@ fn probes() -> Vec<VarInt> {
         .collect()
 }
 
-fn agree<P: FramePart + StreamTypePart>(name: &str) {
+/// Whether the list has `value` as a frame type on some kind of stream.
+fn on_some_kind<L>(value: VarInt) -> bool
+where
+    L: FrameSetOn<RequestStreamKind> + FrameSetOn<ControlStreamKind> + FrameSetOn<PushStreamKind>,
+{
+    <<L as FrameSetOn<RequestStreamKind>>::FrameType as ClaimedValue>::of(value).is_some()
+        || <<L as FrameSetOn<ControlStreamKind>>::FrameType as ClaimedValue>::of(value).is_some()
+        || <<L as FrameSetOn<PushStreamKind>>::FrameType as ClaimedValue>::of(value).is_some()
+}
+
+fn agree<L>(name: &str)
+where
+    L: FrameSet
+        + StreamTypeSet
+        + FrameSetOn<RequestStreamKind>
+        + FrameSetOn<ControlStreamKind>
+        + FrameSetOn<PushStreamKind>
+        + StreamSet<ClientInitiatedUnidirectional, L>
+        + StreamSet<ServerInitiatedUnidirectional, L>,
+{
     assert!(!probes().is_empty());
     for value in probes() {
         assert_eq!(
-            <P as FramePart>::FRAME_TYPES.contains(value),
-            <P as FramePart>::type_value_of(value).is_some(),
+            <L as FrameSet>::FRAME_TYPES.contains(value),
+            on_some_kind::<L>(value),
             "{name}: frame type {value:?}"
         );
+        // What a server opens is claimed or not; what a client opens may
+        // also be rejected, which only a claimed value is.
+        let claimed = <L as StreamTypeSet>::STREAM_TYPES.contains(value);
+        let by_server = <L as StreamSet<ServerInitiatedUnidirectional, L>>::judge(value, false);
         assert_eq!(
-            <P as StreamTypePart>::STREAM_TYPES.contains(value),
-            <P as StreamTypePart>::type_value_of(value).is_some(),
-            "{name}: stream type {value:?}"
+            matches!(by_server, StreamVerdict::Claimed(_)),
+            claimed,
+            "{name}: stream type {value:?} of a server"
+        );
+        assert!(!matches!(
+            by_server,
+            StreamVerdict::Error(_) | StreamVerdict::ErrorUnlessClaimed(_)
+        ));
+        let by_client = <L as StreamSet<ClientInitiatedUnidirectional, L>>::judge(value, false);
+        assert_eq!(
+            !matches!(by_client, StreamVerdict::NotClaimed),
+            claimed,
+            "{name}: stream type {value:?} of a client"
         );
     }
 }
 
 #[test]
 fn every_part_claims_what_it_reads() {
-    agree::<hatate_wire::Part>("hatate_wire::Part");
-    agree::<hatate_wire_datagram::Part>("hatate_wire_datagram::Part");
-    agree::<hatate_wire_extended_connect::Part>("hatate_wire_extended_connect::Part");
+    agree::<HList![hatate_wire::Part]>("hatate_wire::Part");
+    agree::<HList![hatate_wire_datagram::Part]>("hatate_wire_datagram::Part");
+    agree::<HList![hatate_wire_extended_connect::Part]>("hatate_wire_extended_connect::Part");
 }
 
 #[test]
-fn the_claims_of_the_list_of_all_parts_agree_with_its_lookups() {
-    type All = frunk_core::HList![
+fn the_claims_of_the_list_of_all_parts_agree_with_what_it_reads() {
+    type All = HList![
         hatate_wire::Part,
         hatate_wire_datagram::Part,
         hatate_wire_extended_connect::Part
     ];
+    agree::<All>("all parts");
     for value in probes() {
-        assert_eq!(
-            <All as FrameSet>::FRAME_TYPES.contains(value),
-            <All as FrameSet>::type_value_of(value).is_some(),
-            "{value:?}"
-        );
         assert_eq!(
             <<All as SettingsOf>::Settings as SettingList>::IDENTIFIERS.contains(value),
             [0x01, 0x06, 0x07, 0x08, 0x33].contains(&value.get()),
-            "{value:?}"
-        );
-        assert_eq!(
-            <All as StreamTypeSet>::STREAM_TYPES.contains(value),
-            <All as StreamTypeSet>::type_value_of(value).is_some(),
             "{value:?}"
         );
     }
@@ -83,6 +116,8 @@ fn the_claims_of_the_list_of_all_parts_agree_with_its_lookups() {
 fn the_extensions_claim_their_one_setting_and_nothing_else() {
     use hatate_wire_datagram::H3Datagram;
     use hatate_wire_extended_connect::EnableConnectProtocol;
+    type Datagram = HList![hatate_wire_datagram::Part];
+    type Connect = HList![hatate_wire_extended_connect::Part];
     assert_eq!(H3Datagram::IDENTIFIER.get(), 0x33);
     assert_eq!(EnableConnectProtocol::IDENTIFIER.get(), 0x08);
     for value in probes() {
@@ -99,10 +134,10 @@ fn the_extensions_claim_their_one_setting_and_nothing_else() {
             connect
         );
         for claimed in [
-            <hatate_wire_datagram::Part as FramePart>::FRAME_TYPES.contains(value),
-            <hatate_wire_datagram::Part as StreamTypePart>::STREAM_TYPES.contains(value),
-            <hatate_wire_extended_connect::Part as FramePart>::FRAME_TYPES.contains(value),
-            <hatate_wire_extended_connect::Part as StreamTypePart>::STREAM_TYPES.contains(value),
+            <Datagram as FrameSet>::FRAME_TYPES.contains(value),
+            <Datagram as StreamTypeSet>::STREAM_TYPES.contains(value),
+            <Connect as FrameSet>::FRAME_TYPES.contains(value),
+            <Connect as StreamTypeSet>::STREAM_TYPES.contains(value),
         ] {
             assert!(!claimed, "{value:?}");
         }

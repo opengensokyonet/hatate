@@ -83,6 +83,8 @@ version = "0.0.0"
 dependencies = [
  "frunk_core",
  "hatate_wire",
+ "nitori_call",
+ "nitori_io",
  "sakuya_var_int",
  "snafu",
 ]
@@ -91,7 +93,11 @@ dependencies = [
 name = "hatate_wire_qpack"
 version = "0.0.0"
 dependencies = [
+ "hatate_qpack",
+ "nitori_call",
+ "nitori_io",
  "sakuya_var_int",
+ "snafu",
 ]
 
 [[package]]

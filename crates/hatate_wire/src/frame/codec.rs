@@ -1,53 +1,25 @@
-//! Reading frames, finishing them and moving on to the next one, writing
-//! frames and frame heads, and reading the Push ID of a PUSH_PROMISE.
+//! Reading and checking frame heads, writing frames and frame heads, and
+//! reading the Push ID of a PUSH_PROMISE.
 use super::{
     Frame, FrameType, FrameWidths, Http2FrameType, Http2FrameTypeError, Http3FrameType, PushId,
-    ReceivedFrame,
-    payload::{FramePayload, PayloadError},
-    set::{FrameKind, FrameSet, FrameStreamKind},
+    set::{FrameKind, FrameSetOn},
 };
 use crate::{
     Role,
     error_code::{ErrorCode, ErrorCodeOf},
-    stream::{FrameStreamInfo, FrameStreamInfoViewExt as _},
+    stream::kind::StreamKind,
 };
 use core::{future::poll_fn, num::NonZeroU64, task::Poll};
-use nitori_call::{Composed, ReceiverAccess, call};
-use nitori_io::{ExactLen, Infinite, Min, calls::WriteAllError, prelude::*};
+use nitori_call::{ReceiverAccess, call};
+use nitori_io::{ExactLen, calls::WriteAllError, prelude::*};
 use sakuya_var_int::{
     VarInt, VarIntField, VarIntWidth, VarIntWidthError,
     call::{ReadVarIntError, ReadVarIntFieldExt as _, WriteVarIntError, WriteVarIntFieldExt as _},
 };
 use snafu::{ResultExt, Snafu};
 
-/// Reads the Type and Length of the next frame from `io`, any source, and
-/// returns the frame, whose payload is `io` composed with a
-/// [`FramePayload`] of the Length.
-///
-/// `io` is passed through, by value; it can be a `&mut` borrow of an
-/// access. The type is not looked up and nothing is checked about it; on a
-/// stream that carries frames, [`read_received_frame`] does that.
-///
-/// Returns `None` if the stream ends before the first byte: at a frame
-/// boundary. The stream stays inside the frame until the frame is finished
-/// ([`Frame::finish`]).
-///
-/// # Errors
-///
-/// [`ReadFrameError`]; its [`ErrorCodeOf::error_code`] gives the
-/// connection error the failure calls for, if any.
-pub async fn read_frame<I: ReceiverAccess<Family: Read>>(
-    mut io: I,
-) -> Result<Option<Frame<Composed<I, FramePayload>>>, ReadFrameError<<I::Family as Read>::Error>> {
-    let Some(r#type) = read_type(&mut io).await? else {
-        return Ok(None);
-    };
-    let length = read_length(&mut io).await?;
-    Ok(Some(payload_frame(io, r#type, length)))
-}
-
 /// The Type of the next frame, or `None` at the end of the stream.
-async fn read_type<I: ReceiverAccess<Family: Read>>(
+pub(crate) async fn read_type<I: ReceiverAccess<Family: Read>>(
     io: &mut I,
 ) -> Result<Option<VarIntField<VarInt>>, ReadFrameError<<I::Family as Read>::Error>> {
     match io.read_var_int_field::<VarInt>().await {
@@ -57,7 +29,7 @@ async fn read_type<I: ReceiverAccess<Family: Read>>(
     }
 }
 
-async fn read_length<I: ReceiverAccess<Family: Read>>(
+pub(crate) async fn read_length<I: ReceiverAccess<Family: Read>>(
     io: &mut I,
 ) -> Result<VarIntField<VarInt>, ReadFrameError<<I::Family as Read>::Error>> {
     io.read_var_int_field::<VarInt>()
@@ -65,17 +37,7 @@ async fn read_length<I: ReceiverAccess<Family: Read>>(
         .context(read_frame_error::LengthSnafu)
 }
 
-/// The frame whose payload follows on `io`.
-fn payload_frame<I: ReceiverAccess>(
-    io: I,
-    r#type: VarIntField<VarInt>,
-    length: VarIntField<VarInt>,
-) -> Frame<Composed<I, FramePayload>> {
-    let payload = Composed::new(io, FramePayload::new(length.get().get()));
-    Frame::new(r#type, length, payload)
-}
-
-/// Failures of [`read_frame`].
+/// Failures of reading the Type and Length of a frame.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum ReadFrameError<E> {
@@ -109,94 +71,47 @@ impl<E> ErrorCodeOf<ErrorCode> for ReadFrameError<E> {
     }
 }
 
-/// The frame type value of the parts of the stream `I` reads.
-type StreamTypeValue<I> =
-    <<<I as ReceiverAccess>::Family as FrameStreamInfo>::Parts as FrameSet>::TypeValue;
-
-/// The frame `read_received_frame` reads from `I`.
-type ReceivedPayloadFrame<I> = ReceivedFrame<StreamTypeValue<I>, Composed<I, FramePayload>>;
-
-/// The failure of `read_received_frame` on `I`.
-type ReceivedFrameError<I> =
-    ReadReceivedFrameError<<<I as ReceiverAccess>::Family as Read>::Error, StreamTypeValue<I>>;
-
-/// Reads the next frame from `io`, a stream that carries frames: the
-/// Type, which it looks up in the list of parts of the stream and checks
-/// against the kind of the stream and the role of this endpoint, and the
-/// Length. The payload is `io` composed with a [`FramePayload`] of the
-/// Length.
-///
-/// `io` is passed through, by value; its family tells which stream it is
-/// ([`FrameStreamInfo`]), as a stream composed with a
-/// [`FrameStream`](crate::stream::FrameStream) does. A type that no part
-/// claims is not checked; the caller normally skips its payload
-/// ([RFC 9114 §9]).
-///
-/// Returns `None` if the stream ends before the first byte: at a frame
-/// boundary. The stream stays inside the frame until the frame is finished
-/// ([`ReceivedFrame::finish`]).
-///
-/// # Errors
-///
-/// [`ReadReceivedFrameError`]; its [`ErrorCodeOf::error_code`] gives the
-/// connection error the failure calls for, if any. A type is rejected before
-/// the Length is read.
-///
-/// [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9
-pub async fn read_received_frame<I>(
-    mut io: I,
-) -> Result<Option<ReceivedPayloadFrame<I>>, ReceivedFrameError<I>>
-where
-    I: ReceiverAccess<Family: Read + FrameStreamInfo<Parts: FrameSet>>,
-{
-    let stream =
-        poll_fn(|cx| io.poll_access(cx, |mut view, _| Poll::Ready(view.frame_stream()))).await;
-    let Some(r#type) = read_type(&mut io)
-        .await
-        .context(read_received_frame_error::FrameSnafu)?
-    else {
-        return Ok(None);
-    };
-    let value = r#type.get();
+/// Checks the type `value` of a frame received on a stream of kind `K`
+/// whose list of parts is `L`, at an endpoint of role `role`: a type of
+/// HTTP/2, or one the list claims for other kinds of stream, is not
+/// allowed there, and some types only one role receives.
+pub(crate) fn check_frame_type<L: FrameSetOn<K>, K: StreamKind, E>(
+    value: VarInt,
+    role: Role,
+) -> Result<FrameType<L::FrameType>, ReadFrameHeadError<E>> {
+    // Evaluated when the function is generated for a concrete list, so a
+    // list whose claims conflict does not build.
+    const {
+        assert!(
+            L::CLAIMS_VALID,
+            "the parts claim overlapping, reserved or HTTP/2 frame types"
+        );
+    }
     if let Some(frame_type) = Http2FrameType::of(value) {
-        return Err(ReadReceivedFrameError::Http2Type {
+        return Err(ReadFrameHeadError::Http2Type {
             source: Http2FrameTypeError::new(frame_type),
         });
     }
-    type Parts<I> = <<I as ReceiverAccess>::Family as FrameStreamInfo>::Parts;
-    let frame_type = match <Parts<I> as FrameSet>::type_value_of(value) {
-        Some(frame_type) => {
-            let kind = <Parts<I> as FrameSet>::kind_of(frame_type);
-            if !kind.allowed_on(stream.kind()) {
-                return Err(ReadReceivedFrameError::NotAllowedOnStream {
-                    frame_type,
-                    stream: stream.kind(),
-                });
-            }
-            if !kind.receivable_by(stream.role()) {
-                return Err(ReadReceivedFrameError::NotReceivableByRole {
-                    frame_type,
-                    role: stream.role(),
-                });
-            }
-            FrameType::Known(frame_type)
+    let frame_type = FrameType::<L::FrameType>::from(value);
+    match frame_type {
+        FrameType::Known(known) if !known.receivable_by(role) => {
+            Err(ReadFrameHeadError::NotReceivableByRole {
+                frame_type: value,
+                role,
+            })
         }
-        None => FrameType::Unknown(value),
-    };
-    let length = read_length(&mut io)
-        .await
-        .context(read_received_frame_error::FrameSnafu)?;
-    Ok(Some(ReceivedFrame::new(
-        frame_type,
-        payload_frame(io, r#type, length),
-    )))
+        FrameType::Unknown(_) if L::FRAME_TYPES.contains(value) => {
+            Err(ReadFrameHeadError::NotAllowedOnStream { frame_type: value })
+        }
+        _ => Ok(frame_type),
+    }
 }
 
-/// Failures of [`read_received_frame`]. `T` is the frame type value of
-/// the list of parts of the stream.
+/// Failures of reading the head of a frame on a stream that carries frames
+/// ([`FrameStream`](crate::stream::FrameStream)).
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-pub enum ReadReceivedFrameError<E, T> {
+pub enum ReadFrameHeadError<E> {
     /// The Type or Length could not be read.
     #[snafu(display("could not read frame head"))]
     Frame {
@@ -209,21 +124,21 @@ pub enum ReadReceivedFrameError<E, T> {
         /// The type received.
         source: Http2FrameTypeError,
     },
-    /// A frame of this type may not appear on this kind of stream
-    /// ([`FrameKind::allowed_on`]).
-    #[snafu(display("frame type is not allowed on a stream of kind {stream:?}"))]
+    /// A part of the list claims the type, but not on this kind of stream
+    /// ([RFC 9114 §7.2]).
+    ///
+    /// [RFC 9114 §7.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2
+    #[snafu(display("frame type {frame_type} is not allowed on this kind of stream"))]
     NotAllowedOnStream {
         /// The type received.
-        frame_type: T,
-        /// The kind of the stream.
-        stream: FrameStreamKind,
+        frame_type: VarInt,
     },
     /// An endpoint of this role may not receive a frame of this type
     /// ([`FrameKind::receivable_by`]).
-    #[snafu(display("frame type may not be received by a {role:?}"))]
+    #[snafu(display("frame type {frame_type} may not be received by a {role:?}"))]
     NotReceivableByRole {
         /// The type received.
-        frame_type: T,
+        frame_type: VarInt,
         /// The role of this endpoint.
         role: Role,
     },
@@ -235,129 +150,13 @@ pub enum ReadReceivedFrameError<E, T> {
 ///
 /// [RFC 9114 §7.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2
 /// [RFC 9114 §7.2.8]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
-impl<E, T> ErrorCodeOf<ErrorCode> for ReadReceivedFrameError<E, T> {
+impl<E> ErrorCodeOf<ErrorCode> for ReadFrameHeadError<E> {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Frame { source } => source.error_code(),
             Self::Http2Type { .. }
             | Self::NotAllowedOnStream { .. }
             | Self::NotReceivableByRole { .. } => Some(ErrorCode::H3_FRAME_UNEXPECTED),
-        }
-    }
-}
-
-/// The failure of reading the payload of a frame read from `I`.
-type PayloadReadError<I> = PayloadError<<<I as ReceiverAccess>::Family as Read>::Error>;
-
-/// Finishing a frame read from a stream `I`, whose payload is `I`
-/// composed with a [`FramePayload`], and moving on to the next one.
-///
-/// The payload skips what is left of it on the stream, which therefore
-/// skips ([`Skip`]); compose [`ReadSkip`](nitori_io::adapters::ReadSkip)
-/// or [`ReadChunkSkip`](nitori_io::adapters::ReadChunkSkip) onto a stream
-/// that only reads, below or above its
-/// [`FrameStream`](crate::stream::FrameStream).
-impl<I> Frame<Composed<I, FramePayload>>
-where
-    I: ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>>>,
-    u64: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
-    Infinite: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
-{
-    /// Skips what is left of the payload and gives the stream back, at the
-    /// next frame.
-    ///
-    /// # Errors
-    ///
-    /// The failure of skipping the payload, such as a stream that ends
-    /// inside it; the stream is then inside the frame.
-    pub async fn finish(self) -> Result<I, PayloadReadError<I>> {
-        let mut payload = self.payload;
-        payload.skip_to_end().await?;
-        Ok(payload.into_parts().0)
-    }
-
-    /// Finishes this frame and reads the next one with [`read_frame`].
-    ///
-    /// # Errors
-    ///
-    /// [`NextFrameError`]: the failure of finishing this frame or of
-    /// reading the next.
-    pub async fn next(
-        self,
-    ) -> Result<
-        Option<Self>,
-        NextFrameError<<I::Family as Read>::Error, ReadFrameError<<I::Family as Read>::Error>>,
-    > {
-        let io = self.finish().await.context(next_frame_error::FinishSnafu)?;
-        read_frame(io).await.context(next_frame_error::ReadSnafu)
-    }
-}
-
-/// Finishing a frame read from a stream that carries frames, and moving on
-/// to the next one; as for [`Frame`], the stream skips.
-impl<I> ReceivedPayloadFrame<I>
-where
-    I: ReceiverAccess<
-        Family: Skip<Count: Clone + Min<u64, Output = u64>> + FrameStreamInfo<Parts: FrameSet>,
-    >,
-    u64: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
-    Infinite: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
-{
-    /// Skips what is left of the payload and gives the stream back, at the
-    /// next frame.
-    ///
-    /// # Errors
-    ///
-    /// The failure of skipping the payload, such as a stream that ends
-    /// inside it; the stream is then inside the frame.
-    pub async fn finish(self) -> Result<I, PayloadReadError<I>> {
-        self.frame.finish().await
-    }
-
-    /// Finishes this frame and reads the next one with
-    /// [`read_received_frame`].
-    ///
-    /// # Errors
-    ///
-    /// [`NextFrameError`]: the failure of finishing this frame or of
-    /// reading the next.
-    pub async fn next(
-        self,
-    ) -> Result<Option<Self>, NextFrameError<<I::Family as Read>::Error, ReceivedFrameError<I>>>
-    {
-        let io = self.finish().await.context(next_frame_error::FinishSnafu)?;
-        read_received_frame(io)
-            .await
-            .context(next_frame_error::ReadSnafu)
-    }
-}
-
-/// Failures of moving on to the next frame: of [`Frame::next`], where `R`
-/// is [`ReadFrameError`], and of [`ReceivedFrame::next`], where it is
-/// [`ReadReceivedFrameError`].
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum NextFrameError<E, R> {
-    /// What was left of the payload could not be skipped.
-    #[snafu(display("could not finish frame"))]
-    Finish {
-        /// The failure of skipping it.
-        source: PayloadError<E>,
-    },
-    /// The next frame could not be read.
-    #[snafu(display("could not read next frame"))]
-    Read {
-        /// The failure of reading it.
-        source: R,
-    },
-}
-
-/// The code of the failure of finishing or reading.
-impl<E, R: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for NextFrameError<E, R> {
-    fn error_code(&self) -> Option<ErrorCode> {
-        match self {
-            Self::Finish { source } => source.error_code(),
-            Self::Read { source } => source.error_code(),
         }
     }
 }
@@ -424,8 +223,11 @@ pub enum WriteFrameHeadError<E> {
 /// payload, a source of exactly Length bytes, such as the bytes of a DATA
 /// or HEADERS frame, or of a frame of a type this crate does not read.
 ///
-/// Write the types of RFC 9114 with [`Http3FrameType::value`]; a type of
-/// HTTP/2 is rejected. Pass the payload as a `&mut` borrow to keep it.
+/// The Type is any type that gives its value on the wire: a frame read from
+/// a [`FrameStream`](crate::stream::FrameStream), whose type is a
+/// [`FrameType`], is written back as it was read; write the types of RFC 9114
+/// as [`Http3FrameType`], and others as a raw `VarInt`. A type of HTTP/2 is
+/// rejected. Pass the payload as a `&mut` borrow to keep it.
 ///
 /// # Errors
 ///
@@ -434,18 +236,22 @@ pub enum WriteFrameHeadError<E> {
 /// after that leaves the stream inside the frame.
 #[call(sync)]
 pub async fn write_frame<
+    T: Copy + Into<VarInt> + TryFrom<VarInt>,
     R: Read + ExactLen,
     P: ReceiverAccess<Family = R>,
     F: Write,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
-    frame: Frame<P>,
+    frame: Frame<T, P>,
 ) -> Result<(), WriteFrameError<R::Error, F::Error>>
 where
     <R as ExactLen>::Length: TryInto<u64>,
 {
-    let (r#type, length) = (frame.r#type, frame.length);
+    let length = frame.length;
+    // invariant: the field held the value at its width when it was made.
+    let r#type = VarIntField::new(frame.r#type.to_var_int(), frame.r#type.width())
+        .expect("a field's width holds its value");
     let mut payload = frame.payload;
     let remaining =
         poll_fn(|cx| payload.poll_access(cx, |mut view, _| Poll::Ready(view.remaining_len())))
@@ -695,7 +501,7 @@ async fn copy_payload<
 /// ([RFC 9114 §7.2.5]). The encoded field section follows it, to the end of
 /// the payload.
 ///
-/// `io` is the payload of the frame, a [`FramePayload`] composed onto
+/// `io` is the payload of the frame, a [`FramePayload`](crate::frame::payload::FramePayload) composed onto
 /// the request stream.
 ///
 /// # Errors

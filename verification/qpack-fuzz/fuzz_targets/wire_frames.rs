@@ -1,29 +1,31 @@
-//! Walk a stream of HTTP/3 frames with the parts of HTTP/3, HTTP Datagrams and
-//! Extended CONNECT: heads, SETTINGS, the integer frames, PUSH_PROMISE (its
-//! Push ID, then the rest of the payload), and the payload of every other
-//! frame, which is collected. Every frame read whole is written back (the
-//! collected ones through `write_frame` and
+//! Walk a stream of HTTP/3 frames, a `FrameStream` of the parts of HTTP/3, HTTP
+//! Datagrams and Extended CONNECT: heads, SETTINGS, the integer frames,
+//! PUSH_PROMISE (its Push ID, then the rest of the payload), and the payload
+//! of every other frame, which is collected. Every frame read whole is
+//! written back (the collected ones through `write_frame` and
 //! `write_push_promise_frame`) and must equal its bytes.
 //!
 //! The first byte sets how the stream arrives: its low four bits plus one are
 //! the bytes given per read, and its high four bits the period of a
-//! `Pending` (0 for none).
+//! `Pending` (0 for none). The second sets the stream: bits 0 and 1 the kind
+//! (a request stream, a control stream, a push stream, and again a request
+//! stream) and bit 2 the role of the endpoint. The rest is the stream.
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 use bytes::BufMut;
 use core::{
     convert::Infallible,
-    future::{Future, poll_fn},
+    future::Future,
     pin::{Pin, pin},
     task::{Context, Poll, Waker},
 };
 use frunk_core::HList;
 use hatate_wire::{
+    Role,
     frame::{
-        Frame, Http2FrameType, Http3FrameType,
+        Frame, Http3FrameType,
         codec::{
             ReadPushPromisePushIdExt as _, WriteFrameExt as _, WritePushPromiseFrameHostExt as _,
-            read_frame,
         },
         control::codec::{
             ReadCancelPushFrameExt as _, ReadGoawayFrameExt as _, ReadMaxPushIdFrameExt as _,
@@ -36,10 +38,14 @@ use hatate_wire::{
         },
         set::{Settings, SettingsOf},
     },
+    stream::{
+        FrameStream,
+        kind::{ControlStreamKind, PushStreamKind, RequestStreamKind},
+    },
 };
 use libfuzzer_sys::fuzz_target;
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::{ExactLen, Read, Write, prelude::*};
+use nitori_io::{ExactLen, Min, Read, Skip, Write, prelude::*};
 use sakuya_var_int::{VarInt, VarIntField};
 
 type Parts = HList![
@@ -48,14 +54,28 @@ type Parts = HList![
     hatate_wire_extended_connect::Part
 ];
 
-/// A stream that gives `chunk` bytes at most per read and is pending on every
-/// `period`-th read.
+/// A stream that gives `chunk` bytes at most per read or skip and is pending
+/// on every `period`-th one.
 struct Arrival<'a> {
     input: &'a [u8],
     chunk: usize,
     period: usize,
     reads: usize,
     woken: bool,
+}
+
+impl Arrival<'_> {
+    /// Whether this call is the pending one.
+    fn pending(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.period != 0 && !self.woken && self.reads % self.period == 0 {
+            self.woken = true;
+            cx.waker().wake_by_ref();
+            return true;
+        }
+        self.woken = false;
+        self.reads += 1;
+        false
+    }
 }
 
 nitori_call::family_receiver!(impl ['a] for Arrival<'a>);
@@ -71,14 +91,10 @@ impl Read for Arrival<'_> {
         Self: 'visit,
     {
         let this = host.get_pin_mut().get_mut();
-        if this.period != 0 && !this.woken && this.reads % this.period == 0 {
-            this.woken = true;
-            cx.waker().wake_by_ref();
+        if this.pending(cx) {
             return Poll::Pending;
         }
-        this.woken = false;
-        this.reads += 1;
-        let count = this.chunk.min(this.input.len()).min(dst.remaining_mut());
+        let count = Ord::min(Ord::min(this.chunk, this.input.len()), dst.remaining_mut());
         let (head, tail) = this.input.split_at(count);
         dst.put_slice(head);
         this.input = tail;
@@ -86,35 +102,46 @@ impl Read for Arrival<'_> {
     }
 }
 
-impl ExactLen for Arrival<'_> {
-    type Length = usize;
-    fn remaining_len<'visit>(host: Pin<&mut Self::ReceiverView<'visit>>) -> usize
+impl Skip for Arrival<'_> {
+    type Count = usize;
+    fn poll_skip<'visit, M: Min<usize, Output = usize> + Clone>(
+        host: Pin<&mut Self::ReceiverView<'visit>>,
+        cx: &mut Context<'_>,
+        maximum: M,
+    ) -> Poll<Result<Option<usize>, Self::Error>>
     where
         Self: 'visit,
     {
-        host.get_pin_mut().get_mut().input.len()
+        let this = host.get_pin_mut().get_mut();
+        if this.pending(cx) {
+            return Poll::Pending;
+        }
+        let allowed = Min::min(maximum, this.chunk);
+        if allowed != 0 && this.input.is_empty() {
+            return Poll::Ready(Ok(None));
+        }
+        let count = Ord::min(allowed, this.input.len());
+        this.input = &this.input[count..];
+        Poll::Ready(Ok(Some(count)))
     }
 }
 
-macro_rules! position {
-    ($io:expr, $wire:expr) => {{
-        let remaining =
-            poll_fn(|cx| $io.poll_access(cx, |mut view, _| Poll::Ready(view.remaining_len())))
-                .await;
-        $wire.len() - remaining.try_into().unwrap_or(0)
-    }};
+fn complete<T>(future: impl Future<Output = T>) -> T {
+    let mut future = pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+    }
 }
 
-/// The rest of `payload`, read from the stream `io`; `None` if reading failed.
-async fn collect<F: Read, A: ReceiverAccess<Family = F>>(
-    io: &mut A,
-    payload: &mut hatate_wire::frame::payload::FramePayload,
-) -> Option<Vec<u8>> {
-    let mut source = io.compose(payload);
+/// The rest of `payload`, read to its end; `None` if reading failed.
+async fn collect<A: ReceiverAccess<Family: Read>>(payload: &mut A) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     loop {
         let mut buffer = [0; 64];
-        match source.read(&mut &mut buffer[..]).await {
+        match payload.read(&mut &mut buffer[..]).await {
             Ok(0) => return Some(bytes),
             Ok(count) => bytes.extend_from_slice(&buffer[..count]),
             Err(_) => return None,
@@ -137,172 +164,149 @@ where
     out.write_frame(Frame::new(r#type, length, payload)).await
 }
 
-/// Reads every frame of `wire` from `io`, writes each one it read whole to
+/// Walks the frames of a stream of this kind, writes each frame read whole to
 /// `out`, and puts the bytes it expects there in `expected`.
-#[call(sync)]
-async fn walk<
-    F: Read + ExactLen,
-    A: ReceiverAccess<Family = F>,
-    W: Write,
-    B: ReceiverAccess<Family = W>,
->(
-    io: &mut A,
-    out: &mut B,
-    wire: &[u8],
-    expected: &mut Vec<u8>,
-) where
-    <F as ExactLen>::Length: TryInto<usize>,
-{
-    loop {
-        let start = position!(io, wire);
-        let frame = match read_frame(&mut *io).await {
-            Ok(Some(frame)) => frame,
-            _ => return,
-        };
-        let widths = frame.widths();
-        let type_field = frame.r#type();
-        let length_field = frame.length();
-        let mut payload = frame.into_payload().into_parts().1;
-        let length = length_field.get().get();
-        // A type of HTTP/2 is not one a stream of HTTP/3 carries.
-        if Http2FrameType::of(type_field.get()).is_some() {
+macro_rules! walk {
+    ($io:expr, $kind:ty, $role:expr, $wire:expr, $out:expr, $expected:expr) => {{
+        let wire: &[u8] = $wire;
+        let Ok(Some(mut stream)) = FrameStream::<Parts, $kind, _>::read($io, $role).await else {
             return;
-        }
-        let mut whole = false;
-        match Http3FrameType::of(type_field.get()) {
-            Some(Http3FrameType::Settings) => {
-                let mut slots = Settings::<<Parts as SettingsOf>::Settings>::new();
-                let mut settings = Vec::new();
-                {
-                    let mut source = io.compose(&mut payload);
+        };
+        let mut start = 0usize;
+        loop {
+            let mut frame = stream.frame();
+            let widths = frame.widths();
+            let type_field = VarIntField::new(frame.frame_type().into(), frame.r#type().width())
+                .expect("a field holds its value at its width");
+            let length_field = frame.length();
+            let length = length_field.get().get();
+            let end = start
+                + usize::from(type_field.encoded_len() as u8)
+                + usize::from(length_field.encoded_len() as u8)
+                + Ord::min(usize::try_from(length).unwrap_or(usize::MAX), wire.len());
+            let mut whole = false;
+            match Http3FrameType::of(type_field.get()) {
+                Some(Http3FrameType::Settings) => {
+                    let mut slots = Settings::<<Parts as SettingsOf>::Settings>::new();
+                    let mut settings = Vec::new();
                     loop {
-                        match source.read_setting(&mut slots).await {
+                        match frame.payload().read_setting(&mut slots).await {
                             Ok(Some(setting)) => settings.push(setting),
                             Ok(None) => break,
                             Err(_) => return,
                         }
                     }
+                    match SettingsFrame::<<Parts as SettingsOf>::Settings>::new(settings, widths) {
+                        Ok(settings_frame) => {
+                            assert_eq!(settings_frame.payload_len(), length);
+                            let Ok(()) = $out.write_settings_frame(&settings_frame).await else {
+                                panic!("a SETTINGS frame was not written");
+                            };
+                            whole = true;
+                        }
+                        // Unknown identifiers may repeat on the wire; a frame may not.
+                        Err(SettingsFrameError::Duplicate { .. }) => {}
+                        Err(error) => {
+                            panic!("a SETTINGS frame that was read cannot be built: {error}")
+                        }
+                    }
                 }
-                match SettingsFrame::<<Parts as SettingsOf>::Settings>::new(settings, widths) {
-                    Ok(frame) => {
-                        assert_eq!(frame.payload_len(), length);
-                        let Ok(()) = out.write_settings_frame(&frame).await else {
-                            panic!("a SETTINGS frame was not written");
-                        };
-                        whole = true;
+                Some(Http3FrameType::CancelPush) => {
+                    let Ok(read) = frame.payload().read_cancel_push_frame(widths).await else {
+                        return;
+                    };
+                    let Ok(()) = $out.write_cancel_push_frame(read).await else {
+                        panic!("a CANCEL_PUSH frame was not written");
+                    };
+                    whole = true;
+                }
+                Some(Http3FrameType::Goaway) => {
+                    let Ok(read) = frame.payload().read_goaway_frame(widths).await else {
+                        return;
+                    };
+                    let Ok(()) = $out.write_goaway_frame(read).await else {
+                        panic!("a GOAWAY frame was not written");
+                    };
+                    whole = true;
+                }
+                Some(Http3FrameType::MaxPushId) => {
+                    let Ok(read) = frame.payload().read_max_push_id_frame(widths).await else {
+                        return;
+                    };
+                    let Ok(()) = $out.write_max_push_id_frame(read).await else {
+                        panic!("a MAX_PUSH_ID frame was not written");
+                    };
+                    whole = true;
+                }
+                Some(Http3FrameType::PushPromise) => {
+                    let Ok(push_id) = frame.payload().read_push_promise_push_id().await else {
+                        return;
+                    };
+                    let Some(section) = collect(frame.payload()).await else {
+                        return;
+                    };
+                    let mut again = (Vec::<u8>::new(), &section[..]);
+                    let Ok(()) = again.write_push_promise_frame_unpin(widths, push_id).await else {
+                        panic!("a PUSH_PROMISE frame was not written");
+                    };
+                    assert_eq!(again.0, &wire[start..end]);
+                }
+                _ => {
+                    // DATA, HEADERS and the frames of types no part claims.
+                    let Some(bytes) = collect(frame.payload()).await else {
+                        return;
+                    };
+                    assert_eq!(bytes.len() as u64, length);
+                    let mut again = (Vec::<u8>::new(), &bytes[..]);
+                    if let Err(error) = again.write_payload_unpin(type_field, length_field).await {
+                        panic!("a frame of the payload was not written: {error}");
                     }
-                    // Unknown identifiers may repeat on the wire; a frame may not.
-                    Err(SettingsFrameError::Duplicate { .. }) => {}
-                    Err(error) => panic!("a SETTINGS frame that was read cannot be built: {error}"),
+                    assert_eq!(again.0, &wire[start..end]);
                 }
             }
-            Some(Http3FrameType::CancelPush) => {
-                let frame = {
-                    let mut source = io.compose(&mut payload);
-                    match source.read_cancel_push_frame(widths).await {
-                        Ok(frame) => frame,
-                        Err(_) => return,
-                    }
-                };
-                let Ok(()) = out.write_cancel_push_frame(frame).await else {
-                    panic!("a CANCEL_PUSH frame was not written");
-                };
-                whole = true;
-            }
-            Some(Http3FrameType::Goaway) => {
-                let frame = {
-                    let mut source = io.compose(&mut payload);
-                    match source.read_goaway_frame(widths).await {
-                        Ok(frame) => frame,
-                        Err(_) => return,
-                    }
-                };
-                let Ok(()) = out.write_goaway_frame(frame).await else {
-                    panic!("a GOAWAY frame was not written");
-                };
-                whole = true;
-            }
-            Some(Http3FrameType::MaxPushId) => {
-                let frame = {
-                    let mut source = io.compose(&mut payload);
-                    match source.read_max_push_id_frame(widths).await {
-                        Ok(frame) => frame,
-                        Err(_) => return,
-                    }
-                };
-                let Ok(()) = out.write_max_push_id_frame(frame).await else {
-                    panic!("a MAX_PUSH_ID frame was not written");
-                };
-                whole = true;
-            }
-            Some(Http3FrameType::PushPromise) => {
-                let push_id = {
-                    let mut source = io.compose(&mut payload);
-                    match source.read_push_promise_push_id().await {
-                        Ok(push_id) => push_id,
-                        Err(_) => return,
-                    }
-                };
-                let Some(section) = collect(io, &mut payload).await else {
-                    return;
-                };
-                if payload.remaining() != 0 {
-                    return;
-                }
-                let end = position!(io, wire);
-                let mut again = (Vec::<u8>::new(), &section[..]);
-                let Ok(()) = again
-                    .write_push_promise_frame_unpin(widths, push_id)
-                    .await
-                else {
-                    panic!("a PUSH_PROMISE frame was not written");
-                };
-                assert_eq!(again.0, &wire[start..end]);
-                continue;
-            }
-            _ => {
-                // DATA, HEADERS and the frames of types no part claims.
-                let Some(bytes) = collect(io, &mut payload).await else {
-                    return;
-                };
-                assert_eq!(bytes.len() as u64, length);
-                if payload.remaining() != 0 {
+            if whole {
+                // The frame was written from what was read: the payload was
+                // read to its end, or the frame is not the bytes it was.
+                if frame.into_payload().into_parts().1.remaining() == 0 {
+                    $expected.extend_from_slice(&wire[start..end]);
+                } else {
                     return;
                 }
-                let end = position!(io, wire);
-                let mut again = (Vec::<u8>::new(), &bytes[..]);
-                if let Err(error) = again
-                    .write_payload_unpin(type_field, length_field)
-                    .await
-                {
-                    panic!("a frame of the payload was not written: {error}");
-                }
-                assert_eq!(again.0, &wire[start..end]);
-                continue;
+            }
+            match stream.next_frame().await {
+                Ok(Some(_)) => start = end,
+                _ => return,
             }
         }
-        if payload.remaining() != 0 {
-            return;
-        }
-        if whole {
-            let end = position!(io, wire);
-            expected.extend_from_slice(&wire[start..end]);
-        }
-    }
+    }};
 }
 
-fn complete<T>(future: impl Future<Output = T>) -> T {
-    let mut future = pin!(future);
-    let mut cx = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
-            return value;
-        }
+/// Reads every frame of `wire` from `io` as a stream of this kind, writes each
+/// one it read whole to `out`, and puts the bytes it expects there in
+/// `expected`.
+#[call(sync)]
+async fn walk<
+    F: Read<Error = Infallible> + Skip<Count = usize>,
+    A: ReceiverAccess<Family = F>,
+    W: Write<Error = Infallible>,
+    B: ReceiverAccess<Family = W>,
+>(
+    io: &mut A,
+    out: &mut B,
+    kind: u8,
+    role: Role,
+    wire: &[u8],
+    expected: &mut Vec<u8>,
+) {
+    match kind & 3 {
+        1 => walk!(&mut *io, ControlStreamKind, role, wire, out, expected),
+        2 => walk!(&mut *io, PushStreamKind, role, wire, out, expected),
+        _ => walk!(&mut *io, RequestStreamKind, role, wire, out, expected),
     }
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Some((&control, wire)) = data.split_first() else {
+    let [control, setup, wire @ ..] = data else {
         return;
     };
     let arrival = Arrival {
@@ -312,8 +316,13 @@ fuzz_target!(|data: &[u8]| {
         reads: 0,
         woken: false,
     };
+    let role = if setup & 4 == 0 {
+        Role::Client
+    } else {
+        Role::Server
+    };
     let mut hosts = (arrival, Vec::<u8>::new());
     let mut expected = Vec::new();
-    complete(hosts.walk_unpin(wire, &mut expected));
+    complete(hosts.walk_unpin(setup & 3, role, wire, &mut expected));
     assert_eq!(hosts.1, expected);
 });

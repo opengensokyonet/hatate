@@ -8,6 +8,12 @@ use core::{
     pin::{Pin, pin},
     task::{Context, Poll, Waker},
 };
+use hatate_wire::{
+    frame::{FrameType, Http3FrameType},
+    registry::ClaimedValue,
+};
+use nitori_call::ReceiverAccess;
+use nitori_io::{Read, prelude::*};
 
 /// A stream that gives at most `chunk` bytes per read and answers
 /// `Pending` once before every read, so that every state a reader keeps
@@ -298,4 +304,43 @@ impl nitori_io::Skip for Overskip {
     {
         Poll::Ready(Ok(Some(nitori_io::Min::min(maximum, 8) + 1)))
     }
+}
+/// The type of a frame as the tests compare it: its value on the wire, and
+/// whether a part has it on the stream, it is reserved, or it is unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ty {
+    Known(u64),
+    Reserved(u64),
+    Unknown(u64),
+}
+
+pub fn ty<C: ClaimedValue>(frame_type: FrameType<C>) -> Ty {
+    match frame_type {
+        FrameType::Known(known) => Ty::Known(known.value().get()),
+        FrameType::Reserved(value) => Ty::Reserved(value.get()),
+        FrameType::Unknown(value) => Ty::Unknown(value.get()),
+    }
+}
+
+/// The type of a frame of RFC 9114 that a part has on the stream.
+pub const fn known(frame_type: Http3FrameType) -> Ty {
+    Ty::Known(frame_type.value().get())
+}
+
+/// Reads at most `take` bytes from `io`, stopping at EOF.
+pub async fn read_some<A: ReceiverAccess<Family: Read>>(
+    io: &mut A,
+    take: usize,
+) -> Result<Vec<u8>, <A::Family as Read>::Error> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 7];
+    while bytes.len() < take {
+        let want = (take - bytes.len()).min(buffer.len());
+        let count = io.read(&mut &mut buffer[..want]).await?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    Ok(bytes)
 }

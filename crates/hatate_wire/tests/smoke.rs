@@ -1,17 +1,17 @@
 #![feature(impl_trait_in_assoc_type)]
-use frunk_core::{HList, coproduct::Coproduct};
+mod common;
+
+use common::{Ty, known, ty};
+use frunk_core::HList;
 use hatate_wire::{
     Role,
-    frame::{
-        FrameType, Http3FrameType, codec::read_received_frame,
-        control::codec::ReadGoawayFrameExt as _,
-    },
+    frame::{Http3FrameType, control::codec::ReadGoawayFrameExt as _},
     settings::{
         Setting,
         codec::ReadSettingExt as _,
         set::{Settings, SettingsOf},
     },
-    stream::{UnidirectionalStream, codec::read_unidirectional_stream},
+    stream::{FrameStream, kind::ControlStreamKind},
 };
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::Skip;
@@ -26,29 +26,24 @@ async fn settings_then_goaway<F: Skip<Count = usize>, A: ReceiverAccess<Family =
 where
     <F as nitori_io::Read>::Error: core::fmt::Debug,
 {
-    let Some(UnidirectionalStream::Control { stream, .. }) =
-        read_unidirectional_stream::<Parts, _>(&mut *io, Role::Client)
-            .await
-            .unwrap()
-    else {
-        panic!("not a control stream");
-    };
-    let mut frame = read_received_frame(stream).await.unwrap().unwrap();
-    assert!(matches!(
-        frame.frame_type(),
-        FrameType::Known(Coproduct::Inl(Http3FrameType::Settings))
-    ));
+    let mut stream = FrameStream::<Parts, ControlStreamKind, _>::read(&mut *io, Role::Client)
+        .await
+        .unwrap()
+        .expect("a first frame");
+    let mut frame = stream.frame();
+    assert_eq!(ty(frame.frame_type()), known(Http3FrameType::Settings));
     let mut count = 0;
     let mut settings = Settings::<<Parts as SettingsOf>::Settings>::new();
     while let Some(setting) = frame.payload().read_setting(&mut settings).await.unwrap() {
         assert!(matches!(setting, Setting::Known(_) | Setting::Unknown(_)));
         count += 1;
     }
-    let mut frame = frame.next().await.unwrap().unwrap();
-    let widths = frame.frame().widths();
+    let mut frame = stream.next_frame().await.unwrap().unwrap();
+    assert_eq!(ty(frame.frame_type()), known(Http3FrameType::Goaway));
+    let widths = frame.widths();
     let goaway = frame.payload().read_goaway_frame(widths).await.unwrap();
-    let stream = frame.finish().await.unwrap();
-    assert!(read_received_frame(stream).await.unwrap().is_none());
+    assert!(stream.next_frame().await.unwrap().is_none());
+    let _: Ty = ty(stream.frame().frame_type());
     (count, goaway.id().get().get().get())
 }
 
@@ -58,7 +53,7 @@ fn reads_settings_and_goaway() {
     // bytes), a reserved identifier 0x21 = 0; GOAWAY with ID 4 in two
     // bytes.
     let mut input = &[
-        0x00, 0x04, 0x05, 0x01, 0x40, 0x40, 0x21, 0x00, 0x07, 0x02, 0x40, 0x04,
+        0x04, 0x05, 0x01, 0x40, 0x40, 0x21, 0x00, 0x07, 0x02, 0x40, 0x04,
     ][..];
     assert_eq!(input.sync_settings_then_goaway_unpin(), (2, 4));
     assert!(input.is_empty());

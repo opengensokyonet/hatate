@@ -10,6 +10,8 @@ description = "HTTP Datagrams (RFC 9297) on HTTP/3: the SETTINGS_H3_DATAGRAM set
 bytes.workspace = true
 frunk_core.workspace = true
 hatate_wire.workspace = true
+nitori_call.workspace = true
+nitori_io.workspace = true
 sakuya_var_int.workspace = true
 snafu.workspace = true
 

@@ -3,17 +3,22 @@
 mod common;
 
 use common::{Dribble, run};
+use frunk_core::HList;
 use hatate_wire::{
+    Role,
     error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
         FrameWidths, Http3FrameType, PushId,
         codec::{
             ReadPushPromisePushIdError, ReadPushPromisePushIdExt as _,
-            WritePushPromiseFrameHostExt as _, read_frame,
+            WritePushPromiseFrameHostExt as _,
         },
         payload::PayloadError,
     },
+    stream::{FrameStream, kind::RequestStreamKind},
 };
+
+type Parts = HList![hatate_wire::Part];
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::{Read, prelude::*};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
@@ -38,28 +43,30 @@ async fn read_promise<F: Read, A: ReceiverAccess<Family = F>>(
 where
     <F as Read>::Error: core::fmt::Debug,
 {
-    let frame = read_frame(&mut *io).await.unwrap().unwrap();
-    assert_eq!(frame.r#type().get(), Http3FrameType::PushPromise.value());
+    // A client receives PUSH_PROMISE on a request stream.
+    let mut stream = FrameStream::<Parts, RequestStreamKind, _>::read(&mut *io, Role::Client)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut frame = stream.frame();
+    assert_eq!(
+        frame.frame_type().value(),
+        Http3FrameType::PushPromise.value()
+    );
     let widths = frame.widths();
-    let mut payload = frame.into_payload().into_parts().1;
-    let push_id = {
-        let mut source = io.compose(&mut payload);
-        source.read_push_promise_push_id().await?
-    };
-    let remaining = payload.remaining();
+    let push_id = frame.payload().read_push_promise_push_id().await?;
+    let remaining = stream.frame().into_payload().into_parts().1.remaining();
     let mut section = Vec::new();
-    {
-        let mut source = io.compose(&mut payload);
-        loop {
-            let mut buffer = [0; 3];
-            let count = source.read(&mut &mut buffer[..]).await.unwrap();
-            if count == 0 {
-                break;
-            }
-            section.extend_from_slice(&buffer[..count]);
+    let mut frame = stream.frame();
+    loop {
+        let mut buffer = [0; 3];
+        let count = frame.payload().read(&mut &mut buffer[..]).await.unwrap();
+        if count == 0 {
+            break;
         }
+        section.extend_from_slice(&buffer[..count]);
     }
-    assert_eq!(payload.remaining(), 0);
+    assert_eq!(stream.frame().into_payload().into_parts().1.remaining(), 0);
     Ok(Promise {
         push_id,
         widths,

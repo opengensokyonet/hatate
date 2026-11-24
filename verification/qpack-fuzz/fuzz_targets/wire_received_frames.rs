@@ -1,18 +1,21 @@
-//! Frames read from a stream that carries frames, with the parts of HTTP/3,
-//! HTTP Datagrams and Extended CONNECT: each frame's type is checked against
-//! the kind of stream and the role of the endpoint, a prefix of its payload
-//! is read, and the frame is finished (or moved past to the next) by skipping.
+//! Frames read from a [`FrameStream`] that carries frames, with the parts of
+//! HTTP/3, HTTP Datagrams and Extended CONNECT: each frame's type is checked
+//! against the kind of stream and the role of the endpoint, and the whole
+//! stream is walked frame by frame.
 //!
 //! The first byte sets how the stream arrives: its low four bits plus one are
 //! the bytes given per read, and its high four bits the period of a
 //! `Pending` (0 for none). The second sets the stream: bits 0 and 1 the kind
-//! (a request stream, a control stream, a push stream, a stream of another
-//! type), bit 2 the role of the endpoint, bit 3 whether a frame is moved past
-//! with `next` or finished and the next one read, and bits 4 to 7 how many
-//! bytes of each payload are read. The rest is the stream, read with a host
-//! that skips natively and once more with a host that only reads, made to skip
-//! by `ReadSkip`; both must give what an independent reading of the bytes
-//! calls for, which includes the failure and its code.
+//! (a request stream, a control stream, a push stream, and again a request
+//! stream), bit 2 the role of the endpoint, bit 3 whether the walk uses
+//! `next_known_frame` (which skips reserved and unknown frames after the
+//! first) or `next_frame`, and bits 4 to 7 how many bytes of each payload are
+//! read; 15 is the mode that writes every frame back whole with `write_frame`
+//! instead, which must give the bytes of the frames it was read from. The
+//! rest is the stream, read with a host that skips natively and once more with
+//! a host that only reads, made to skip by `ReadSkip`; both must give what an
+//! independent reading of the bytes calls for, which includes the failure and
+//! its code.
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 use bytes::BufMut;
@@ -26,17 +29,15 @@ use frunk_core::HList;
 use hatate_wire::{
     Role,
     error_code::{ErrorCode, ErrorCodeOf as _},
-    frame::{
-        FrameType,
-        codec::{NextFrameError, ReadFrameError, ReadReceivedFrameError, read_received_frame},
-        set::{FrameSet, FrameStreamKind},
+    frame::codec::{ReadFrameError, ReadFrameHeadError, WriteFrameError, WriteFrameExt as _},
+    stream::{
+        FrameStream, NextFrameError,
+        kind::{ControlStreamKind, PushStreamKind, RequestStreamKind},
     },
-    stream::{FrameStream, FrameStreamInfo},
 };
 use libfuzzer_sys::fuzz_target;
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::{Min, Read, Skip, adapters::ReadSkip, prelude::*};
-use sakuya_var_int::VarInt;
+use nitori_io::{Min, Read, Skip, Write, adapters::ReadSkip, prelude::*};
 
 type Parts = HList![
     hatate_wire::Part,
@@ -154,24 +155,28 @@ impl Failure {
 /// it ended.
 type Outcome = (Vec<(u64, Vec<u8>)>, Option<Failure>);
 
-fn head_failure<E, T>(error: &ReadReceivedFrameError<E, T>) -> Failure {
-    let (failure, code) = match error {
-        ReadReceivedFrameError::Frame {
+fn head_failure<E>(error: &ReadFrameHeadError<E>) -> Failure {
+    let failure = match error {
+        ReadFrameHeadError::Frame {
             source: ReadFrameError::Type { .. } | ReadFrameError::Length { .. },
-        } => (Failure::Head, Some(ErrorCode::H3_FRAME_ERROR)),
-        ReadReceivedFrameError::Http2Type { .. } => {
-            (Failure::Http2, Some(ErrorCode::H3_FRAME_UNEXPECTED))
-        }
-        ReadReceivedFrameError::NotAllowedOnStream { .. } => {
-            (Failure::NotAllowed, Some(ErrorCode::H3_FRAME_UNEXPECTED))
-        }
-        ReadReceivedFrameError::NotReceivableByRole { .. } => {
-            (Failure::NotReceivable, Some(ErrorCode::H3_FRAME_UNEXPECTED))
-        }
+        } => Failure::Head,
+        ReadFrameHeadError::Http2Type { .. } => Failure::Http2,
+        ReadFrameHeadError::NotAllowedOnStream { .. } => Failure::NotAllowed,
+        ReadFrameHeadError::NotReceivableByRole { .. } => Failure::NotReceivable,
     };
-    assert_eq!(error.error_code(), code);
-    assert_eq!(code, Some(failure.code()));
+    assert_eq!(error.error_code(), Some(failure.code()));
     failure
+}
+
+fn next_failure<E>(error: &NextFrameError<E>) -> Failure {
+    match error {
+        NextFrameError::Skip { source } => {
+            assert_eq!(source.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
+            Failure::Payload
+        }
+        NextFrameError::Head { source } => head_failure(source),
+        NextFrameError::Interrupted => panic!("a stream was interrupted without a failure"),
+    }
 }
 
 /// Reads at most `take` bytes from `io`, stopping at EOF.
@@ -192,80 +197,97 @@ async fn read_some<A: ReceiverAccess<Family: Read>>(
     Ok(bytes)
 }
 
-/// Reads every frame of a stream that carries frames: of each, at most
-/// `take` bytes of its payload, then on to the next frame, by `next` or by
-/// `finish` and a read.
-#[call(sync)]
-async fn frames<F>(io: &mut impl ReceiverAccess<Family = F>, take: usize, next: bool) -> Outcome
-where
-    F: Skip<Count = usize> + Read<Error = Infallible> + FrameStreamInfo<Parts = Parts>,
-{
-    let mut seen = Vec::new();
-    let mut received = read_received_frame(&mut *io).await;
-    loop {
-        let mut frame = match received {
-            Ok(Some(frame)) => frame,
+/// The mode of `take` that writes the frames back.
+const WRITE_BACK: usize = 15;
+
+/// Walks the stream of one kind from its first frame: of each frame at most
+/// `take` bytes of its payload are read, or all of it is written to `out`.
+macro_rules! walk {
+    ($io:expr, $kind:ty, $role:expr, $take:expr, $known:expr, $out:expr) => {{
+        let take: usize = $take;
+        let known: bool = $known;
+        let mut seen = Vec::new();
+        let mut stream = match FrameStream::<Parts, $kind, _>::read($io, $role).await {
+            Ok(Some(stream)) => stream,
             Ok(None) => return (seen, None),
             Err(error) => return (seen, Some(head_failure(&error))),
         };
-        let payload = match read_some(frame.payload(), take).await {
-            Ok(payload) => payload,
-            Err(error) => {
-                assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
-                return (seen, Some(Failure::Payload));
-            }
-        };
-        let frame_type = match frame.frame_type() {
-            FrameType::Known(value) => <Parts as FrameSet>::value_of(value).get(),
-            FrameType::Unknown(value) => value.get(),
-        };
-        seen.push((frame_type, payload));
-        received = if next {
-            match frame.next().await {
-                Ok(frame) => Ok(frame),
-                Err(NextFrameError::Finish { source }) => {
-                    assert_eq!(source.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
-                    return (seen, Some(Failure::Payload));
+        loop {
+            let mut frame = stream.frame();
+            let frame_type = frame.frame_type().value().get();
+            if take == WRITE_BACK {
+                match $out.write_frame(frame).await {
+                    Ok(()) => seen.push((frame_type, Vec::new())),
+                    Err(WriteFrameError::Payload { .. }) => return (seen, Some(Failure::Payload)),
+                    Err(error) => panic!("a frame that was read was not written: {error}"),
                 }
-                Err(NextFrameError::Read { source }) => Err(source),
-            }
-        } else {
-            match frame.finish().await {
-                Ok(stream) => read_received_frame(stream).await,
-                Err(source) => {
-                    assert_eq!(source.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
-                    return (seen, Some(Failure::Payload));
+            } else {
+                match read_some(frame.payload(), take).await {
+                    Ok(payload) => seen.push((frame_type, payload)),
+                    Err(error) => {
+                        assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
+                        return (seen, Some(Failure::Payload));
+                    }
                 }
             }
-        };
+            let next = if known {
+                stream.next_known_frame().await
+            } else {
+                stream.next_frame().await
+            };
+            match next {
+                Ok(Some(_)) => {}
+                Ok(None) => return (seen, None),
+                Err(error) => return (seen, Some(next_failure(&error))),
+            }
+        }
+    }};
+}
+
+async fn frames_of<I, B>(
+    io: I,
+    out: &mut B,
+    kind: u8,
+    role: Role,
+    take: usize,
+    known: bool,
+) -> Outcome
+where
+    I: ReceiverAccess<Family: Skip<Count = usize> + Read<Error = Infallible>>,
+    B: ReceiverAccess<Family: Write<Error = Infallible>>,
+{
+    match kind & 3 {
+        1 => walk!(io, ControlStreamKind, role, take, known, out),
+        2 => walk!(io, PushStreamKind, role, take, known, out),
+        _ => walk!(io, RequestStreamKind, role, take, known, out),
     }
 }
 
-/// [`frames`] on a host that skips by itself.
+/// [`frames_of`] on a host that skips by itself.
 #[call(sync)]
-async fn native<F: Skip<Count = usize> + Read<Error = Infallible>>(
+async fn native<F: Skip<Count = usize> + Read<Error = Infallible>, W: Write<Error = Infallible>>(
     io: &mut impl ReceiverAccess<Family = F>,
-    kind: FrameStreamKind,
+    out: &mut impl ReceiverAccess<Family = W>,
+    kind: u8,
     role: Role,
     take: usize,
-    next: bool,
+    known: bool,
 ) -> Outcome {
-    let mut stream = io.compose(FrameStream::<Parts>::new(kind, role));
-    stream.frames(take, next).await
+    frames_of(&mut *io, out, kind, role, take, known).await
 }
 
-/// [`frames`] on a host that only reads, made to skip by [`ReadSkip`].
+/// [`frames_of`] on a host that only reads, made to skip by [`ReadSkip`].
 #[call(sync)]
-async fn by_reading<F: Read<Error = Infallible>>(
+async fn by_reading<F: Read<Error = Infallible>, W: Write<Error = Infallible>>(
     io: &mut impl ReceiverAccess<Family = F>,
-    kind: FrameStreamKind,
+    out: &mut impl ReceiverAccess<Family = W>,
+    kind: u8,
     role: Role,
     take: usize,
-    next: bool,
+    known: bool,
 ) -> Outcome {
-    let mut stream = io.compose(FrameStream::<Parts>::new(kind, role));
-    let mut skipping = stream.compose(ReadSkip);
-    skipping.frames(take, next).await
+    let mut skipping = io.compose(ReadSkip);
+    frames_of(&mut skipping, out, kind, role, take, known).await
 }
 
 /// The length and value of the variable-length integer at the start of
@@ -289,18 +311,14 @@ fn integer(bytes: &[u8]) -> Option<(usize, u64)> {
 /// Whether a frame of type `frame_type` may be on a stream of this kind and
 /// be received by this role, by RFC 9114 §7.2 and not by the library: the
 /// failure it calls for, if not.
-fn placement(frame_type: u64, kind: FrameStreamKind, role: Role) -> Option<Failure> {
-    let unidirectional = match kind {
-        FrameStreamKind::Request => None,
-        FrameStreamKind::Unidirectional(value) => Some(value.get()),
-    };
+fn placement(frame_type: u64, kind: u8, role: Role) -> Option<Failure> {
     let allowed = match frame_type {
         // DATA and HEADERS: a request or push stream.
-        0x00 | 0x01 => matches!(unidirectional, None | Some(1)),
+        0x00 | 0x01 => kind != 1,
         // PUSH_PROMISE: a request stream.
-        0x05 => unidirectional.is_none(),
+        0x05 => kind != 1 && kind != 2,
         // CANCEL_PUSH, SETTINGS, GOAWAY and MAX_PUSH_ID: the control stream.
-        0x03 | 0x04 | 0x07 | 0x0d => unidirectional == Some(0),
+        0x03 | 0x04 | 0x07 | 0x0d => kind == 1,
         _ => true,
     };
     if !allowed {
@@ -314,40 +332,106 @@ fn placement(frame_type: u64, kind: FrameStreamKind, role: Role) -> Option<Failu
     (!receivable).then_some(Failure::NotReceivable)
 }
 
-/// What an independent reading of `wire` gives.
-fn expected(wire: &[u8], kind: FrameStreamKind, role: Role, take: usize) -> Outcome {
+/// Whether a frame of this type is one the parts have on this kind of
+/// stream, rather than reserved or unknown.
+fn known_on(frame_type: u64, kind: u8) -> bool {
+    match frame_type {
+        0x00 | 0x01 => kind != 1,
+        0x05 => kind != 1 && kind != 2,
+        0x03 | 0x04 | 0x07 | 0x0d => kind == 1,
+        _ => false,
+    }
+}
+
+/// What an independent reading of the stream gives, and the bytes the frames
+/// it returns are written back as: `whole` of the complete ones, and `tail`, the
+/// stream from the start of the frame whose payload is cut, a prefix of
+/// which may have been written.
+struct Expected {
+    outcome: Outcome,
+    whole: Vec<u8>,
+    tail: Vec<u8>,
+}
+
+fn expected(wire: &[u8], kind: u8, role: Role, take: usize, known: bool) -> Expected {
+    let write_back = take == WRITE_BACK;
     let mut seen = Vec::new();
+    let mut whole = Vec::new();
     let mut at = 0;
+    let finish = |seen, failure, whole, tail| Expected {
+        outcome: (seen, failure),
+        whole,
+        tail,
+    };
     while at < wire.len() {
+        let start = at;
         let Some((type_length, frame_type)) = integer(&wire[at..]) else {
-            return (seen, Some(Failure::Head));
+            return finish(seen, Some(Failure::Head), whole, Vec::new());
         };
         // HTTP/2's types and the placement are checked before the Length.
         if matches!(frame_type, 0x02 | 0x06 | 0x08 | 0x09) {
-            return (seen, Some(Failure::Http2));
+            return finish(seen, Some(Failure::Http2), whole, Vec::new());
         }
         if let Some(failure) = placement(frame_type, kind, role) {
-            return (seen, Some(failure));
+            return finish(seen, Some(failure), whole, Vec::new());
         }
         let Some((length_length, length)) = integer(&wire[at + type_length..]) else {
-            return (seen, Some(Failure::Head));
+            return finish(seen, Some(Failure::Head), whole, Vec::new());
         };
-        let start = at + type_length + length_length;
-        let available = wire.len() - start;
+        let payload_start = at + type_length + length_length;
+        let available = wire.len() - payload_start;
         let length = usize::try_from(length).unwrap_or(usize::MAX);
-        // The bytes of the payload that are read must be there, and are
-        // seen; then the rest, which is skipped, must be there too.
-        let read = Ord::min(length, take);
-        if available < read {
-            return (seen, Some(Failure::Payload));
+        // The first frame is always given; later ones are given by
+        // next_known_frame only if known.
+        let returned = start == 0 || !known || known_on(frame_type, kind);
+        if !returned {
+            if available < length {
+                return finish(seen, Some(Failure::Payload), whole, Vec::new());
+            }
+        } else if write_back {
+            if available < length {
+                return finish(seen, Some(Failure::Payload), whole, wire[start..].to_vec());
+            }
+            seen.push((frame_type, Vec::new()));
+            whole.extend_from_slice(&wire[start..payload_start + length]);
+        } else {
+            // The bytes of the payload that are read must be there, and are
+            // seen; then the rest, which is skipped, must be there too.
+            let read = Ord::min(length, take);
+            if available < read {
+                return finish(seen, Some(Failure::Payload), whole, Vec::new());
+            }
+            seen.push((
+                frame_type,
+                wire[payload_start..payload_start + read].to_vec(),
+            ));
+            if available < length {
+                return finish(seen, Some(Failure::Payload), whole, Vec::new());
+            }
         }
-        seen.push((frame_type, wire[start..start + read].to_vec()));
-        if available < length {
-            return (seen, Some(Failure::Payload));
-        }
-        at = start + length;
+        at = payload_start + length;
     }
-    (seen, None)
+    finish(seen, None, whole, Vec::new())
+}
+
+/// What was written must be the bytes of the frames given, plus, after a
+/// failure inside a payload, a prefix of the frame that failed.
+fn check_written(expected: &Expected, written: &[u8]) {
+    assert!(
+        written.starts_with(&expected.whole),
+        "{written:?} {:?}",
+        expected.whole
+    );
+    if expected.outcome.1.is_none() {
+        assert_eq!(written, expected.whole);
+    } else {
+        let extra = &written[expected.whole.len()..];
+        assert!(
+            expected.tail.starts_with(extra),
+            "{extra:?} {:?}",
+            expected.tail
+        );
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -361,29 +445,26 @@ fuzz_target!(|data: &[u8]| {
         reads: 0,
         woken: false,
     };
-    let kind = match setup & 3 {
-        0 => FrameStreamKind::Request,
-        1 => FrameStreamKind::Unidirectional(VarInt::from_u32(0x00)),
-        2 => FrameStreamKind::Unidirectional(VarInt::from_u32(0x01)),
-        _ => FrameStreamKind::Unidirectional(VarInt::from_u32(0x21)),
-    };
+    let kind = setup & 3;
     let role = if setup & 4 == 0 {
         Role::Client
     } else {
         Role::Server
     };
-    let next = setup & 8 != 0;
+    let known = setup & 8 != 0;
     let take = usize::from(setup >> 4);
-    let expected = expected(wire, kind, role, take);
+    let expected = expected(wire, kind, role, take, known);
 
-    let mut host = arrival();
+    let mut hosts = (arrival(), Vec::<u8>::new());
     assert_eq!(
-        complete(host.native_unpin(kind, role, take, next)),
-        expected
+        complete(hosts.native_unpin(kind, role, take, known)),
+        expected.outcome
     );
-    let mut host = arrival();
+    check_written(&expected, &hosts.1);
+    let mut hosts = (arrival(), Vec::<u8>::new());
     assert_eq!(
-        complete(host.by_reading_unpin(kind, role, take, next)),
-        expected
+        complete(hosts.by_reading_unpin(kind, role, take, known)),
+        expected.outcome
     );
+    check_written(&expected, &hosts.1);
 });

@@ -9,12 +9,7 @@ use frunk_core::{
 use hatate_wire::{
     Role,
     error_code::{ErrorCode, ErrorCodeOf as _},
-    frame::{
-        FrameType, FrameWidths, Http3FrameType,
-        codec::{read_frame, read_received_frame},
-        payload::PayloadError,
-        set::FrameSet,
-    },
+    frame::{FrameWidths, payload::PayloadError, set::FramePartOn},
     settings::{
         Keyed, KeyedSetting, MaxFieldSectionSize, Setting,
         codec::{
@@ -22,14 +17,23 @@ use hatate_wire::{
         },
         set::{SettingList, Settings, SettingsOf},
     },
-    stream::{FrameStream, UnidirectionalStream, codec::read_unidirectional_stream},
-    stream_type::{StreamType, StreamTypeSet},
+    stream::{
+        FrameStream, ReceivedStream,
+        class::{
+            ClientInitiatedBidirectional, ClientInitiatedUnidirectional,
+            ServerInitiatedBidirectional, ServerInitiatedUnidirectional,
+        },
+        codec::{read_bidirectional_stream, read_unidirectional_stream},
+        http3::Http3UnidirectionalStream,
+        kind::{ControlStreamKind, PushStreamKind, RequestStreamKind},
+        part::{StreamSet, StreamVerdict},
+    },
 };
 use hatate_wire_datagram::{H3Datagram, H3DatagramValueError};
 use hatate_wire_extended_connect::{EnableConnectProtocol, EnableConnectProtocolValueError};
 use hatate_wire_qpack::{QpackBlockedStreams, QpackMaxTableCapacity};
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::Read;
+use nitori_io::{Read, Skip};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
 type All = HList![
@@ -50,59 +54,155 @@ type AllSetting = <AllList as SettingList>::Setting;
 type AllValueErrors = <AllList as SettingList>::ValueErrors;
 type Http3List = <Http3Only as SettingsOf>::Settings;
 
-/// Reads one whole SETTINGS frame into `settings`.
+/// Reads one whole SETTINGS frame, the first frame of a control stream of
+/// the parts of `All`, into `settings`.
 #[call(sync)]
-async fn read_settings<L: SettingList, F: Read, A: ReceiverAccess<Family = F>>(
+async fn read_settings<
+    L: SettingList,
+    F: Read + Skip<Count = usize>,
+    A: ReceiverAccess<Family = F>,
+>(
     io: &mut A,
     settings: &mut Settings<L>,
-) -> Result<Vec<Setting<L::Setting>>, ReadSettingError<PayloadError<F::Error>, L::ValueErrors>> {
-    let Ok(Some(head)) = read_frame(&mut *io).await else {
+) -> Result<Vec<Setting<L::Setting>>, ReadSettingError<PayloadError<F::Error>, L::ValueErrors>>
+where
+    <F as Read>::Error: core::fmt::Debug,
+{
+    let Ok(Some(mut stream)) =
+        FrameStream::<All, ControlStreamKind, _>::read(&mut *io, Role::Server).await
+    else {
         panic!("no frame head");
     };
-    assert_eq!(head.r#type().get().get(), 0x04);
-    let mut payload = head.into_payload().into_parts().1;
+    let mut frame = stream.frame();
+    assert_eq!(frame.frame_type().value().get(), 0x04);
     let mut read = Vec::new();
-    {
-        let mut source = io.compose(&mut payload);
-        while let Some(setting) = source.read_setting(settings).await? {
-            read.push(setting);
-        }
+    while let Some(setting) = frame.payload().read_setting(settings).await? {
+        read.push(setting);
     }
+    let payload = frame.into_payload().into_parts().1;
     assert_eq!(payload.remaining(), 0, "the payload was read to its end");
     Ok(read)
 }
 
-/// Whether the frame type at the start of the stream, read on a request
-/// stream with the parts of `All`, is unknown; with its value.
-#[call(sync)]
-async fn frame_type_on_request_stream<F: Read, A: ReceiverAccess<Family = F>>(
-    io: &mut A,
-) -> FrameType<<All as FrameSet>::TypeValue>
-where
-    <F as Read>::Error: core::fmt::Debug,
-{
-    let io = io.compose(FrameStream::<All>::request(Role::Server));
-    read_received_frame(io).await.unwrap().unwrap().frame_type()
+/// How a stream of the parts of a list started.
+#[derive(Debug, PartialEq, Eq)]
+enum Started {
+    /// A request stream at its first frame, of this type.
+    Request(u64),
+    /// A control stream at its first frame, of this type.
+    Control(u64),
+    /// A push stream with this Push ID, at its first frame, of this type.
+    Push(u64, u64),
+    QpackEncoder,
+    QpackDecoder,
+    /// A stream no part claims, with its value.
+    Unknown(u64),
+    /// No first value: the stream ended or held only reserved frames.
+    Empty,
+    /// A part rejects the stream with this code.
+    Rejected(ErrorCode),
 }
 
-/// The type of the unidirectional stream at the start of the stream, read
-/// with the parts of `All`, of a stream that carries no frames.
-#[call(sync)]
-async fn other_stream_type<F: Read, A: ReceiverAccess<Family = F>>(
-    io: &mut A,
-) -> StreamType<<All as StreamTypeSet>::TypeValue>
-where
-    <F as Read>::Error: core::fmt::Debug,
-{
-    match read_unidirectional_stream::<All, _>(&mut *io, Role::Client)
-        .await
-        .unwrap()
-        .unwrap()
-    {
-        UnidirectionalStream::Other(stream) => stream.head().stream_type(),
-        _ => panic!("not a stream without frames"),
-    }
+/// Reads the start of streams with the parts of a list. `$known` takes the
+/// sum of the streams the parts of the list give and returns the stream of
+/// HTTP/3, the only part that has any; the others' are empty.
+macro_rules! streams {
+    ($request:ident, $unidirectional:ident, $list:ty, |$known:ident| $http3:expr) => {
+        /// A client-initiated bidirectional stream.
+        #[call(sync)]
+        async fn $request<F: Read + Skip<Count = usize>, A: ReceiverAccess<Family = F>>(
+            io: &mut A,
+        ) -> Started
+        where
+            <F as Read>::Error: core::fmt::Debug,
+        {
+            match read_bidirectional_stream::<$list, ClientInitiatedBidirectional, _>(&mut *io)
+                .await
+            {
+                Err(error) => Started::Rejected(error.error_code().unwrap()),
+                Ok(None) => Started::Empty,
+                Ok(Some(ReceivedStream::Unknown(unknown))) => {
+                    Started::Unknown(unknown.value().get())
+                }
+                Ok(Some(ReceivedStream::Known($known))) => {
+                    let mut request = $http3;
+                    Started::Request(request.frame().frame_type().value().get())
+                }
+            }
+        }
+
+        /// A unidirectional stream that the peer opened; `server` tells whether
+        /// the server opened it.
+        #[call(sync)]
+        async fn $unidirectional<F: Read + Skip<Count = usize>, A: ReceiverAccess<Family = F>>(
+            io: &mut A,
+            server: bool,
+        ) -> Started
+        where
+            <F as Read>::Error: core::fmt::Debug,
+        {
+            let stream = if server {
+                read_unidirectional_stream::<$list, ServerInitiatedUnidirectional, _>(&mut *io)
+                    .await
+                    .unwrap()
+                    .map(|stream| stream.into_stream())
+            } else {
+                read_unidirectional_stream::<$list, ClientInitiatedUnidirectional, _>(&mut *io)
+                    .await
+                    .unwrap()
+                    .map(|stream| stream.into_stream())
+            };
+            match stream {
+                None => Started::Empty,
+                Some(ReceivedStream::Unknown(unknown)) => Started::Unknown(unknown.value().get()),
+                Some(ReceivedStream::Known($known)) => match $http3 {
+                    Http3UnidirectionalStream::Control(mut control) => {
+                        Started::Control(control.frame().frame_type().value().get())
+                    }
+                    Http3UnidirectionalStream::Push(mut push) => Started::Push(
+                        push.push_id().get().get().get(),
+                        push.frames().frame().frame_type().value().get(),
+                    ),
+                    Http3UnidirectionalStream::QpackEncoder(_) => Started::QpackEncoder,
+                    Http3UnidirectionalStream::QpackDecoder(_) => Started::QpackDecoder,
+                },
+            }
+        }
+    };
 }
+
+streams!(request_all, unidirectional_all, All, |known| match known {
+    Coproduct::Inl(http3) => http3,
+    Coproduct::Inr(Coproduct::Inl(none)) => match none {},
+    Coproduct::Inr(Coproduct::Inr(Coproduct::Inl(none))) => match none {},
+    Coproduct::Inr(Coproduct::Inr(Coproduct::Inr(none))) => match none {},
+});
+streams!(
+    request_reversed,
+    unidirectional_reversed,
+    Reversed,
+    |known| match known {
+        Coproduct::Inl(none) => match none {},
+        Coproduct::Inr(Coproduct::Inl(none)) => match none {},
+        Coproduct::Inr(Coproduct::Inr(Coproduct::Inl(http3))) => http3,
+        Coproduct::Inr(Coproduct::Inr(Coproduct::Inr(none))) => match none {},
+    }
+);
+streams!(
+    request_http3_only,
+    unidirectional_http3_only,
+    Http3Only,
+    |known| match known {
+        Coproduct::Inl(http3) => http3,
+        Coproduct::Inr(none) => match none {},
+    }
+);
+
+type Reversed = HList![
+    hatate_wire_extended_connect::Part,
+    hatate_wire_datagram::Part,
+    hatate_wire::Part
+];
 
 fn frame(payload: &[u8]) -> Vec<u8> {
     assert!(payload.len() < 64);
@@ -438,30 +538,172 @@ fn each_setting_of_the_extensions_is_written_and_read_back() {
 }
 
 #[test]
-fn frame_types_and_stream_types_of_the_extensions_are_none() {
-    // The two extensions add no frame or stream types: every value either
-    // belongs to HTTP/3 or is unknown, in any list.
-    for value in 0..0x80u32 {
+fn the_extensions_add_no_frame_types_or_streams_of_their_own() {
+    // No frames on any kind of stream.
+    fn none<K: hatate_wire::stream::kind::StreamKind, P: FramePartOn<K>>() -> bool
+    where
+        P::FrameType: 'static,
+    {
+        core::any::TypeId::of::<P::FrameType>()
+            == core::any::TypeId::of::<frunk_core::coproduct::CNil>()
+    }
+    assert!(none::<RequestStreamKind, hatate_wire_datagram::Part>());
+    assert!(none::<ControlStreamKind, hatate_wire_datagram::Part>());
+    assert!(none::<PushStreamKind, hatate_wire_datagram::Part>());
+    assert!(none::<RequestStreamKind, hatate_wire_extended_connect::Part>());
+    assert!(none::<ControlStreamKind, hatate_wire_extended_connect::Part>());
+    assert!(none::<PushStreamKind, hatate_wire_extended_connect::Part>());
+    assert!(!none::<RequestStreamKind, hatate_wire::Part>());
+
+    // No streams in any class: every value is not theirs.
+    for value in 0..0x100u32 {
         let value = VarInt::from_u32(value);
-        let in_all = <All as FrameSet>::type_value_of(value).is_some();
-        let in_http3 = <Http3Only as FrameSet>::type_value_of(value).is_some();
-        assert_eq!(in_all, in_http3);
-        assert_eq!(in_all, Http3FrameType::of(value).is_some());
+        for skipped in [false, true] {
+            assert_eq!(
+                <HList![
+                    hatate_wire_datagram::Part,
+                    hatate_wire_extended_connect::Part
+                ] as StreamSet<ClientInitiatedUnidirectional, All>>::judge(
+                    value, skipped
+                ),
+                StreamVerdict::NotClaimed
+            );
+        }
+    }
+}
+
+/// What a list's verdict on a value is, apart from the form of the claim.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    Claimed,
+    NotClaimed,
+    Error(ErrorCode),
+    ErrorUnlessClaimed(ErrorCode),
+}
+
+fn verdict<T>(verdict: StreamVerdict<T>) -> Verdict {
+    match verdict {
+        StreamVerdict::Claimed(_) => Verdict::Claimed,
+        StreamVerdict::NotClaimed => Verdict::NotClaimed,
+        StreamVerdict::Error(code) => Verdict::Error(code),
+        StreamVerdict::ErrorUnlessClaimed(code) => Verdict::ErrorUnlessClaimed(code),
+    }
+}
+
+#[test]
+fn the_extensions_change_no_verdict_of_the_list_in_any_class() {
+    macro_rules! same {
+        ($class:ty, $value:expr, $skipped:expr) => {
+            assert_eq!(
+                verdict(<All as StreamSet<$class, All>>::judge($value, $skipped)),
+                verdict(<Http3Only as StreamSet<$class, Http3Only>>::judge(
+                    $value, $skipped
+                )),
+                "{} {:?}",
+                stringify!($class),
+                $value
+            );
+            assert_eq!(
+                verdict(<Reversed as StreamSet<$class, Reversed>>::judge(
+                    $value, $skipped
+                )),
+                verdict(<Http3Only as StreamSet<$class, Http3Only>>::judge(
+                    $value, $skipped
+                )),
+                "{} {:?}",
+                stringify!($class),
+                $value
+            );
+        };
+    }
+    let mut values: Vec<u64> = (0..0x100).chain([0x3fff, 0x4000, (1 << 62) - 1]).collect();
+    for n in [0, 1, 2, 100, 1 << 30] {
+        values.push(hatate_wire::registry::reserved(n).unwrap().get());
+    }
+    for value in values {
+        let value = VarInt::new(value).unwrap();
+        for skipped in [false, true] {
+            same!(ClientInitiatedBidirectional, value, skipped);
+            same!(ServerInitiatedBidirectional, value, skipped);
+            same!(ClientInitiatedUnidirectional, value, skipped);
+            same!(ServerInitiatedUnidirectional, value, skipped);
+        }
+    }
+}
+
+#[test]
+fn a_list_with_the_extensions_reads_request_streams_wherever_the_part_of_http3_is() {
+    let wire = [0x01, 0x02, 0xaa, 0xbb];
+    for list in 0..3 {
+        // A reserved frame before it changes nothing.
+        let wire = [&[0x21, 0x00][..], &wire].concat();
+        let mut input = &wire[..];
+        let started = match list {
+            0 => input.sync_request_all_unpin(),
+            1 => input.sync_request_reversed_unpin(),
+            _ => input.sync_request_http3_only_unpin(),
+        };
+        assert_eq!(started, Started::Request(0x01), "list {list}");
+    }
+    // The values the extensions do not claim are as unknown as without them.
+    for value in [0x33u8, 0x0a, 0x0b] {
+        let wire = [value, 0x00];
+        let mut input = &wire[..];
         assert_eq!(
-            <All as StreamTypeSet>::type_value_of(value).is_some(),
-            <Http3Only as StreamTypeSet>::type_value_of(value).is_some()
+            input.sync_request_all_unpin(),
+            Started::Unknown(u64::from(value))
+        );
+        let mut input = &wire[..];
+        assert_eq!(
+            input.sync_request_reversed_unpin(),
+            Started::Unknown(u64::from(value))
         );
     }
-    let mut input = &[0x33, 0x00][..];
-    assert_eq!(
-        input.sync_frame_type_on_request_stream_unpin(),
-        FrameType::Unknown(VarInt::from_u32(0x33))
-    );
-    let mut input = &[0x08][..];
-    assert_eq!(
-        input.sync_other_stream_type_unpin(),
-        StreamType::Unknown(VarInt::from_u32(0x08))
-    );
+    let mut input = &[][..];
+    assert_eq!(input.sync_request_all_unpin(), Started::Empty);
+    // PUSH_PROMISE, HTTP/2's types and the frames of other streams are
+    // rejected as without the extensions.
+    for value in [0x02u8, 0x03, 0x04, 0x05, 0x07, 0x0d] {
+        let wire = [value, 0x00];
+        for started in [
+            (&wire[..]).sync_request_all_unpin(),
+            (&wire[..]).sync_request_reversed_unpin(),
+            (&wire[..]).sync_request_http3_only_unpin(),
+        ] {
+            assert_eq!(started, Started::Rejected(ErrorCode::H3_FRAME_UNEXPECTED));
+        }
+    }
+}
+
+#[test]
+fn a_list_with_the_extensions_reads_control_push_and_qpack_streams() {
+    macro_rules! check {
+        ($module:ident) => {
+            // The control stream, at its SETTINGS frame, from both sides.
+            for server in [false, true] {
+                let mut input = &[0x00, 0x04, 0x02, 0x33, 0x01][..];
+                assert_eq!(input.$module(server), Started::Control(0x04));
+            }
+            // A server's push stream.
+            let mut input = &[0x01, 0x07, 0x01, 0x00][..];
+            assert_eq!(input.$module(true), Started::Push(7, 0x01));
+            let mut input = &[0x02][..];
+            assert_eq!(input.$module(true), Started::QpackEncoder);
+            let mut input = &[0x03][..];
+            assert_eq!(input.$module(false), Started::QpackDecoder);
+            // What no part claims is unknown, the types of the extensions
+            // included: they have none.
+            for value in [0x04u8, 0x08, 0x33] {
+                let mut input = &[value][..];
+                assert_eq!(input.$module(true), Started::Unknown(u64::from(value)));
+            }
+            let mut input = &[][..];
+            assert_eq!(input.$module(true), Started::Empty);
+        };
+    }
+    check!(sync_unidirectional_all_unpin);
+    check!(sync_unidirectional_reversed_unpin);
+    check!(sync_unidirectional_http3_only_unpin);
 }
 
 #[test]

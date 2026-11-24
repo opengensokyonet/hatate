@@ -1,22 +1,19 @@
 //! HTTP/3 frames ([RFC 9114 §7]).
 //!
 //! A frame is a Type, a Length and a payload of Length bytes, on a stream
-//! where its bytes may arrive in pieces. Reading one has three steps, as for
-//! every object on a byte stream: [`codec::read_received_frame`] reads the
-//! Type and Length from a stream that carries frames, finds the part that
-//! claims the type and checks that the frame may arrive there; the caller
-//! then consumes the payload, the stream composed with a
-//! [`payload::FramePayload`], either itself or with the reader of that
-//! frame type; and [`ReceivedFrame::finish`] skips what is left of the
-//! payload and gives the stream back at the next frame, or
-//! [`ReceivedFrame::next`] also reads that frame. [`codec::read_frame`]
-//! reads a [`Frame`] from any source, without the type and placement
-//! checks.
+//! where its bytes may arrive in pieces. Frames are read on a stream that
+//! carries them, a [`FrameStream`](crate::stream::FrameStream), which holds
+//! the current frame: [`frame`](crate::stream::FrameStream::frame) gives it,
+//! with its payload, the stream composed with a [`payload::FramePayload`],
+//! for the caller to consume itself or with the reader of that frame type;
+//! [`next_frame`](crate::stream::FrameStream::next_frame) skips what is left
+//! of the payload and reads the next frame.
 //!
-//! The types of a connection are those of a list of parts ([`set`]). A
-//! type no part claims, including the reserved types and those of
-//! extensions the list leaves out, is [`FrameType::Unknown`] and handed to
-//! the caller, who normally discards it ([RFC 9114 §9]).
+//! The types of a connection are those of a list of parts ([`set`]), and
+//! each kind of stream has its own ([`set::FrameSetOn`]). A reserved type is
+//! [`FrameType::Reserved`]; one no part claims, including those of
+//! extensions the list leaves out, is [`FrameType::Unknown`]. Both are
+//! skipped ([RFC 9114 §9]).
 //!
 //! Each variable-length integer keeps the width it was read with, and is
 //! written at the width its value holds, so that writing a value read from
@@ -24,10 +21,12 @@
 //!
 //! [RFC 9114 §7]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7
 //! [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9
-use crate::stream_type::Http3StreamType;
-use crate::{Role, registry::ClaimedValues};
+use crate::{
+    Role,
+    registry::{ClaimedValue, ClaimedValues, UnclaimedValueError, is_reserved},
+};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
-use set::{FrameKind, FrameStreamKind};
+use set::FrameKind;
 use snafu::Snafu;
 
 #[allow(missing_docs)] // The call macro also generates operation and extension trait items.
@@ -97,36 +96,133 @@ impl Http3FrameType {
     }
 }
 
-/// The placement and role rules of [RFC 9114 §7.2].
-///
-/// [RFC 9114 §7.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2
-impl FrameKind for Http3FrameType {
-    fn allowed_on(self, stream: FrameStreamKind) -> bool {
-        let unidirectional = match stream {
-            FrameStreamKind::Request => None,
-            FrameStreamKind::Unidirectional(value) => Some(Http3StreamType::of(value)),
-        };
-        match self {
-            Self::Data | Self::Headers => {
-                matches!(unidirectional, None | Some(Some(Http3StreamType::Push)))
-            }
-            Self::PushPromise => unidirectional.is_none(),
-            Self::CancelPush | Self::Settings | Self::Goaway | Self::MaxPushId => {
-                unidirectional == Some(Some(Http3StreamType::Control))
-            }
-        }
+impl ClaimedValue for Http3FrameType {
+    fn value(self) -> VarInt {
+        Self::value(self)
     }
 
-    fn receivable_by(self, role: Role) -> bool {
-        match self {
-            // Only a server pushes (§7.2.5), and only a client permits
-            // pushes (§7.2.7).
-            Self::PushPromise => role == Role::Client,
-            Self::MaxPushId => role == Role::Server,
-            _ => true,
-        }
+    fn of(value: VarInt) -> Option<Self> {
+        Self::of(value)
     }
 }
+
+impl From<Http3FrameType> for VarInt {
+    fn from(frame_type: Http3FrameType) -> Self {
+        frame_type.value()
+    }
+}
+
+impl TryFrom<VarInt> for Http3FrameType {
+    type Error = UnclaimedValueError;
+
+    fn try_from(value: VarInt) -> Result<Self, UnclaimedValueError> {
+        Self::of(value).ok_or(UnclaimedValueError::new(value))
+    }
+}
+
+/// The role rules of [RFC 9114 §7.2.5, §7.2.7]: only a server pushes, and
+/// only a client permits pushes.
+///
+/// [RFC 9114 §7.2.5, §7.2.7]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.5
+const fn http3_receivable_by(frame_type: Http3FrameType, role: Role) -> bool {
+    match frame_type {
+        Http3FrameType::PushPromise => matches!(role, Role::Client),
+        Http3FrameType::MaxPushId => matches!(role, Role::Server),
+        _ => true,
+    }
+}
+
+macro_rules! frame_types_on {
+    ($(#[$meta:meta])* $name:ident { $($(#[$variant_meta:meta])* $variant:ident),+ $(,)? }) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $($(#[$variant_meta])* $variant,)+
+        }
+
+        impl $name {
+            /// The frame type as RFC 9114 names it.
+            pub const fn frame_type(self) -> Http3FrameType {
+                match self {
+                    $(Self::$variant => Http3FrameType::$variant,)+
+                }
+            }
+
+            /// The frame type `frame_type`, if it appears on this kind of stream.
+            pub const fn of_frame_type(frame_type: Http3FrameType) -> Option<Self> {
+                match frame_type {
+                    $(Http3FrameType::$variant => Some(Self::$variant),)+
+                    #[allow(unreachable_patterns)]
+                    _ => None,
+                }
+            }
+        }
+
+        impl From<$name> for Http3FrameType {
+            fn from(frame_type: $name) -> Self {
+                frame_type.frame_type()
+            }
+        }
+
+        impl ClaimedValue for $name {
+            fn value(self) -> VarInt {
+                self.frame_type().value()
+            }
+
+            fn of(value: VarInt) -> Option<Self> {
+                match Http3FrameType::of(value) {
+                    Some(frame_type) => Self::of_frame_type(frame_type),
+                    None => None,
+                }
+            }
+        }
+
+        impl FrameKind for $name {
+            fn receivable_by(self, role: Role) -> bool {
+                http3_receivable_by(self.frame_type(), role)
+            }
+        }
+    };
+}
+
+frame_types_on!(
+    /// A frame type of RFC 9114 that appears on a request stream
+    /// ([RFC 9114 §7.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2)).
+    RequestFrameType {
+        /// DATA (0x00).
+        Data,
+        /// HEADERS (0x01).
+        Headers,
+        /// PUSH_PROMISE (0x05), which only a client receives.
+        PushPromise,
+    }
+);
+
+frame_types_on!(
+    /// A frame type of RFC 9114 that appears on a control stream
+    /// ([RFC 9114 §7.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2)).
+    ControlFrameType {
+        /// CANCEL_PUSH (0x03).
+        CancelPush,
+        /// SETTINGS (0x04).
+        Settings,
+        /// GOAWAY (0x07).
+        Goaway,
+        /// MAX_PUSH_ID (0x0d), which only a server receives.
+        MaxPushId,
+    }
+);
+
+frame_types_on!(
+    /// A frame type of RFC 9114 that appears on a push stream
+    /// ([RFC 9114 §7.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2)).
+    PushFrameType {
+        /// DATA (0x00).
+        Data,
+        /// HEADERS (0x01).
+        Headers,
+    }
+);
 
 /// The frame types HTTP/2 defines and HTTP/3 does not: receiving one is a
 /// connection error of type H3_FRAME_UNEXPECTED ([RFC 9114 §7.2.8]).
@@ -295,46 +391,83 @@ impl FrameWidths {
     }
 }
 
-/// The type of a frame as a list of parts reads it.
+/// The type of a frame on a stream of some kind, as the list of parts of
+/// the stream reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FrameType<T> {
-    /// A type that a part of the list claims, in the form of that part.
+    /// A type that a part of the list has on this kind of stream, in the form
+    /// of that part.
     Known(T),
-    /// A type no part of the list claims. The caller normally discards the
-    /// payload ([RFC 9114 §9]); a part that is not in the list could read it.
+    /// A reserved type ([RFC 9114 §7.2.8]), which belongs to no part and has
+    /// no meaning; its payload is skipped.
+    ///
+    /// [RFC 9114 §7.2.8]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
+    Reserved(VarInt),
+    /// A type that no part of the list claims. Its payload is skipped
+    /// ([RFC 9114 §9]); a part that is not in the list could read it.
     ///
     /// [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9
     Unknown(VarInt),
 }
 
+impl<T: ClaimedValue> FrameType<T> {
+    /// The type on the wire.
+    pub fn value(self) -> VarInt {
+        match self {
+            Self::Known(frame_type) => frame_type.value(),
+            Self::Reserved(value) | Self::Unknown(value) => value,
+        }
+    }
+}
+
+/// The type `value` as the list reads it: a type it has on this kind of
+/// stream, else reserved, else unknown. A type the list claims for other
+/// kinds of stream, or one of HTTP/2, is unknown here; reading a frame
+/// rejects it before it becomes a `FrameType`.
+impl<T: ClaimedValue> From<VarInt> for FrameType<T> {
+    fn from(value: VarInt) -> Self {
+        match T::of(value) {
+            Some(frame_type) => Self::Known(frame_type),
+            None if is_reserved(value) => Self::Reserved(value),
+            None => Self::Unknown(value),
+        }
+    }
+}
+
+impl<T: ClaimedValue> From<FrameType<T>> for VarInt {
+    fn from(frame_type: FrameType<T>) -> Self {
+        frame_type.value()
+    }
+}
+
 /// A frame ([RFC 9114 §7.1]): its Type, its Length, and its payload `P`.
 ///
-/// Read from a stream with [`codec::read_frame`], the payload is the
-/// stream composed with a [`FramePayload`](payload::FramePayload), which
-/// ends at the end of the payload; [`finish`](Self::finish) skips what is
-/// left of it and gives the stream back, at the next frame, and
-/// [`next`](Self::next) reads that frame too. To write a frame, the
-/// payload is a source of its bytes ([`codec::write_frame`]).
+/// `T` is the type of the Type field, which keeps the width it had on the
+/// wire: the frame types of a kind of stream as its list of parts reads them,
+/// [`FrameType`], for a frame read from a
+/// [`FrameStream`](crate::stream::FrameStream), or any type that gives its
+/// value on the wire, such as [`Http3FrameType`] or a raw `VarInt`, for a
+/// frame to write. A frame read from a stream is written back as the bytes
+/// it was read from.
 ///
-/// The stream stays inside a frame that is dropped before it is finished,
-/// and so does it when the call reading the frame is dropped: no frame can be
-/// read from it any more, and the stream is abandoned, with STOP_SENDING or
-/// by closing the connection, as HTTP/3 does with a stream it stops reading.
+/// Read from a stream, the payload is the stream composed with what is left
+/// of the payload ([`FramePayload`](payload::FramePayload)), which ends at
+/// the end of the payload. To write a frame, the payload is a source of its
+/// bytes ([`codec::write_frame`]).
 ///
 /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
-#[must_use = "a stream stays inside a frame that is not finished"]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Frame<P> {
-    r#type: VarIntField<VarInt>,
+pub struct Frame<T, P> {
+    r#type: VarIntField<T>,
     length: VarIntField<VarInt>,
     payload: P,
 }
 
-impl<P> Frame<P> {
+impl<T, P> Frame<T, P> {
     /// The frame with the Type `r#type`, the Length `length` and the
     /// payload `payload`. Whether the payload has that length is checked
     /// where it is written.
-    pub const fn new(r#type: VarIntField<VarInt>, length: VarIntField<VarInt>, payload: P) -> Self {
+    pub const fn new(r#type: VarIntField<T>, length: VarIntField<VarInt>, payload: P) -> Self {
         Self {
             r#type,
             length,
@@ -342,19 +475,9 @@ impl<P> Frame<P> {
         }
     }
 
-    /// The Type field.
-    pub const fn r#type(&self) -> VarIntField<VarInt> {
-        self.r#type
-    }
-
     /// The Length field: the length of the payload in bytes.
     pub const fn length(&self) -> VarIntField<VarInt> {
         self.length
-    }
-
-    /// The widths of the Type and Length.
-    pub const fn widths(&self) -> FrameWidths {
-        FrameWidths::new(self.r#type.width(), self.length.width())
     }
 
     /// The payload.
@@ -368,44 +491,19 @@ impl<P> Frame<P> {
     }
 }
 
-/// A frame read from a stream that carries frames, with its type as the
-/// list of parts of the stream reads it.
-///
-/// [`codec::read_received_frame`] reads it from a stream composed with a
-/// [`FrameStream`](crate::stream::FrameStream), and checks that a frame of
-/// its type may arrive there. `T` is the frame type value of the list of
-/// parts ([`set::FrameSet::TypeValue`]). As with [`Frame`], the stream
-/// stays inside a frame that is dropped before it is finished.
-#[must_use = "a stream stays inside a frame that is not finished"]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ReceivedFrame<T, P> {
-    frame_type: FrameType<T>,
-    frame: Frame<P>,
-}
-
-impl<T: Copy, P> ReceivedFrame<T, P> {
-    /// The frame of type `frame_type`, which its stream allows.
-    pub(crate) const fn new(frame_type: FrameType<T>, frame: Frame<P>) -> Self {
-        Self { frame_type, frame }
+impl<T: Copy, P> Frame<T, P> {
+    /// The Type field.
+    pub const fn r#type(&self) -> VarIntField<T> {
+        self.r#type
     }
 
-    /// The frame type, as the list of parts reads it.
-    pub const fn frame_type(&self) -> FrameType<T> {
-        self.frame_type
+    /// The type.
+    pub const fn frame_type(&self) -> T {
+        self.r#type.get()
     }
 
-    /// The frame.
-    pub const fn frame(&self) -> &Frame<P> {
-        &self.frame
-    }
-
-    /// The payload of the frame.
-    pub fn payload(&mut self) -> &mut P {
-        self.frame.payload()
-    }
-
-    /// The frame, without its type as the parts read it.
-    pub fn into_frame(self) -> Frame<P> {
-        self.frame
+    /// The widths of the Type and Length.
+    pub const fn widths(&self) -> FrameWidths {
+        FrameWidths::new(self.r#type.width(), self.length.width())
     }
 }

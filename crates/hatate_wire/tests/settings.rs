@@ -9,9 +9,9 @@ use frunk_core::{
     coproduct::{CoprodInjector, CoproductSelector},
 };
 use hatate_wire::{
-    Part,
+    Part, Role,
     error_code::{ErrorCode, ErrorCodeOf as _},
-    frame::{FrameWidths, Http3FrameType, codec::read_frame, payload::PayloadError},
+    frame::{FrameWidths, Http3FrameType, payload::PayloadError},
     settings::{
         Http2SettingIdentifier, Keyed, KeyedSetting, MaxFieldSectionSize, Setting, UnknownSetting,
         codec::{
@@ -20,6 +20,7 @@ use hatate_wire::{
         },
         set::{SettingList, Settings, SettingsOf, SettingsPart},
     },
+    stream::{FrameStream, kind::ControlStreamKind},
 };
 use hatate_wire_qpack::{QpackBlockedStreams, QpackMaxTableCapacity};
 use nitori_call::{ReceiverAccess, call};
@@ -38,19 +39,22 @@ async fn read_settings<L: SettingList, F: Read, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     settings: &mut Settings<L>,
 ) -> Result<Vec<Setting<L::Setting>>, ReadSettingError<PayloadError<F::Error>, L::ValueErrors>> {
-    let Ok(Some(head)) = read_frame(&mut *io).await else {
+    let Ok(Some(mut stream)) =
+        FrameStream::<Parts, ControlStreamKind, _>::read(&mut *io, Role::Server).await
+    else {
         panic!("no frame head");
     };
-    assert_eq!(head.r#type().get(), Http3FrameType::Settings.value());
-    let mut payload = head.into_payload().into_parts().1;
+    let mut head = stream.frame();
+    assert_eq!(head.frame_type().value(), Http3FrameType::Settings.value());
     let mut read = Vec::new();
-    {
-        let mut source = io.compose(&mut payload);
-        while let Some(setting) = source.read_setting(settings).await? {
-            read.push(setting);
-        }
+    while let Some(setting) = head.payload().read_setting(settings).await? {
+        read.push(setting);
     }
-    assert_eq!(payload.remaining(), 0, "the payload was read to its end");
+    assert_eq!(
+        stream.frame().into_payload().into_parts().1.remaining(),
+        0,
+        "the payload was read to its end"
+    );
     Ok(read)
 }
 
@@ -60,7 +64,12 @@ async fn head_widths<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> Fram
 where
     <F as Read>::Error: core::fmt::Debug,
 {
-    read_frame(&mut *io).await.unwrap().unwrap().widths()
+    FrameStream::<Parts, ControlStreamKind, _>::read(&mut *io, Role::Server)
+        .await
+        .unwrap()
+        .unwrap()
+        .frame()
+        .widths()
 }
 
 fn frame(payload: &[u8]) -> Vec<u8> {

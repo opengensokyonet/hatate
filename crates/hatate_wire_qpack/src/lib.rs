@@ -4,7 +4,9 @@
 //! error codes in the registries of HTTP/3. Every HTTP/3 connection uses
 //! QPACK, so these entries are not a separate part of a composition: the
 //! RFC 9114 part of `hatate_wire` takes them in. This package holds the
-//! values and what each of them means, and nothing of the composition.
+//! values and what each of them means, and nothing of the composition, and
+//! the two QPACK streams as HTTP/3 has them ([`stream`]): critical streams
+//! over the instruction streams of `hatate_qpack`.
 //!
 //! [RFC 9204 §8]: https://www.rfc-editor.org/rfc/rfc9204.html#section-8
 #![no_std]
@@ -17,6 +19,8 @@
 )]
 
 use sakuya_var_int::{VarInt, VarIntField};
+
+pub mod stream;
 
 /// SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x01): the largest dynamic table
 /// capacity the encoder may set ([RFC 9204 §5]). Every value is valid.

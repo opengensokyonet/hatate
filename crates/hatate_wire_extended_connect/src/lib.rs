@@ -18,11 +18,18 @@
 
 use frunk_core::{HList, coproduct::CNil};
 use hatate_wire::{
-    frame::set::FramePart,
+    frame::set::{FramePart, FramePartOn},
     registry::ClaimedValues,
     settings::{KeyedSetting, set::SettingsPart},
+    stream::{
+        class::StreamClass,
+        kind::StreamKind,
+        part::{StreamPart, StreamVerdict},
+    },
     stream_type::StreamTypePart,
 };
+use nitori_call::ReceiverAccess;
+use nitori_io::Read;
 use sakuya_var_int::{VarInt, VarIntField};
 use snafu::Snafu;
 
@@ -104,37 +111,33 @@ impl SettingsPart for Part {
 }
 
 impl FramePart for Part {
-    type Kind = CNil;
-    type TypeValue = CNil;
     const FRAME_TYPES: &'static ClaimedValues = &ClaimedValues::NONE;
+}
 
-    fn type_value_of(_value: VarInt) -> Option<CNil> {
-        None
-    }
-
-    fn value_of(type_value: CNil) -> VarInt {
-        match type_value {}
-    }
-
-    fn kind_of(type_value: CNil) -> CNil {
-        match type_value {}
-    }
+/// No frame types, on any kind of stream.
+impl<K: StreamKind> FramePartOn<K> for Part {
+    type FrameType = CNil;
 }
 
 impl StreamTypePart for Part {
-    type Kind = CNil;
-    type TypeValue = CNil;
     const STREAM_TYPES: &'static ClaimedValues = &ClaimedValues::NONE;
+}
 
-    fn type_value_of(_value: VarInt) -> Option<CNil> {
-        None
+/// No streams of its own, in any class.
+impl<C: StreamClass, L> StreamPart<C, L> for Part {
+    type Claimed = CNil;
+    type Stream<I> = CNil;
+    type ReadError<E> = CNil;
+
+    fn judge(_value: VarInt, _skipped: bool) -> StreamVerdict<CNil> {
+        StreamVerdict::NotClaimed
     }
 
-    fn value_of(type_value: CNil) -> VarInt {
-        match type_value {}
-    }
-
-    fn kind_of(type_value: CNil) -> CNil {
-        match type_value {}
+    async fn read<I: ReceiverAccess<Family: Read>>(
+        claimed: CNil,
+        _field: VarIntField<VarInt>,
+        _io: I,
+    ) -> Result<CNil, CNil> {
+        match claimed {}
     }
 }

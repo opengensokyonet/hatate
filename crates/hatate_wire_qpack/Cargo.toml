@@ -7,4 +7,8 @@ license.workspace = true
 description = "QPACK's entries in the HTTP/3 registries: settings, stream types and error codes"
 
 [dependencies]
+hatate_qpack.workspace = true
+nitori_call.workspace = true
+nitori_io.workspace = true
 sakuya_var_int.workspace = true
+snafu.workspace = true

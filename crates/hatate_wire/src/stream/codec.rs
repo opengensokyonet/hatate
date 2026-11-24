@@ -1,38 +1,48 @@
-//! Reading the start of a unidirectional stream.
-use super::{FrameStream, ReceivedStream, UnidirectionalStream};
+//! Reading the start of a stream the peer opened.
+use super::{
+    ReceivedStream, UnidirectionalStream, UnknownStream,
+    class::{BidirectionalClass, UnidirectionalClass},
+    part::{StreamSet, StreamVerdict},
+};
 use crate::{
-    Role,
     error_code::{ErrorCode, ErrorCodeOf},
-    frame::{PushId, set::FrameStreamKind},
-    stream_type::{Http3StreamType, StreamType, StreamTypeHead, StreamTypeKind, StreamTypeSet},
+    frame::{
+        codec::{ReadFrameError, read_length, read_type},
+        payload::{FramePayload, PayloadError},
+    },
+    parts::PartsError,
+    registry::is_reserved,
+    stream_type::StreamTypeSet,
 };
 use nitori_call::{Composed, ReceiverAccess};
-use nitori_io::Read;
+use nitori_io::{Infinite, Min, Read, Skip, prelude::*};
 use sakuya_var_int::{
     VarInt,
     call::{ReadVarIntError, ReadVarIntFieldExt as _},
 };
 use snafu::{ResultExt, Snafu};
 
-/// Reads the type at the start of a unidirectional stream that the peer
-/// opened, looks it up in the list of parts `L`, and, on a push stream,
-/// reads the Push ID that follows.
+/// The stream that [`read_unidirectional_stream`] gives.
+pub type ReceivedUnidirectionalStream<L, C, I> =
+    UnidirectionalStream<ReceivedStream<<L as StreamSet<C, L>>::Stream<I>, UnknownStream<I>>>;
+
+/// The streams that [`read_bidirectional_stream`] gives.
+pub type ReceivedBidirectionalStream<L, C, I> =
+    ReceivedStream<<L as StreamSet<C, L>>::Stream<I>, UnknownStream<I>>;
+
+/// Reads the type at the start of a unidirectional stream of class `C`
+/// that the peer opened, and gives the stream of the part of `L` that
+/// claims the type, read up to where it can be used, or an
+/// [`UnknownStream`] if no part claims it.
 ///
-/// `io` is the stream and is passed through: a control or push stream
-/// comes back composed with its [`FrameStream`], at its first frame, and
-/// any other stream comes back as it is, after its type. Each comes with
-/// the head it was read from, which keeps the width of the Stream Type
-/// field. `role` is the
-/// role of this endpoint. Name the parts with a turbofish:
-/// `read_unidirectional_stream::<Parts, _>(io, role)`.
+/// `io` is the stream and is passed through. The type keeps the width it
+/// was read with. Name the parts and the class with a turbofish:
+/// `read_unidirectional_stream::<Parts, ClientInitiatedUnidirectional, _>(io)`.
+/// Streams are read concurrently: one whose start has not arrived does not
+/// hold up the others.
 ///
 /// Returns `None` if the stream ends before the first byte; a receiver
 /// tolerates a stream closed before its type ([RFC 9114 §6.2]).
-///
-/// Dropping the returned future, or the stream, before it completes leaves
-/// the stream inside its type or Push ID: it cannot be read from the start
-/// any more, and is abandoned, as with an unfinished frame
-/// ([`Frame`](crate::frame::Frame)).
 ///
 /// # Errors
 ///
@@ -40,58 +50,55 @@ use snafu::{ResultExt, Snafu};
 /// gives the connection error the failure calls for, if any.
 ///
 /// [RFC 9114 §6.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2
-pub async fn read_unidirectional_stream<L: StreamTypeSet, I: ReceiverAccess<Family: Read>>(
+pub async fn read_unidirectional_stream<L, C, I>(
     mut io: I,
-    role: Role,
 ) -> Result<
-    Option<UnidirectionalStream<I, L>>,
-    ReadUnidirectionalStreamError<<I::Family as Read>::Error, L::TypeValue>,
-> {
+    Option<ReceivedUnidirectionalStream<L, C, I>>,
+    ReadUnidirectionalStreamError<
+        <I::Family as Read>::Error,
+        <L as StreamSet<C, L>>::ReadError<<I::Family as Read>::Error>,
+    >,
+>
+where
+    C: UnidirectionalClass,
+    L: StreamSet<C, L> + StreamTypeSet,
+    I: ReceiverAccess<Family: Read>,
+{
+    const {
+        assert!(
+            L::CLAIMS_VALID,
+            "the parts claim overlapping or reserved stream types"
+        );
+    }
     let field = match io.read_var_int_field::<VarInt>().await {
         Ok(field) => field,
         Err(error) if error.is_incomplete() && error.completed() == 0 => return Ok(None),
         Err(source) => return Err(ReadUnidirectionalStreamError::Type { source }),
     };
     let value = field.get();
-    let stream_type = L::type_value_of(value).map_or(StreamType::Unknown(value), StreamType::Known);
-    if let StreamType::Known(stream_type) = stream_type
-        && !L::kind_of(stream_type).acceptable_by(role)
-    {
-        return Err(ReadUnidirectionalStreamError::NotAcceptableByRole { stream_type, role });
-    }
-    let head = StreamTypeHead::new(stream_type, field);
-    let frames = FrameStream::new(FrameStreamKind::Unidirectional(value), role);
-    let framed = match stream_type {
-        StreamType::Known(_) => Http3StreamType::of(value),
-        StreamType::Unknown(_) => None,
-    };
-    Ok(Some(match framed {
-        Some(Http3StreamType::Control) => UnidirectionalStream::Control {
-            head,
-            stream: Composed::new(io, frames),
-        },
-        Some(Http3StreamType::Push) => {
-            let push_id = io
-                .read_var_int_field::<PushId>()
+    let stream = match L::judge(value, false) {
+        StreamVerdict::Claimed(claimed) => ReceivedStream::Known(
+            L::read(claimed, field, io)
                 .await
-                .context(read_unidirectional_stream_error::PushIdSnafu)?;
-            UnidirectionalStream::Push {
-                head,
-                push_id,
-                stream: Composed::new(io, frames),
-            }
+                .map_err(PartsError::new)
+                .context(read_unidirectional_stream_error::PartSnafu)?,
+        ),
+        StreamVerdict::NotClaimed => ReceivedStream::Unknown(UnknownStream::new(value, io)),
+        StreamVerdict::Error(code) | StreamVerdict::ErrorUnlessClaimed(code) => {
+            return Err(ReadUnidirectionalStreamError::Rejected {
+                stream_type: value,
+                code,
+            });
         }
-        Some(Http3StreamType::Qpack(_)) | None => {
-            UnidirectionalStream::Other(ReceivedStream { head, io })
-        }
-    }))
+    };
+    Ok(Some(UnidirectionalStream::read(stream, field.width())))
 }
 
-/// Failures of [`read_unidirectional_stream`]. `T` is the stream type
-/// value of the list of parts.
+/// Failures of [`read_unidirectional_stream`]. `P` is the sum of the
+/// failures of the parts.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-pub enum ReadUnidirectionalStreamError<E, T> {
+pub enum ReadUnidirectionalStreamError<E, P> {
     /// The type could not be read: the stream failed, or ended after the
     /// first byte of the type.
     #[snafu(display("could not read stream type"))]
@@ -99,36 +106,153 @@ pub enum ReadUnidirectionalStreamError<E, T> {
         /// The failure of reading the integer.
         source: ReadVarIntError<E>,
     },
-    /// The Push ID of a push stream could not be read.
-    #[snafu(display("could not read the push ID of a push stream"))]
-    PushId {
-        /// The failure of reading the integer.
-        source: ReadVarIntError<E>,
-    },
-    /// An endpoint of this role may not accept a stream of this type, such
-    /// as a push stream at a server ([RFC 9114 §6.2.2]).
+    /// The part the type belongs to rejects a stream of this class with it,
+    /// such as a push stream that a client opened ([RFC 9114 §6.2.2]).
     ///
     /// [RFC 9114 §6.2.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.2
-    #[snafu(display("an endpoint of role {role:?} may not accept this stream type"))]
-    NotAcceptableByRole {
+    #[snafu(display("stream type {stream_type} is not allowed on this stream"))]
+    Rejected {
         /// The type of the stream.
-        stream_type: T,
-        /// The role of this endpoint.
-        role: Role,
+        stream_type: VarInt,
+        /// The connection error.
+        code: ErrorCode,
+    },
+    /// The part that claims the type could not read what follows it.
+    #[snafu(display("could not read the start of the stream"))]
+    Part {
+        /// The failure of that part.
+        source: PartsError<P>,
     },
 }
 
-/// H3_STREAM_CREATION_ERROR for a type this endpoint may not accept
-/// ([RFC 9114 §6.2]). `None` when the stream fails or ends inside its type
-/// or Push ID, which a receiver tolerates ([RFC 9114 §6.2]), and when the
-/// stream itself failed.
+/// The code of the rejection, or of the part's failure. `None` when the
+/// stream fails or ends inside its type, which a receiver tolerates
+/// ([RFC 9114 §6.2]).
 ///
 /// [RFC 9114 §6.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2
-impl<E, T> ErrorCodeOf<ErrorCode> for ReadUnidirectionalStreamError<E, T> {
+impl<E, P: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadUnidirectionalStreamError<E, P> {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
-            Self::Type { .. } | Self::PushId { .. } => None,
-            Self::NotAcceptableByRole { .. } => Some(ErrorCode::H3_STREAM_CREATION_ERROR),
+            Self::Type { .. } => None,
+            Self::Rejected { code, .. } => Some(*code),
+            Self::Part { source } => source.error_code(),
+        }
+    }
+}
+
+/// Reads the start of a bidirectional stream of class `C` that the peer
+/// opened, and gives the stream of the part of `L` that claims it, read up
+/// to where it can be used, or an [`UnknownStream`] if no part claims it.
+///
+/// Reserved frames at the start are skipped; the first value that is not
+/// the type of a reserved frame is judged by the parts, which are told
+/// whether anything was skipped. A request stream comes back at its first
+/// frame. Name the parts and the class with a turbofish:
+/// `read_bidirectional_stream::<Parts, ClientInitiatedBidirectional, _>(io)`.
+///
+/// Returns `None` if the stream ends before such a value.
+///
+/// # Errors
+///
+/// [`ReadBidirectionalStreamError`]; its [`ErrorCodeOf::error_code`]
+/// gives the connection error the failure calls for, if any.
+pub async fn read_bidirectional_stream<L, C, I>(
+    mut io: I,
+) -> Result<
+    Option<ReceivedBidirectionalStream<L, C, I>>,
+    ReadBidirectionalStreamError<
+        <I::Family as Read>::Error,
+        <L as StreamSet<C, L>>::ReadError<<I::Family as Read>::Error>,
+    >,
+>
+where
+    C: BidirectionalClass,
+    L: StreamSet<C, L>,
+    I: ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>>>,
+    u64: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
+    Infinite: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
+{
+    let mut skipped = false;
+    let field = loop {
+        let Some(field) = read_type(&mut io)
+            .await
+            .context(read_bidirectional_stream_error::HeadSnafu)?
+        else {
+            return Ok(None);
+        };
+        if !is_reserved(field.get()) {
+            break field;
+        }
+        let length = read_length(&mut io)
+            .await
+            .context(read_bidirectional_stream_error::HeadSnafu)?;
+        let mut payload = Composed::new(&mut io, FramePayload::new(length.get().get()));
+        payload
+            .skip_to_end()
+            .await
+            .context(read_bidirectional_stream_error::ReservedPayloadSnafu)?;
+        skipped = true;
+    };
+    let value = field.get();
+    Ok(Some(match L::judge(value, skipped) {
+        StreamVerdict::Claimed(claimed) => ReceivedStream::Known(
+            L::read(claimed, field, io)
+                .await
+                .map_err(PartsError::new)
+                .context(read_bidirectional_stream_error::PartSnafu)?,
+        ),
+        StreamVerdict::NotClaimed => ReceivedStream::Unknown(UnknownStream::new(value, io)),
+        StreamVerdict::Error(code) | StreamVerdict::ErrorUnlessClaimed(code) => {
+            return Err(ReadBidirectionalStreamError::Rejected { value, code });
+        }
+    }))
+}
+
+/// Failures of [`read_bidirectional_stream`]. `P` is the sum of the
+/// failures of the parts.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum ReadBidirectionalStreamError<E, P> {
+    /// The head of a frame at the start could not be read.
+    #[snafu(display("could not read the start of the stream"))]
+    Head {
+        /// The failure of reading it.
+        source: ReadFrameError<E>,
+    },
+    /// The payload of a reserved frame at the start could not be skipped.
+    #[snafu(display("could not skip a reserved frame"))]
+    ReservedPayload {
+        /// The failure of skipping it.
+        source: PayloadError<E>,
+    },
+    /// The part the value belongs to rejects a stream of this class that
+    /// starts with it, or no part claims a stream of this class that HTTP/3
+    /// does not use ([RFC 9114 §6.1]).
+    ///
+    /// [RFC 9114 §6.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.1
+    #[snafu(display("value {value} is not allowed at the start of this stream"))]
+    Rejected {
+        /// The value.
+        value: VarInt,
+        /// The connection error.
+        code: ErrorCode,
+    },
+    /// The part that claims the value could not read the stream.
+    #[snafu(display("could not read the start of the stream"))]
+    Part {
+        /// The failure of that part.
+        source: PartsError<P>,
+    },
+}
+
+/// The code of the failure, the rejection, or the part's failure.
+impl<E, P: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadBidirectionalStreamError<E, P> {
+    fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Head { source } => source.error_code(),
+            Self::ReservedPayload { source } => source.error_code(),
+            Self::Rejected { code, .. } => Some(*code),
+            Self::Part { source } => source.error_code(),
         }
     }
 }

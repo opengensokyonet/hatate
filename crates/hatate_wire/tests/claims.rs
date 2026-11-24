@@ -1,9 +1,12 @@
 //! The claimed values of a part agree with what the part reads: the
 //! compile-time check of disjointness is only as good as that agreement.
+use frunk_core::HList;
 use hatate_wire::{
-    frame::set::{FramePart, FrameSet},
+    frame::set::{FramePart, FramePartOn, FrameSet, FrameSetOn},
+    registry::ClaimedValue,
     settings::set::{SettingList, SettingsOf, SettingsPart},
-    stream_type::{StreamTypePart, StreamTypeSet},
+    stream::kind::{ControlStreamKind, PushStreamKind, RequestStreamKind},
+    stream_type::{Http3StreamType, StreamTypePart, StreamTypeSet},
 };
 use sakuya_var_int::VarInt;
 
@@ -26,34 +29,55 @@ fn probes() -> Vec<VarInt> {
         .collect()
 }
 
-fn agree<P: FramePart + StreamTypePart>(name: &str) {
+/// Whether the frame types the part has on the request, control or push
+/// stream include `value`.
+fn on_some_stream<P>(value: VarInt) -> bool
+where
+    P: FramePartOn<RequestStreamKind>
+        + FramePartOn<ControlStreamKind>
+        + FramePartOn<PushStreamKind>,
+{
+    <<P as FramePartOn<RequestStreamKind>>::FrameType as ClaimedValue>::of(value).is_some()
+        || <<P as FramePartOn<ControlStreamKind>>::FrameType as ClaimedValue>::of(value).is_some()
+        || <<P as FramePartOn<PushStreamKind>>::FrameType as ClaimedValue>::of(value).is_some()
+}
+
+/// The same for a list of parts.
+fn list_on_some_stream<L>(value: VarInt) -> bool
+where
+    L: FrameSetOn<RequestStreamKind> + FrameSetOn<ControlStreamKind> + FrameSetOn<PushStreamKind>,
+{
+    <<L as FrameSetOn<RequestStreamKind>>::FrameType as ClaimedValue>::of(value).is_some()
+        || <<L as FrameSetOn<ControlStreamKind>>::FrameType as ClaimedValue>::of(value).is_some()
+        || <<L as FrameSetOn<PushStreamKind>>::FrameType as ClaimedValue>::of(value).is_some()
+}
+
+#[test]
+fn the_claims_of_the_part_of_rfc_9114_agree_with_its_lookups() {
     assert!(!probes().is_empty());
     for value in probes() {
+        // A frame type the part claims appears on at least one kind of
+        // stream, and one it does not claim appears on none.
         assert_eq!(
-            <P as FramePart>::FRAME_TYPES.contains(value),
-            <P as FramePart>::type_value_of(value).is_some(),
-            "{name}: frame type {value:?}"
+            <hatate_wire::Part as FramePart>::FRAME_TYPES.contains(value),
+            on_some_stream::<hatate_wire::Part>(value),
+            "frame type {value:?}"
         );
         assert_eq!(
-            <P as StreamTypePart>::STREAM_TYPES.contains(value),
-            <P as StreamTypePart>::type_value_of(value).is_some(),
-            "{name}: stream type {value:?}"
+            <hatate_wire::Part as StreamTypePart>::STREAM_TYPES.contains(value),
+            Http3StreamType::of(value).is_some(),
+            "stream type {value:?}"
         );
     }
 }
 
 #[test]
-fn the_claims_of_the_part_of_rfc_9114_agree_with_its_lookups() {
-    agree::<hatate_wire::Part>("hatate_wire::Part");
-}
-
-#[test]
 fn the_claims_of_a_list_agree_with_its_lookups() {
-    type List = frunk_core::HList![hatate_wire::Part];
+    type List = HList![hatate_wire::Part];
     for value in probes() {
         assert_eq!(
             <List as FrameSet>::FRAME_TYPES.contains(value),
-            <List as FrameSet>::type_value_of(value).is_some(),
+            list_on_some_stream::<List>(value),
             "{value:?}"
         );
         assert_eq!(
@@ -63,7 +87,7 @@ fn the_claims_of_a_list_agree_with_its_lookups() {
         );
         assert_eq!(
             <List as StreamTypeSet>::STREAM_TYPES.contains(value),
-            <List as StreamTypeSet>::type_value_of(value).is_some(),
+            Http3StreamType::of(value).is_some(),
             "{value:?}"
         );
     }

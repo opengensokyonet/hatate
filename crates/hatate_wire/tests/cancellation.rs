@@ -7,33 +7,36 @@
 //! counts the bytes the host handed over, so its remaining length stays
 //! equal to the unread bytes of the payload; what a new read makes of the
 //! rest is the subject of the tests below.
+//!
+//! A `FrameStream` is kept inside a call, so each test drops a future in the
+//! call, after a number of polls, and goes on in the same call. Every host
+//! gives one byte at a time, after a suspension before each.
 mod common;
 
-use common::Dribble;
+use common::{Dribble, Ty, known, read_some, run, ty};
 use core::{
+    convert::Infallible,
     future::Future,
     pin::pin,
     task::{Context, Poll, Waker},
 };
 use frunk_core::HList;
-use hatate_wire::stream::FrameStream;
 use hatate_wire::{
     Role,
     error_code::{ErrorCode, ErrorCodeOf as _},
-    frame::{
-        FrameWidths,
-        codec::{read_frame, read_received_frame},
-        control::{GoawayFrame, codec::*},
-        payload::{FramePayload, PayloadError},
-    },
+    frame::{FrameWidths, Http3FrameType, control::codec::*},
     settings::{
         Setting,
         codec::ReadSettingExt as _,
         set::{Settings, SettingsOf},
     },
+    stream::{
+        FrameStream, NextFrameError,
+        kind::{ControlStreamKind, RequestStreamKind},
+    },
 };
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::{Read, Skip, prelude::*};
+use nitori_io::{ExactLen, Read, Skip, prelude::*};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
 type Parts = HList![hatate_wire::Part];
@@ -45,55 +48,75 @@ fn poll_then_drop<T>(future: impl Future<Output = T>, polls: usize) -> bool {
     (0..polls).any(|_| matches!(future.as_mut().poll(&mut cx), Poll::Ready(_)))
 }
 
-/// Reads the head of a frame and returns its payload.
-#[call(sync)]
-async fn payload_of<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> FramePayload
+/// Polls `future` `polls` times and drops it; `true` if it completed by
+/// reaching a frame.
+fn poll_then_drop_frame<T, E>(
+    future: impl Future<Output = Result<Option<T>, E>>,
+    polls: usize,
+) -> bool {
+    let mut future = pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..polls {
+        if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+            return matches!(result, Ok(Some(_)));
+        }
+    }
+    false
+}
+
+/// The unread bytes of the payload of the current frame.
+fn remaining<K: hatate_wire::stream::kind::StreamKind, I: ReceiverAccess<Family: Read>>(
+    stream: &mut FrameStream<Parts, K, I>,
+) -> u64
 where
-    <F as Read>::Error: core::fmt::Debug,
+    Parts: hatate_wire::frame::set::FrameSetOn<K>,
 {
-    read_frame(&mut *io)
+    stream.frame().into_payload().into_parts().1.remaining()
+}
+
+/// What the GOAWAY read again made of the integer.
+#[derive(Debug, PartialEq, Eq)]
+enum Again {
+    Id(u64),
+    Trailing(Option<ErrorCode>),
+    Other,
+}
+
+/// Reads the first frame of a control stream, a GOAWAY, and drops a read of
+/// its integer after `polls` polls: if `again`, reads it again.
+#[call(sync)]
+async fn goaway_dropped<F: Read<Error = Infallible>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    polls: usize,
+    again: bool,
+) -> (bool, u64, Option<(Again, u64)>) {
+    let mut stream = FrameStream::<Parts, ControlStreamKind, _>::read(&mut *io, Role::Client)
         .await
         .unwrap()
-        .unwrap()
-        .into_payload()
-        .into_parts()
-        .1
-}
-
-/// Reads the GOAWAY integer from the payload.
-#[call(sync)]
-async fn goaway_of<F: Read, A: ReceiverAccess<Family = F>>(
-    io: &mut A,
-    payload: &mut FramePayload,
-) -> Result<GoawayFrame, ReadIntegerFrameError<PayloadError<F::Error>>>
-where
-    <F as Read>::Error: core::fmt::Debug,
-{
-    let mut source = io.compose(payload);
-    source.read_goaway_frame(FrameWidths::SHORTEST).await
-}
-
-/// Reads one setting from the payload.
-#[call(sync)]
-async fn one_setting<F: Read, A: ReceiverAccess<Family = F>>(
-    io: &mut A,
-    payload: &mut FramePayload,
-) -> String
-where
-    <F as Read>::Error: core::fmt::Debug,
-{
-    let mut source = io.compose(payload);
-    let mut settings = Settings::<<Parts as SettingsOf>::Settings>::new();
-    match source.read_setting(&mut settings).await {
-        Ok(Some(Setting::Known(setting))) => format!("known {setting:?}"),
-        Ok(Some(Setting::Unknown(setting))) => format!(
-            "unknown {:#x}={:#x}",
-            setting.identifier().get().get(),
-            setting.value().get().get()
-        ),
-        Ok(None) => "end".to_string(),
-        Err(error) => format!("error {error:?}"),
+        .unwrap();
+    assert_eq!(remaining(&mut stream), 8);
+    let done = poll_then_drop(
+        stream
+            .frame()
+            .payload()
+            .read_goaway_frame(FrameWidths::SHORTEST),
+        polls,
+    );
+    let left = remaining(&mut stream);
+    if !again {
+        return (done, left, None);
     }
+    let result = stream
+        .frame()
+        .payload()
+        .read_goaway_frame(FrameWidths::SHORTEST)
+        .await;
+    let again = match result {
+        Ok(frame) => Again::Id(frame.id().get().get().get()),
+        Err(error @ ReadIntegerFrameError::Trailing { .. }) => Again::Trailing(error.error_code()),
+        Err(_) => Again::Other,
+    };
+    (done, left, Some((again, remaining(&mut stream))))
 }
 
 fn field(value: u64, width: VarIntWidth) -> Vec<u8> {
@@ -112,28 +135,20 @@ fn a_goaway_dropped_in_the_middle_keeps_the_count_exact() {
     let payload_start = 2;
     for polls in 0..20 {
         let mut host = Dribble::new(&wire, 1);
-        let mut payload = {
-            let mut future = pin!(host.payload_of_unpin());
-            let mut cx = Context::from_waker(Waker::noop());
-            loop {
-                if let Poll::Ready(payload) = future.as_mut().poll(&mut cx) {
-                    break payload;
-                }
-            }
-        };
-        assert_eq!(payload.remaining(), 8);
-        let done = poll_then_drop(host.goaway_of_unpin(&mut payload), polls);
+        let (done, left, _) = run(host.goaway_dropped_unpin(polls, false)).0;
         let consumed = wire.len() - host.rest().len() - payload_start;
         // The payload counts every byte the host handed over.
-        assert_eq!(payload.remaining(), 8 - consumed as u64, "polls {polls}");
+        assert_eq!(left, 8 - consumed as u64, "polls {polls}");
         if done {
             // Read to its end before the drop: the payload is finished.
-            assert_eq!(payload.remaining(), 0);
+            assert_eq!(left, 0);
             continue;
         }
         // Continue with a new read, as a caller that treats the drop as
         // "not started" would.
-        let again = common::run(host.goaway_of_unpin(&mut payload)).0;
+        let mut host = Dribble::new(&wire, 1);
+        let (_, _, again) = run(host.goaway_dropped_unpin(polls, true)).0;
+        let (again, left) = again.unwrap();
         // Observed: nothing consumed means nothing lost, and the new read
         // gets the integer. Some of the integer's bytes consumed means the
         // new read starts in the middle of it: it reads a first byte as the
@@ -141,23 +156,73 @@ fn a_goaway_dropped_in_the_middle_keeps_the_count_exact() {
         // except when only the last byte is left, which reads as a small
         // integer without any error.
         match (consumed, again) {
-            (0, Ok(frame)) => assert_eq!(frame.id().get().get().get(), 0x0102_0304),
-            (1..=6, Err(error)) => {
-                assert!(
-                    matches!(error, ReadIntegerFrameError::Trailing { .. }),
-                    "{error:?}"
-                );
-                assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
-                assert_eq!(payload.remaining(), 7 - consumed as u64);
+            (0, Again::Id(id)) => assert_eq!(id, 0x0102_0304),
+            (1..=6, Again::Trailing(code)) => {
+                assert_eq!(code, Some(ErrorCode::H3_FRAME_ERROR));
+                assert_eq!(left, 7 - consumed as u64);
             }
-            (7, Ok(frame)) => {
+            (7, Again::Id(id)) => {
                 // The last byte of the integer, 0x04, read as an integer.
-                assert_eq!(frame.id().get().get().get(), 0x04);
-                assert_eq!(payload.remaining(), 0);
+                assert_eq!(id, 0x04);
+                assert_eq!(left, 0);
             }
             (consumed, again) => panic!("{consumed} bytes consumed: {again:?}"),
         }
     }
+}
+
+/// Reads one setting from the payload of the current frame.
+async fn one_setting<S: ReceiverAccess<Family = F>, F: Read + ExactLen>(
+    source: &mut S,
+    settings: &mut Settings<<Parts as SettingsOf>::Settings>,
+) -> String
+where
+    <F as ExactLen>::Length: TryInto<u64>,
+    <F as Read>::Error: core::fmt::Debug,
+{
+    match source.read_setting(settings).await {
+        Ok(Some(Setting::Known(setting))) => format!("known {setting:?}"),
+        Ok(Some(Setting::Unknown(setting))) => format!(
+            "unknown {:#x}={:#x}",
+            setting.identifier().get().get(),
+            setting.value().get().get()
+        ),
+        Ok(None) => "end".to_string(),
+        Err(error) => format!("error {error:?}"),
+    }
+}
+
+/// Reads the first frame of a control stream, a SETTINGS frame, and drops a
+/// read of one setting after `polls` polls; if `again`, reads settings to
+/// the end of the payload.
+#[call(sync)]
+async fn setting_dropped<F: Read<Error = Infallible>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    polls: usize,
+    again: bool,
+) -> (bool, u64, Vec<String>, u64) {
+    let mut stream = FrameStream::<Parts, ControlStreamKind, _>::read(&mut *io, Role::Client)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut settings = Settings::<<Parts as SettingsOf>::Settings>::new();
+    let done = poll_then_drop(one_setting(stream.frame().payload(), &mut settings), polls);
+    let left = remaining(&mut stream);
+    let mut results = Vec::new();
+    if again {
+        // Continue with new reads to the end of the payload: they never
+        // panic and never pass its end.
+        for _ in 0..6 {
+            let text = one_setting(stream.frame().payload(), &mut settings).await;
+            let end = text == "end" || text.starts_with("error");
+            results.push(text);
+            if end {
+                break;
+            }
+        }
+    }
+    let end = remaining(&mut stream);
+    (done, left, results, end)
 }
 
 #[test]
@@ -172,33 +237,16 @@ fn a_settings_frame_dropped_in_the_middle_keeps_the_count_exact() {
     .concat();
     for polls in 0..24 {
         let mut host = Dribble::new(&wire, 1);
-        let mut payload = {
-            let mut future = pin!(host.payload_of_unpin());
-            let mut cx = Context::from_waker(Waker::noop());
-            loop {
-                if let Poll::Ready(payload) = future.as_mut().poll(&mut cx) {
-                    break payload;
-                }
-            }
-        };
-        let done = poll_then_drop(host.one_setting_unpin(&mut payload), polls);
+        let (done, left, _, _) = run(host.setting_dropped_unpin(polls, false)).0;
         let consumed = wire.len() - host.rest().len() - 2;
         assert_eq!(
-            payload.remaining(),
+            left,
             settings.len() as u64 - consumed as u64,
             "polls {polls}"
         );
-        // Continue with new reads to the end of the payload: they never
-        // panic and never pass its end.
-        let mut results = Vec::new();
-        for _ in 0..6 {
-            let (text, _) = common::run(host.one_setting_unpin(&mut payload));
-            let end = text == "end" || text.starts_with("error");
-            results.push(text);
-            if end {
-                break;
-            }
-        }
+
+        let mut host = Dribble::new(&wire, 1);
+        let (_, _, results, end) = run(host.setting_dropped_unpin(polls, true)).0;
         if consumed == 0 {
             // Nothing consumed, nothing lost: the whole frame reads.
             assert_eq!(
@@ -221,163 +269,319 @@ fn a_settings_frame_dropped_in_the_middle_keeps_the_count_exact() {
                 "polls {polls}"
             );
         }
-        assert_eq!(payload.remaining(), 0, "{results:?}");
+        assert_eq!(end, 0, "{results:?}");
     }
 }
 
-/// Skips the rest of the payload.
-#[call(sync)]
-async fn skip_payload<F: Skip<Count = usize>, A: ReceiverAccess<Family = F>>(
-    io: &mut A,
-    payload: &mut FramePayload,
-) -> Result<(), PayloadError<F::Error>> {
-    let mut source = io.compose(payload);
-    source.skip_to_end().await
-}
-
-/// DATA with a payload of six bytes, then HEADERS with two, then a byte
-/// that no frame owns.
-const FRAMES: [u8; 13] = [0x00, 0x06, 1, 2, 3, 4, 5, 6, 0x01, 0x02, 0xaa, 0xbb, 0xcc];
+/// DATA with a payload of six bytes, then HEADERS with a Type of two bytes
+/// and a payload of one, then a byte that no frame owns.
+const FRAMES: [u8; 13] = [0x00, 0x06, 1, 2, 3, 4, 5, 6, 0x40, 0x01, 0x01, 0xaa, 0xbb];
 /// The bytes up to the end of the first frame, and up to the end of the
 /// head of the second.
 const FIRST_END: usize = 8;
-const SECOND_HEAD_END: usize = 10;
+const SECOND_HEAD_END: usize = 11;
+/// The bytes up to the end of the head of the first.
+const FIRST_HEAD_END: usize = 2;
 
-/// Reads the head of the first frame and finishes it.
+/// What `next_frame` made of the stream after the drops.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Frame(Ty, u64),
+    End,
+    Interrupted,
+    Failed(Option<ErrorCode>),
+}
+
+/// The result of dropping `next_frame` after each number of polls in
+/// `drops` (stopping if one completes), and with `resume`, of calling it
+/// once more, and of the bytes the access has left.
+#[derive(Debug, PartialEq, Eq)]
+struct Dropped {
+    /// A dropped call completed.
+    completed: bool,
+    /// The unread bytes of the payload of the current frame after the drops.
+    remaining: u64,
+    /// The call after the drops.
+    step: Option<Step>,
+    /// What the access gives back, after the call.
+    rest: Vec<u8>,
+}
+
 #[call(sync)]
-async fn finish_first<
-    F: Skip<Count = usize> + Read<Error = core::convert::Infallible>,
+async fn drop_next<
+    F: Skip<Count = usize> + Read<Error = Infallible>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
-) {
-    let frame = read_frame(&mut *io).await.unwrap().unwrap();
-    let _ = frame.finish().await.unwrap();
-}
-
-/// Reads the head of the first frame, finishes it, and reads the next.
-#[call(sync)]
-async fn next_first<
-    F: Skip<Count = usize> + Read<Error = core::convert::Infallible>,
-    A: ReceiverAccess<Family = F>,
->(
-    io: &mut A,
-) -> u64 {
-    let frame = read_frame(&mut *io).await.unwrap().unwrap();
-    let next = frame.next().await.unwrap().unwrap();
-    next.r#type().get().get()
-}
-
-/// [`finish_first`] for a frame of a stream that carries frames.
-#[call(sync)]
-async fn finish_first_received<
-    F: Skip<Count = usize> + Read<Error = core::convert::Infallible>,
-    A: ReceiverAccess<Family = F>,
->(
-    io: &mut A,
-) {
-    let mut stream = io.compose(FrameStream::<Parts>::request(Role::Server));
-    let frame = read_received_frame(&mut stream).await.unwrap().unwrap();
-    let _ = frame.finish().await.unwrap();
-}
-
-/// [`next_first`] for a frame of a stream that carries frames.
-#[call(sync)]
-async fn next_first_received<
-    F: Skip<Count = usize> + Read<Error = core::convert::Infallible>,
-    A: ReceiverAccess<Family = F>,
->(
-    io: &mut A,
-) -> u64 {
-    let mut stream = io.compose(FrameStream::<Parts>::request(Role::Server));
-    let frame = read_received_frame(&mut stream).await.unwrap().unwrap();
-    let next = frame.next().await.unwrap().unwrap();
-    next.frame().r#type().get().get()
-}
-
-/// Drops `finish` and `next` after every number of polls: the stream is
-/// never read past what the call had reached, which is inside the first
-/// frame while finishing, and inside the head of the second while reading
-/// it; and a call that completes leaves the stream at the next frame, or
-/// after its head.
-macro_rules! drop_in_the_middle {
-    ($name:ident, $finish:ident, $next:ident) => {
-        #[test]
-        fn $name() {
-            let mut consumed_before = 0;
-            for polls in 0..40 {
-                let mut host = Dribble::new(&FRAMES, 1);
-                let done = poll_then_drop(host.$finish(), polls);
-                let consumed = FRAMES.len() - host.rest().len();
-                assert!(consumed <= FIRST_END, "polls {polls}: {consumed}");
-                assert!(consumed <= polls, "polls {polls}: {consumed}");
-                assert!(consumed >= consumed_before, "polls {polls}");
-                consumed_before = consumed;
-                // The last skip completes the call: it is done exactly
-                // when the first frame is, and then the stream is at the
-                // second.
-                assert_eq!(done, consumed == FIRST_END, "polls {polls}");
-                if done {
-                    assert_eq!(host.rest(), &FRAMES[FIRST_END..]);
-                }
-            }
-            assert_eq!(consumed_before, FIRST_END);
-
-            let mut consumed_before = 0;
-            for polls in 0..40 {
-                let mut host = Dribble::new(&FRAMES, 1);
-                let done = poll_then_drop(host.$next(), polls);
-                let consumed = FRAMES.len() - host.rest().len();
-                assert!(consumed <= SECOND_HEAD_END, "polls {polls}: {consumed}");
-                assert!(consumed >= consumed_before, "polls {polls}");
-                consumed_before = consumed;
-                assert_eq!(done, consumed == SECOND_HEAD_END, "polls {polls}");
-                if done {
-                    // The head of the second frame is read, and its
-                    // payload is next on the stream.
-                    assert_eq!(host.rest(), &FRAMES[SECOND_HEAD_END..]);
-                }
-            }
-            assert_eq!(consumed_before, SECOND_HEAD_END);
+    drops: Vec<usize>,
+    resume: bool,
+) -> Dropped {
+    let mut stream = FrameStream::<Parts, RequestStreamKind, _>::read(&mut *io, Role::Server)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut completed = false;
+    for polls in drops {
+        if poll_then_drop_frame(stream.next_frame(), polls) {
+            completed = true;
+            break;
+        }
+    }
+    let left = remaining(&mut stream);
+    if !resume {
+        return Dropped {
+            completed,
+            remaining: left,
+            step: None,
+            rest: Vec::new(),
+        };
+    }
+    let step = if completed {
+        Step::Frame(ty(stream.frame().frame_type()), left)
+    } else {
+        match stream.next_frame().await {
+            Ok(Some(frame)) => Step::Frame(
+                ty(frame.frame_type()),
+                frame.into_payload().into_parts().1.remaining(),
+            ),
+            Ok(None) => Step::End,
+            Err(NextFrameError::Interrupted) => Step::Interrupted,
+            Err(error) => Step::Failed(error.error_code()),
         }
     };
+    let mut io = stream.into_io();
+    let rest = read_some(&mut io, 100).await.unwrap();
+    Dropped {
+        completed,
+        remaining: left,
+        step: Some(step),
+        rest,
+    }
 }
 
-drop_in_the_middle!(
-    a_frame_finished_or_moved_past_and_dropped_never_passes_what_it_reached,
-    finish_first_unpin,
-    next_first_unpin
-);
-drop_in_the_middle!(
-    a_received_frame_finished_or_moved_past_and_dropped_never_passes_what_it_reached,
-    finish_first_received_unpin,
-    next_first_received_unpin
-);
+fn consumed(host: &Dribble<'_>) -> usize {
+    FRAMES.len() - host.rest().len()
+}
+
+#[test]
+fn next_frame_dropped_in_the_middle_never_passes_what_it_reached() {
+    let mut consumed_before = 0;
+    for polls in 0..60 {
+        let mut host = Dribble::new(&FRAMES, 1);
+        let (dropped, _) = run(host.drop_next_unpin(vec![polls], false));
+        let consumed = consumed(&host);
+        // The first head was read when the stream was made.
+        assert!(
+            (FIRST_HEAD_END..=SECOND_HEAD_END).contains(&consumed),
+            "polls {polls}: {consumed}"
+        );
+        assert!(
+            consumed - FIRST_HEAD_END <= polls,
+            "polls {polls}: {consumed}"
+        );
+        assert!(consumed >= consumed_before, "polls {polls}");
+        consumed_before = consumed;
+        // The call is done exactly when the head of the second frame is
+        // read.
+        assert_eq!(
+            dropped.completed,
+            consumed == SECOND_HEAD_END,
+            "polls {polls}"
+        );
+        // The payload counts every byte skipped; once the call completed,
+        // the current frame is the second, whose payload is one byte.
+        let expected = if dropped.completed {
+            1
+        } else {
+            FIRST_END.saturating_sub(consumed) as u64
+        };
+        assert_eq!(dropped.remaining, expected, "polls {polls}");
+    }
+    assert_eq!(consumed_before, SECOND_HEAD_END);
+}
+
+#[test]
+fn next_frame_dropped_while_skipping_resumes_and_while_reading_a_head_is_interrupted() {
+    for polls in 0..60 {
+        let mut host = Dribble::new(&FRAMES, 1);
+        let (dropped, _) = run(host.drop_next_unpin(vec![polls], false));
+        let consumed = consumed(&host);
+
+        let mut host = Dribble::new(&FRAMES, 1);
+        let (resumed, _) = run(host.drop_next_unpin(vec![polls], true));
+        let step = resumed.step.as_ref().unwrap();
+        if dropped.completed {
+            // The second frame was reached before the drop.
+            assert_eq!(*step, Step::Frame(known(Http3FrameType::Headers), 1));
+            assert_eq!(resumed.rest, [0xaa, 0xbb]);
+        } else if consumed < FIRST_END {
+            // The drop was in the middle of skipping the first payload: the
+            // next call skips what is left, and reads the second frame.
+            assert_eq!(
+                *step,
+                Step::Frame(known(Http3FrameType::Headers), 1),
+                "polls {polls}"
+            );
+            assert_eq!(resumed.rest, [0xaa, 0xbb]);
+        } else {
+            // The drop was in the head of the second frame, even before its
+            // first byte: the stream is abandoned, and the access is where
+            // the dropped call left it.
+            assert_eq!(
+                *step,
+                Step::Interrupted,
+                "polls {polls}, consumed {consumed}"
+            );
+            assert_eq!(resumed.rest, &FRAMES[consumed..], "polls {polls}");
+        }
+    }
+}
+
+#[test]
+fn next_frame_dropped_twice_in_the_middle_of_skipping_still_resumes() {
+    for first in 0..14 {
+        for second in 0..14 {
+            let drops = vec![first, second];
+            let mut host = Dribble::new(&FRAMES, 1);
+            let (dropped, _) = run(host.drop_next_unpin(drops.clone(), false));
+            let consumed = consumed(&host);
+            let mut host = Dribble::new(&FRAMES, 1);
+            let (resumed, _) = run(host.drop_next_unpin(drops, true));
+            let step = resumed.step.unwrap();
+            let expected = if dropped.completed {
+                1
+            } else {
+                FIRST_END.saturating_sub(consumed) as u64
+            };
+            assert_eq!(dropped.remaining, expected, "{first} {second}");
+            if dropped.completed || consumed < FIRST_END {
+                assert_eq!(
+                    step,
+                    Step::Frame(known(Http3FrameType::Headers), 1),
+                    "{first} {second}"
+                );
+            } else {
+                assert_eq!(step, Step::Interrupted, "{first} {second}");
+                assert_eq!(resumed.rest, &FRAMES[consumed..]);
+            }
+        }
+    }
+}
+
+/// Skips the rest of the payload of the first frame, dropping the skip
+/// after `polls` polls, and again if `again`.
+#[call(sync)]
+async fn skip_dropped<
+    F: Skip<Count = usize> + Read<Error = Infallible>,
+    A: ReceiverAccess<Family = F>,
+>(
+    io: &mut A,
+    polls: usize,
+    again: bool,
+) -> (bool, u64, u64) {
+    let mut stream = FrameStream::<Parts, RequestStreamKind, _>::read(&mut *io, Role::Server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining(&mut stream), 6);
+    let done = poll_then_drop(stream.frame().payload().skip_to_end(), polls);
+    let left = remaining(&mut stream);
+    if again {
+        stream.frame().payload().skip_to_end().await.unwrap();
+    }
+    (done, left, remaining(&mut stream))
+}
 
 #[test]
 fn a_payload_skipped_in_part_and_dropped_keeps_the_count_exact() {
     for polls in 0..20 {
         let mut host = Dribble::new(&FRAMES, 1);
-        let mut payload = {
-            let mut future = pin!(host.payload_of_unpin());
-            let mut cx = Context::from_waker(Waker::noop());
-            loop {
-                if let Poll::Ready(payload) = future.as_mut().poll(&mut cx) {
-                    break payload;
-                }
-            }
-        };
-        assert_eq!(payload.remaining(), 6);
-        let done = poll_then_drop(host.skip_payload_unpin(&mut payload), polls);
-        let consumed = FRAMES.len() - host.rest().len() - 2;
+        let ((done, left, _), _) = run(host.skip_dropped_unpin(polls, false));
+        let consumed = consumed(&host);
         // The payload counts every byte skipped, so skipping again takes
         // exactly what is left and stops at the end of the frame.
-        assert_eq!(payload.remaining(), 6 - consumed as u64, "polls {polls}");
-        assert_eq!(done, payload.remaining() == 0, "polls {polls}");
-        common::run(host.skip_payload_unpin(&mut payload))
-            .0
-            .unwrap();
-        assert_eq!(payload.remaining(), 0);
+        assert_eq!(left, (FIRST_END - consumed) as u64, "polls {polls}");
+        assert_eq!(done, left == 0, "polls {polls}");
+        let mut host = Dribble::new(&FRAMES, 1);
+        let ((_, _, end), _) = run(host.skip_dropped_unpin(polls, true));
+        assert_eq!(end, 0);
         assert_eq!(host.rest(), &FRAMES[FIRST_END..], "polls {polls}");
     }
+}
+
+/// Makes the stream of a first frame, dropping the read after `polls`
+/// polls.
+#[call(sync)]
+async fn first_frame_dropped<
+    F: Skip<Count = usize> + Read<Error = Infallible>,
+    A: ReceiverAccess<Family = F>,
+>(
+    io: &mut A,
+    polls: usize,
+) -> bool {
+    poll_then_drop(
+        FrameStream::<Parts, RequestStreamKind, _>::read(&mut *io, Role::Server),
+        polls,
+    )
+}
+
+#[test]
+fn the_first_frame_dropped_while_read_consumes_only_what_it_reached() {
+    // A Type of two bytes and a Length of four.
+    let wire = [0x40, 0x00, 0x80, 0x00, 0x00, 0x03, b'a', b'b', b'c'];
+    let head = 6;
+    for polls in 0..20 {
+        let mut host = Dribble::new(&wire, 1);
+        let (done, _) = run(host.first_frame_dropped_unpin(polls));
+        let consumed = wire.len() - host.rest().len();
+        assert!(
+            consumed <= polls && consumed <= head,
+            "polls {polls}: {consumed}"
+        );
+        assert_eq!(done, consumed == head, "polls {polls}");
+    }
+}
+
+/// A frame head that was rejected, and then another call.
+#[call(sync)]
+async fn after_a_rejected_head<
+    F: Skip<Count = usize> + Read<Error = Infallible>,
+    A: ReceiverAccess<Family = F>,
+>(
+    io: &mut A,
+) -> (Option<ErrorCode>, Option<ErrorCode>, bool, Vec<u8>) {
+    let mut stream = FrameStream::<Parts, RequestStreamKind, _>::read(&mut *io, Role::Server)
+        .await
+        .unwrap()
+        .unwrap();
+    // The first frame is DATA; the next head is PING of HTTP/2.
+    let first = match stream.next_frame().await {
+        Err(error @ NextFrameError::Head { .. }) => error.error_code(),
+        other => panic!("{:?}", other.map(|frame| frame.is_some())),
+    };
+    // The stream is inside the head: it is abandoned, without a code of its
+    // own, and stays so.
+    let second = match stream.next_frame().await {
+        Err(error @ NextFrameError::Interrupted) => error.error_code(),
+        other => panic!("{:?}", other.map(|frame| frame.is_some())),
+    };
+    let interrupted_again = matches!(
+        stream.next_known_frame().await,
+        Err(NextFrameError::Interrupted)
+    );
+    let mut io = stream.into_io();
+    let rest = read_some(&mut io, 100).await.unwrap();
+    (first, second, interrupted_again, rest)
+}
+
+#[test]
+fn a_head_that_was_rejected_leaves_the_stream_interrupted() {
+    // DATA, then PING with a Length that is not read.
+    let wire = [0x00, 0x00, 0x06, 0x01, 0xaa];
+    let mut host = Dribble::new(&wire, 1);
+    let ((first, second, again, rest), _) = run(host.after_a_rejected_head_unpin());
+    assert_eq!(first, Some(ErrorCode::H3_FRAME_UNEXPECTED));
+    assert_eq!(second, None);
+    assert!(again);
+    assert_eq!(rest, [0x01, 0xaa]);
 }

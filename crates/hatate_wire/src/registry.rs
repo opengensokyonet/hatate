@@ -8,7 +8,68 @@
 //!
 //! [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9
 use core::ops::RangeInclusive;
+use frunk_core::coproduct::{CNil, Coproduct};
 use sakuya_var_int::VarInt;
+use snafu::Snafu;
+
+/// A value of a registry as the type that claims it reads it, such as a
+/// frame type or a stream type of a part: the type converts it to and from
+/// the integer on the wire.
+///
+/// The value types of the parts implement it, and so do their sums, a
+/// `Coproduct` of value types ending in `CNil`, so that the conversion of a
+/// value of a list of parts is that of the part it belongs to.
+pub trait ClaimedValue: Copy {
+    /// The integer on the wire.
+    fn value(self) -> VarInt;
+
+    /// The value that `value` is, or `None` if this type does not claim it.
+    fn of(value: VarInt) -> Option<Self>;
+}
+
+impl ClaimedValue for CNil {
+    fn value(self) -> VarInt {
+        match self {}
+    }
+
+    fn of(_value: VarInt) -> Option<Self> {
+        None
+    }
+}
+
+impl<H: ClaimedValue, T: ClaimedValue> ClaimedValue for Coproduct<H, T> {
+    fn value(self) -> VarInt {
+        match self {
+            Coproduct::Inl(value) => value.value(),
+            Coproduct::Inr(value) => value.value(),
+        }
+    }
+
+    fn of(value: VarInt) -> Option<Self> {
+        H::of(value)
+            .map(Coproduct::Inl)
+            .or_else(|| T::of(value).map(Coproduct::Inr))
+    }
+}
+
+/// An integer is not a value the type claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Snafu)]
+#[snafu(display("{value} is not a value this type claims"))]
+pub struct UnclaimedValueError {
+    value: VarInt,
+}
+
+impl UnclaimedValueError {
+    /// The error for `value`.
+    pub const fn new(value: VarInt) -> Self {
+        Self { value }
+    }
+
+    /// The integer.
+    pub const fn value(&self) -> VarInt {
+        self.value
+    }
+}
 
 /// The values a part claims in one registry: ranges of values, or for a
 /// list of parts those of the parts it holds.

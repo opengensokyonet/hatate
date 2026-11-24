@@ -5,13 +5,18 @@ mod common;
 
 use bytes::Bytes;
 use common::Liar;
+use frunk_core::hlist::HNil;
 use hatate_wire::frame::{
     Frame, FrameWidths, Http2FrameType, PushId,
     codec::{
         CopyPayloadError, FrameLengthError, WriteFrameError, WriteFrameExt as _,
         WriteFrameHeadError, WriteFrameHeadHostExt as _, WritePushPromiseFrameError,
-        WritePushPromiseFrameHostExt as _, read_frame,
+        WritePushPromiseFrameHostExt as _,
     },
+};
+use hatate_wire::{
+    Role,
+    stream::{FrameStream, kind::RequestStreamKind},
 };
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::{ExactLen, Read, Write};
@@ -41,8 +46,15 @@ async fn read_head<F: Read>(
 where
     <F as Read>::Error: core::fmt::Debug,
 {
-    let frame = read_frame(&mut *io).await.unwrap().unwrap();
-    let (r#type, length, widths) = (frame.r#type(), frame.length(), frame.widths());
+    // Every type is read on a stream of a list of no parts, which looks
+    // none up.
+    let mut stream = FrameStream::<HNil, RequestStreamKind, _>::read(&mut *io, Role::Server)
+        .await
+        .unwrap()
+        .unwrap();
+    let frame = stream.frame();
+    let (length, widths) = (frame.length(), frame.widths());
+    let r#type = VarIntField::new(frame.frame_type().value(), widths.type_width()).unwrap();
     (
         r#type,
         length,
