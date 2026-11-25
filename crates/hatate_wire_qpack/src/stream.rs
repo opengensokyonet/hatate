@@ -54,10 +54,10 @@ pub enum CriticalStreamError<E> {
 /// The receiver family of a [`CriticalStream`] composed onto a parent
 /// stream. It passes on [`Read`], [`ReadChunk`] and [`Skip`] where the
 /// parent has them, with the end of the stream as a failure.
-pub struct Critical<F>(PhantomData<fn(F) -> F>);
+pub struct CriticalSource<F>(PhantomData<fn(F) -> F>);
 
 pin_project_lite::pin_project! {
-    /// The view of a [`Critical`] family: the parent view, held by value.
+    /// The view of a [`CriticalSource`] family: the parent view, held by value.
     pub struct CriticalView<'v, F>
     where
         F: ReceiverFamily,
@@ -74,7 +74,7 @@ impl<F: ReceiverFamily> core::fmt::Debug for CriticalView<'_, F> {
     }
 }
 
-impl<F: ReceiverFamily> ReceiverFamily for Critical<F> {
+impl<F: ReceiverFamily> ReceiverFamily for CriticalSource<F> {
     type ReceiverView<'v>
         = CriticalView<'v, F>
     where
@@ -82,7 +82,7 @@ impl<F: ReceiverFamily> ReceiverFamily for Critical<F> {
 }
 
 impl<F: ReceiverFamily> Compose<F> for CriticalStream {
-    type Family = Critical<F>;
+    type Family = CriticalSource<F>;
     fn compose<'v>(self: Pin<&'v mut Self>, parent: F::ReceiverView<'v>) -> CriticalView<'v, F>
     where
         F: 'v,
@@ -92,7 +92,7 @@ impl<F: ReceiverFamily> Compose<F> for CriticalStream {
     }
 }
 
-impl<F: Read> Read for Critical<F> {
+impl<F: Read> Read for CriticalSource<F> {
     type Error = CriticalStreamError<F::Error>;
     fn poll_read<'v, O: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'v>>,
@@ -113,7 +113,7 @@ impl<F: Read> Read for Critical<F> {
     }
 }
 
-impl<F: ReadChunk> ReadChunk for Critical<F> {
+impl<F: ReadChunk> ReadChunk for CriticalSource<F> {
     type Chunk = F::Chunk;
     fn poll_read_chunk<'v>(
         host: Pin<&mut Self::ReceiverView<'v>>,
@@ -133,7 +133,7 @@ impl<F: ReadChunk> ReadChunk for Critical<F> {
     }
 }
 
-impl<F: Skip> Skip for Critical<F> {
+impl<F: Skip> Skip for CriticalSource<F> {
     type Count = F::Count;
     fn poll_skip<'v, M: Min<F::Count, Output = F::Count> + Clone>(
         host: Pin<&mut Self::ReceiverView<'v>>,
