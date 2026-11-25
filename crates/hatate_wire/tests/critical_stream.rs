@@ -18,9 +18,9 @@ use hatate_qpack::encoder_instruction::{Started, literal::LiteralSource};
 use hatate_wire::{
     Part, Role,
     error_code::{ErrorCode, ErrorCodeOf},
-    frame::control::codec::ReadGoawayFrameExt as _,
+    frame::GoawayId,
     settings::{
-        codec::ReadSettingExt as _,
+        codec::SettingParameter,
         set::{Settings, SettingsOf},
     },
     stream::{
@@ -33,7 +33,8 @@ use hatate_wire_qpack::stream::{
     CriticalStream, CriticalStreamError, QpackDecoderStream, QpackEncoderStream,
 };
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::{Read, ReadChunk, Skip, prelude::*};
+use nitori_io::{Read, ReadChunk, Skip, calls::ReadValue, prelude::*};
+use sakuya_var_int::VarIntField;
 
 type Parts = HList![Part];
 
@@ -304,7 +305,8 @@ async fn control_failure<
     then: Then,
 ) -> Option<ErrorCode> {
     let stream =
-        match read_unidirectional_stream::<Parts, ServerInitiatedUnidirectional, _>(&mut *io).await
+        match read_unidirectional_stream::<Parts, ServerInitiatedUnidirectional, _, ()>(&mut *io)
+            .await
         {
             Ok(stream) => stream.expect("a type"),
             Err(error) => return error.error_code(),
@@ -323,10 +325,13 @@ async fn control_failure<
         let mut settings = Settings::<<Parts as SettingsOf>::Settings>::new();
         let mut frame = control.frame();
         loop {
-            match frame.payload().read_setting(&mut settings).await {
-                Ok(Some(_)) => {}
-                Ok(None) => panic!("the settings ended"),
+            assert!(frame.payload().remaining() > 0, "the settings ended");
+            let parameter = match frame.payload().decode::<SettingParameter, _>().await {
+                Ok(parameter) => parameter,
                 Err(error) => return error.error_code(),
+            };
+            if let Err(error) = settings.insert(parameter) {
+                return error.error_code();
             }
         }
     }
@@ -334,8 +339,11 @@ async fn control_failure<
         match control.next_frame().await {
             Ok(mut frame) => {
                 if let Then::Goaway = then {
-                    let widths = frame.widths();
-                    match frame.payload().read_goaway_frame(widths).await {
+                    match frame
+                        .payload()
+                        .decode_to_end::<ReadValue<VarIntField<GoawayId>, ()>, _>()
+                        .await
+                    {
                         Ok(_) => panic!("a whole GOAWAY"),
                         Err(error) => return error.error_code(),
                     }
@@ -662,7 +670,8 @@ async fn push_ends<
     io: &mut A,
 ) -> Result<usize, Option<ErrorCode>> {
     let stream =
-        match read_unidirectional_stream::<Parts, ServerInitiatedUnidirectional, _>(&mut *io).await
+        match read_unidirectional_stream::<Parts, ServerInitiatedUnidirectional, _, ()>(&mut *io)
+            .await
         {
             Ok(stream) => stream.expect("a type"),
             Err(error) => return Err(error.error_code()),

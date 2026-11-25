@@ -51,7 +51,7 @@ macro_rules! open {
         >(
             io: &mut A,
         ) -> Opened {
-            match read_unidirectional_stream::<Parts, $class, _>(&mut *io).await {
+            match read_unidirectional_stream::<Parts, $class, _, ()>(&mut *io).await {
                 Ok(Some(stream)) => {
                     let ReceivedStream::Known(known) = stream.transpose() else {
                         panic!("not a stream of a part");
@@ -186,10 +186,11 @@ async fn drop_next<
     io: &mut A,
     drops: Vec<usize>,
 ) -> (Step, Vec<u8>) {
-    let stream = read_unidirectional_stream::<Parts, ClientInitiatedUnidirectional, _>(&mut *io)
-        .await
-        .unwrap()
-        .unwrap();
+    let stream =
+        read_unidirectional_stream::<Parts, ClientInitiatedUnidirectional, _, ()>(&mut *io)
+            .await
+            .unwrap()
+            .unwrap();
     let ReceivedStream::Known(known) = stream.transpose() else {
         panic!("not a stream of a part");
     };
@@ -266,10 +267,11 @@ async fn frames_after_the_first<
     io: &mut A,
     known: bool,
 ) -> (Vec<u64>, Option<ErrorCode>, bool) {
-    let stream = read_unidirectional_stream::<Parts, ClientInitiatedUnidirectional, _>(&mut *io)
-        .await
-        .unwrap()
-        .unwrap();
+    let stream =
+        read_unidirectional_stream::<Parts, ClientInitiatedUnidirectional, _, ()>(&mut *io)
+            .await
+            .unwrap()
+            .unwrap();
     let ReceivedStream::Known(known_stream) = stream.transpose() else {
         panic!("not a stream of a part");
     };

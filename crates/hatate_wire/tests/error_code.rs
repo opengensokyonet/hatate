@@ -2,10 +2,11 @@
 use frunk_core::coproduct::{CNil, Coproduct};
 use hatate_wire::{
     error_code::{ErrorCode, ErrorCodeOf},
-    frame::{FrameWidths, control::codec::ReadGoawayFrameHostExt as _},
+    frame::control::GoawayFrame,
     parts::PartsError,
 };
 use hatate_wire_qpack::QpackErrorCode;
+use nitori_codec::prelude::*;
 use sakuya_var_int::VarInt;
 
 /// A failure that calls for H3_ID_ERROR.
@@ -47,12 +48,10 @@ fn a_frame_read_from_a_source_that_cannot_fail_has_a_code_too() {
     fn code_of<E: ErrorCodeOf<ErrorCode>>(error: &E) -> Option<ErrorCode> {
         error.error_code()
     }
-    // The payload of a GOAWAY, read directly from memory: a two-byte
-    // integer cut short.
-    let mut input = &[0x40][..];
-    let error = input
-        .sync_read_goaway_frame_unpin(FrameWidths::SHORTEST)
-        .unwrap_err();
+    // A GOAWAY read directly from memory: a two-byte integer cut short by
+    // the Length.
+    let mut input = &[0x07, 0x01, 0x40][..];
+    let error = input.sync_decode_unpin::<GoawayFrame>().unwrap_err();
     assert_eq!(code_of(&error), Some(ErrorCode::H3_FRAME_ERROR));
 }
 

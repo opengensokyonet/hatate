@@ -19,7 +19,7 @@ use hatate_wire::{
     },
 };
 use nitori_call::ReceiverAccess;
-use nitori_io::Read;
+use nitori_io::{Combine, Read, calls::ReadValue};
 use sakuya_var_int::{VarInt, VarIntField};
 
 type Plain = HList![Part];
@@ -53,7 +53,7 @@ impl<const VALUE: u32, const VERDICT: u8, C: StreamClass, L> StreamPart<C, L>
 {
     type Claimed = ();
     type Rejection = Reason;
-    type Stream<I> = ();
+    type Stream<I, M> = ();
     type ReadError<E> = CNil;
 
     fn judge(value: VarInt, _skipped: bool) -> StreamVerdict<(), Reason> {
@@ -67,9 +67,9 @@ impl<const VALUE: u32, const VERDICT: u8, C: StreamClass, L> StreamPart<C, L>
         }
     }
 
-    async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
+    async fn read<I: ReceiverAccess<Family: Read<Metadata = M>>, M: Combine + Unpin + Clone>(
         (): (),
-        _field: VarIntField<VarInt>,
+        _field: ReadValue<VarIntField<VarInt>, M>,
         _io: I,
     ) -> Result<(), CNil> {
         Ok(())

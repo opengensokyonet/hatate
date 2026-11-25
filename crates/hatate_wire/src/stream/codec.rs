@@ -14,19 +14,21 @@ use crate::{
     registry::is_reserved,
     stream_type::StreamTypeSet,
 };
-use nitori_call::{Composed, ReceiverAccess};
+use nitori_call::ReceiverAccess;
 use nitori_codec::prelude::*;
-use nitori_io::{Infinite, Min, Read, Skip, prelude::*};
+use nitori_io::{Combine, Infinite, Min, Read, Skip, calls::ReadValue};
 use sakuya_var_int::{VarInt, VarIntField, stream::ReadVarIntError};
 use snafu::{ResultExt, Snafu};
 
-/// The stream that [`read_unidirectional_stream`] gives.
-pub type ReceivedUnidirectionalStream<L, C, I> =
-    UnidirectionalStream<ReceivedStream<<L as StreamSet<C, L>>::Stream<I>, UnknownStream<I>>>;
+/// The stream that [`read_unidirectional_stream`] gives, from a source whose
+/// bytes carry the metadata `M`.
+pub type ReceivedUnidirectionalStream<L, C, I, M = ()> =
+    UnidirectionalStream<ReceivedStream<<L as StreamSet<C, L>>::Stream<I, M>, UnknownStream<I>>, M>;
 
-/// The streams that [`read_bidirectional_stream`] gives.
-pub type ReceivedBidirectionalStream<L, C, I> =
-    ReceivedStream<<L as StreamSet<C, L>>::Stream<I>, UnknownStream<I>>;
+/// The streams that [`read_bidirectional_stream`] gives, from a source whose
+/// bytes carry the metadata `M`.
+pub type ReceivedBidirectionalStream<L, C, I, M = ()> =
+    ReceivedStream<<L as StreamSet<C, L>>::Stream<I, M>, UnknownStream<I>>;
 
 /// Reads the type at the start of a unidirectional stream of class `C`
 /// that the peer opened, and gives the stream of the part of `L` that
@@ -37,7 +39,8 @@ pub type ReceivedBidirectionalStream<L, C, I> =
 /// was read with. Name the parts and the class with a turbofish:
 /// `read_unidirectional_stream::<Parts, ClientInitiatedUnidirectional, _>(io)`.
 /// Streams are read concurrently: one whose start has not arrived does not
-/// hold up the others.
+/// hold up the others. The metadata of the bytes of the type is kept
+/// ([`UnidirectionalStream::type_metadata`]).
 ///
 /// Returns `None` if the stream ends before the first byte; a receiver
 /// tolerates a stream closed before its type ([RFC 9114 §6.2]).
@@ -48,10 +51,10 @@ pub type ReceivedBidirectionalStream<L, C, I> =
 /// gives the connection error the failure calls for, if any.
 ///
 /// [RFC 9114 §6.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2
-pub async fn read_unidirectional_stream<L, C, I>(
+pub async fn read_unidirectional_stream<L, C, I, M>(
     mut io: I,
 ) -> Result<
-    Option<ReceivedUnidirectionalStream<L, C, I>>,
+    Option<ReceivedUnidirectionalStream<L, C, I, M>>,
     ReadUnidirectionalStreamError<
         <I::Family as Read>::Error,
         <L as StreamSet<C, L>>::ReadError<<I::Family as Read>::Error>,
@@ -61,7 +64,8 @@ pub async fn read_unidirectional_stream<L, C, I>(
 where
     C: UnidirectionalClass,
     L: StreamSet<C, L> + StreamTypeSet,
-    I: ReceiverAccess<Family: Read<Metadata = ()>>,
+    I: ReceiverAccess<Family: Read<Metadata = M>>,
+    M: Combine + Unpin + Clone,
 {
     const {
         assert!(
@@ -69,15 +73,15 @@ where
             "the parts claim overlapping or reserved stream types"
         );
     }
-    let field = match io.decode::<VarIntField<VarInt>>().await {
+    let field = match ReadValue::<VarIntField<VarInt>, M>::decode_from(&mut io).await {
         Ok(field) => field,
         Err(error) if error.is_incomplete() && error.completed() == 0 => return Ok(None),
         Err(source) => return Err(ReadUnidirectionalStreamError::Type { source }),
     };
-    let value = field.get();
+    let value = field.value.get();
     let stream = match L::judge(value, false) {
         StreamVerdict::Claimed(claimed) => ReceivedStream::Known(
-            L::read(claimed, field, io)
+            L::read(claimed, field.clone(), io)
                 .await
                 .map_err(PartsError::new)
                 .context(read_unidirectional_stream_error::PartSnafu)?,
@@ -90,7 +94,11 @@ where
             });
         }
     };
-    Ok(Some(UnidirectionalStream::read(stream, field.width())))
+    Ok(Some(UnidirectionalStream::read(
+        stream,
+        field.value.width(),
+        field.metadata,
+    )))
 }
 
 /// Failures of [`read_unidirectional_stream`]. `P` is the sum of the
@@ -163,10 +171,10 @@ impl<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>, R: ErrorCodeOf<ErrorC
 /// gives the connection error the failure calls for, if any.
 ///
 /// [RFC 9114 §6.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.1
-pub async fn read_bidirectional_stream<L, C, I>(
+pub async fn read_bidirectional_stream<L, C, I, M>(
     mut io: I,
 ) -> Result<
-    Option<ReceivedBidirectionalStream<L, C, I>>,
+    Option<ReceivedBidirectionalStream<L, C, I, M>>,
     ReadBidirectionalStreamError<
         <I::Family as Read>::Error,
         <L as StreamSet<C, L>>::ReadError<<I::Family as Read>::Error>,
@@ -176,7 +184,8 @@ pub async fn read_bidirectional_stream<L, C, I>(
 where
     C: BidirectionalClass,
     L: StreamSet<C, L>,
-    I: ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>, Metadata = ()>>,
+    I: ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>, Metadata = M>>,
+    M: Combine + Unpin + Clone,
     u64: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
     Infinite: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
 {
@@ -188,20 +197,19 @@ where
         else {
             return Ok(None);
         };
-        if !is_reserved(field.get()) {
+        if !is_reserved(field.value.get()) {
             break field;
         }
         let length = read_length(&mut io)
             .await
             .context(read_bidirectional_stream_error::HeadSnafu)?;
-        let mut payload = Composed::new(&mut io, FramePayload::new(length.get().get()));
-        payload
-            .skip_to_end()
+        FramePayload::new(&mut io, length.value.get().get())
+            .finish()
             .await
             .context(read_bidirectional_stream_error::ReservedPayloadSnafu)?;
         skipped = true;
     };
-    let value = field.get();
+    let value = field.value.get();
     Ok(Some(match L::judge(value, skipped) {
         StreamVerdict::Claimed(claimed) => ReceivedStream::Known(
             L::read(claimed, field, io)

@@ -4,7 +4,7 @@
 //! where its bytes may arrive in pieces. Frames are read on a stream that
 //! carries them, a [`FrameStream`](crate::stream::FrameStream), which holds
 //! the current frame: [`frame`](crate::stream::FrameStream::frame) gives it,
-//! with its payload, the stream composed with a [`payload::FramePayload`],
+//! with its payload, the stream's [`payload::FramePayload`],
 //! for the caller to consume itself or with the reader of that frame type;
 //! [`next_frame`](crate::stream::FrameStream::next_frame) skips what is left
 //! of the payload and reads the next frame.
@@ -25,6 +25,8 @@ use crate::{
     Role,
     registry::{ClaimedValue, ClaimedValues, UnclaimedValueError, is_reserved},
 };
+use nitori_codec::EncodedLen;
+use nitori_io::calls::ReadValue;
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 use set::FrameKind;
 use snafu::Snafu;
@@ -33,6 +35,7 @@ use snafu::Snafu;
 pub mod codec;
 pub mod control;
 pub mod payload;
+pub mod push_promise;
 pub mod set;
 
 /// A frame type that RFC 9114 defines ([RFC 9114 §7.2]).
@@ -440,34 +443,102 @@ impl<T: ClaimedValue> From<FrameType<T>> for VarInt {
     }
 }
 
-/// A frame ([RFC 9114 §7.1]): its Type, its Length, and its payload `P`.
+/// A frame ([RFC 9114 §7.1]): its Type, its Length, and its payload `P`,
+/// the Type and Length each with the metadata `M` of their bytes.
 ///
 /// `T` is the type of the Type field, which keeps the width it had on the
 /// wire: the frame types of a kind of stream as its list of parts reads them,
 /// [`FrameType`], for a frame read from a
-/// [`FrameStream`](crate::stream::FrameStream), or any type that gives its
-/// value on the wire, such as [`Http3FrameType`] or a raw `VarInt`, for a
-/// frame to write. A frame read from a stream is written back as the bytes
-/// it was read from.
+/// [`FrameStream`](crate::stream::FrameStream); one frame type of RFC 9114,
+/// such as [`GoawayFrameType`], for a frame of that type; or any type that
+/// gives its value on the wire, such as [`Http3FrameType`] or a raw `VarInt`.
+/// A frame read from the wire is written back as the bytes it was read from.
+/// The Type is never one of HTTP/2 ([`Http2FrameType`]): reading and
+/// [`new`](Self::new) reject those.
 ///
-/// Read from a stream, the payload is the stream composed with what is left
-/// of the payload ([`FramePayload`](payload::FramePayload)), which ends at
-/// the end of the payload. To write a frame, the payload is a source of its
-/// bytes ([`codec::write_frame`]).
+/// Read from a stream, the payload is a [`FramePayload`](payload::FramePayload),
+/// which ends at the end of the payload, or a value read from it whole.
+/// Written, the payload is a value that encodes itself, such as a
+/// [`Chunks`](nitori_codec::payload::Chunks) of a source of its bytes.
+/// `M` is `()` for a frame built to be written and for one read from a
+/// stream without metadata.
 ///
 /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Frame<T, P> {
-    r#type: VarIntField<T>,
-    length: VarIntField<VarInt>,
+pub struct Frame<T, P, M = ()> {
+    r#type: ReadValue<VarIntField<T>, M>,
+    length: ReadValue<VarIntField<VarInt>, M>,
     payload: P,
 }
 
-impl<T, P> Frame<T, P> {
-    /// The frame with the Type `r#type`, the Length `length` and the
-    /// payload `payload`. Whether the payload has that length is checked
-    /// where it is written.
-    pub const fn new(r#type: VarIntField<T>, length: VarIntField<VarInt>, payload: P) -> Self {
+impl<T: Copy + Into<VarInt> + TryFrom<VarInt>, P: EncodedLen> Frame<T, P> {
+    /// The frame of type `r#type` with the payload `payload`, whose Length
+    /// is the encoded length of the payload.
+    ///
+    /// The Type and the Length are written at the shortest width; a frame
+    /// with longer encodings is one read from the wire.
+    ///
+    /// # Errors
+    ///
+    /// [`NewFrameError`]: the type is one of HTTP/2, the payload cannot tell
+    /// its length, or the length exceeds 2^62 - 1.
+    pub async fn new(r#type: T, mut payload: P) -> Result<Self, NewFrameError<P::LengthError>> {
+        if let Some(frame_type) = Http2FrameType::of(r#type.into()) {
+            return Err(NewFrameError::Http2Type {
+                source: Http2FrameTypeError::new(frame_type),
+            });
+        }
+        let length = payload
+            .encoded_len()
+            .await
+            .map_err(|source| NewFrameError::Length { source })?;
+        let length = VarInt::new(length).map_err(|_| NewFrameError::TooLong { length })?;
+        Ok(Self {
+            r#type: ReadValue {
+                value: VarIntField::shortest(r#type),
+                metadata: (),
+            },
+            length: ReadValue {
+                value: VarIntField::shortest(length),
+                metadata: (),
+            },
+            payload,
+        })
+    }
+}
+
+/// Failures of [`Frame::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
+#[snafu(module)]
+pub enum NewFrameError<E> {
+    /// The type is one HTTP/2 defines and HTTP/3 does not, which must not be
+    /// sent.
+    #[snafu(display("cannot send a frame type of HTTP/2"))]
+    Http2Type {
+        /// The type given.
+        source: Http2FrameTypeError,
+    },
+    /// The payload cannot tell its length.
+    #[snafu(display("frame payload cannot tell its length"))]
+    Length {
+        /// Why it cannot.
+        source: E,
+    },
+    /// The payload is longer than a variable-length integer can state.
+    #[snafu(display("frame payload length {length} exceeds 2^62 - 1"))]
+    TooLong {
+        /// The length of the payload.
+        length: u64,
+    },
+}
+
+impl<T, P, M> Frame<T, P, M> {
+    /// The frame of the Type and Length read from the wire, with `payload`.
+    pub(crate) const fn from_parts(
+        r#type: ReadValue<VarIntField<T>, M>,
+        length: ReadValue<VarIntField<VarInt>, M>,
+        payload: P,
+    ) -> Self {
         Self {
             r#type,
             length,
@@ -477,7 +548,17 @@ impl<T, P> Frame<T, P> {
 
     /// The Length field: the length of the payload in bytes.
     pub const fn length(&self) -> VarIntField<VarInt> {
-        self.length
+        self.length.value
+    }
+
+    /// The metadata of the bytes of the Type.
+    pub const fn type_metadata(&self) -> &M {
+        &self.r#type.metadata
+    }
+
+    /// The metadata of the bytes of the Length.
+    pub const fn length_metadata(&self) -> &M {
+        &self.length.metadata
     }
 
     /// The payload.
@@ -489,21 +570,131 @@ impl<T, P> Frame<T, P> {
     pub fn into_payload(self) -> P {
         self.payload
     }
+
+    /// The frame with the payload `map` makes of this one's, which must
+    /// encode to as many bytes for the Length to stay true: such as the
+    /// payload of a frame read from a stream, wrapped to be written as it
+    /// was read ([`Chunks`](nitori_codec::payload::Chunks)).
+    pub fn map_payload<Q>(self, map: impl FnOnce(P) -> Q) -> Frame<T, Q, M> {
+        Frame {
+            r#type: self.r#type,
+            length: self.length,
+            payload: map(self.payload),
+        }
+    }
 }
 
-impl<T: Copy, P> Frame<T, P> {
+impl<T: Copy, P, M> Frame<T, P, M> {
     /// The Type field.
     pub const fn r#type(&self) -> VarIntField<T> {
-        self.r#type
+        self.r#type.value
     }
 
     /// The type.
     pub const fn frame_type(&self) -> T {
-        self.r#type.get()
+        self.r#type.value.get()
     }
 
     /// The widths of the Type and Length.
     pub const fn widths(&self) -> FrameWidths {
-        FrameWidths::new(self.r#type.width(), self.length.width())
+        FrameWidths::new(self.r#type.value.width(), self.length.value.width())
     }
 }
+
+macro_rules! frame_type_marker {
+    ($(#[$meta:meta])* $name:ident, $frame_type:ident) => {
+        $(#[$meta])*
+        ///
+        /// It is a type of the Type field of a [`Frame`]: its value is always
+        /// that frame type, and a frame of another type is not one of it.
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+        pub struct $name;
+
+        impl From<$name> for VarInt {
+            fn from(_: $name) -> Self {
+                Http3FrameType::$frame_type.value()
+            }
+        }
+
+        impl TryFrom<VarInt> for $name {
+            type Error = FrameTypeMismatchError;
+
+            fn try_from(value: VarInt) -> Result<Self, FrameTypeMismatchError> {
+                if value == Http3FrameType::$frame_type.value() {
+                    Ok(Self)
+                } else {
+                    Err(FrameTypeMismatchError {
+                        expected: Http3FrameType::$frame_type,
+                        frame_type: value,
+                    })
+                }
+            }
+        }
+    };
+}
+
+frame_type_marker!(
+    /// The frame type DATA (0x00).
+    DataFrameType,
+    Data
+);
+frame_type_marker!(
+    /// The frame type HEADERS (0x01).
+    HeadersFrameType,
+    Headers
+);
+frame_type_marker!(
+    /// The frame type CANCEL_PUSH (0x03).
+    CancelPushFrameType,
+    CancelPush
+);
+frame_type_marker!(
+    /// The frame type SETTINGS (0x04).
+    SettingsFrameType,
+    Settings
+);
+frame_type_marker!(
+    /// The frame type PUSH_PROMISE (0x05).
+    PushPromiseFrameType,
+    PushPromise
+);
+frame_type_marker!(
+    /// The frame type GOAWAY (0x07).
+    GoawayFrameType,
+    Goaway
+);
+frame_type_marker!(
+    /// The frame type MAX_PUSH_ID (0x0d).
+    MaxPushIdFrameType,
+    MaxPushId
+);
+
+/// A frame is not of the one frame type its Type field holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
+#[snafu(display("frame type {frame_type} is not {expected:?}"))]
+pub struct FrameTypeMismatchError {
+    expected: Http3FrameType,
+    frame_type: VarInt,
+}
+
+impl FrameTypeMismatchError {
+    /// The frame type the field holds.
+    pub const fn expected(&self) -> Http3FrameType {
+        self.expected
+    }
+
+    /// The type of the frame.
+    pub const fn frame_type(&self) -> VarInt {
+        self.frame_type
+    }
+}
+
+/// A DATA frame ([RFC 9114 §7.2.1]): bytes of the content of a message.
+///
+/// [RFC 9114 §7.2.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.1
+pub type DataFrame<P, M = ()> = Frame<DataFrameType, P, M>;
+
+/// A HEADERS frame ([RFC 9114 §7.2.2]): an encoded field section.
+///
+/// [RFC 9114 §7.2.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.2
+pub type HeadersFrame<P, M = ()> = Frame<HeadersFrameType, P, M>;

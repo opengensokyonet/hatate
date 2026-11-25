@@ -107,8 +107,8 @@ impl From<ErrorCode> for VarInt {
 /// stream underneath failed: whoever owns the stream decides. A failure
 /// that wraps the failure of a source gives the code of its source where
 /// the source has one, so the sources an operation reads from implement it
-/// too: a [`FramePayload`](crate::frame::payload::FramePayload) composed
-/// onto a stream, and an in-memory source that cannot fail.
+/// too: a [`FramePayload`](crate::frame::payload::FramePayload) that
+/// holds a stream, and an in-memory source that cannot fail.
 pub trait ErrorCodeOf<C> {
     /// The code this failure calls for, if any.
     fn error_code(&self) -> Option<C>;

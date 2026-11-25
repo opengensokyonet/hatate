@@ -16,7 +16,7 @@
 //! The kinds of stream that carry frames ([`kind`]) are derived within the
 //! classes by the parts that define them. A [`FrameStream`] holds the stream
 //! and its current frame: [`FrameStream::frame`] gives the frame, whose
-//! payload is the stream composed with what is left of it, and
+//! payload is the [`FramePayload`] of the stream limited to what is left of it, and
 //! [`FrameStream::next_frame`] skips what is left and reads the next frame.
 //!
 //! [RFC 9114 §6]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6
@@ -26,15 +26,17 @@ use crate::{
     frame::{
         Frame, FrameType,
         codec::{ReadFrameHeadError, check_frame_type, read_length, read_type},
-        payload::{FramePayload, PayloadError},
+        payload::{FramePayload, PayloadError, PayloadLimit},
         set::FrameSetOn,
     },
 };
 use core::marker::PhantomData;
 use frunk_core::coproduct::{CNil, Coproduct};
 use kind::StreamKind;
-use nitori_call::{Composed, ReceiverAccess};
-use nitori_io::{Infinite, Min, Read, Skip, adapters::ReadLimit, prelude::*};
+use nitori_call::{AsAccess, Composed, ReceiverAccess};
+use nitori_io::{
+    Combine, Infinite, Min, Read, Skip, adapters::ReadLimit, calls::ReadValue, prelude::*,
+};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth, VarIntWidthError};
 use snafu::Snafu;
 
@@ -48,25 +50,24 @@ pub mod part;
 /// A stream that carries frames, of kind `K` in a connection whose list of
 /// parts is `L`, and its current frame.
 ///
-/// It holds the access `I` to the stream, the head of the current frame and
-/// what is left of its payload. It is made at its first frame
+/// It holds the head of the current frame and its payload, a
+/// [`FramePayload`] that holds the access `I` to the stream. It is made at its first frame
 /// ([`read`](Self::read)) and always has a current frame: after the stream
 /// ends at a frame boundary it keeps the last one, whose payload is then
 /// empty.
 ///
-/// The frame [`frame`](Self::frame) gives borrows the stream, so its payload
-/// is read before the next frame is: [`next_frame`](Self::next_frame) skips
+/// The frame [`frame`](Self::frame) gives borrows the payload, so it is read
+/// before the next frame is: [`next_frame`](Self::next_frame) skips
 /// what is left of it. Skipping resumes where it stopped if the call is
 /// dropped, and so does a call dropped before it read any byte of the next
 /// head. A stream whose next head was begun but not read whole, because the
 /// call was dropped or the head was rejected, is interrupted and is
 /// abandoned. [`into_io`](Self::into_io) gives the access back.
-pub struct FrameStream<L: FrameSetOn<K>, K: StreamKind, I> {
-    io: I,
+pub struct FrameStream<L: FrameSetOn<K>, K: StreamKind, I, M = ()> {
     role: Role,
-    r#type: VarIntField<FrameType<L::FrameType>>,
-    length: VarIntField<VarInt>,
-    payload: FramePayload,
+    r#type: ReadValue<VarIntField<FrameType<L::FrameType>>, M>,
+    length: ReadValue<VarIntField<VarInt>, M>,
+    payload: FramePayload<I>,
     /// What may still be read of the next head: unlimited, and unchanged
     /// until a byte of it is read.
     head: ReadLimit<u64>,
@@ -89,10 +90,11 @@ enum FrameStreamState {
     Interrupted,
 }
 
-/// The head of a frame that a [`FrameStream`] of `L` on `K` reads.
-type Head<L, K> = (
-    VarIntField<FrameType<<L as FrameSetOn<K>>::FrameType>>,
-    VarIntField<VarInt>,
+/// The head of a frame that a [`FrameStream`] of `L` on `K` reads, with
+/// the metadata `M` of its bytes.
+type Head<L, K, M> = (
+    ReadValue<VarIntField<FrameType<<L as FrameSetOn<K>>::FrameType>>, M>,
+    ReadValue<VarIntField<VarInt>, M>,
 );
 
 /// Reads the Length of the frame whose Type `r#type` was read, after
@@ -100,20 +102,28 @@ type Head<L, K> = (
 async fn read_after_type<
     L: FrameSetOn<K>,
     K: StreamKind,
-    I: ReceiverAccess<Family: Read<Metadata = ()>>,
+    I: ReceiverAccess<Family: Read<Metadata = M>>,
+    M: Combine + Unpin,
 >(
     io: &mut I,
     role: Role,
-    r#type: VarIntField<VarInt>,
-) -> Result<Head<L, K>, ReadFrameHeadError<<I::Family as Read>::Error>> {
-    let frame_type = check_frame_type::<L, K>(r#type.get(), role)
+    r#type: ReadValue<VarIntField<VarInt>, M>,
+) -> Result<Head<L, K, M>, ReadFrameHeadError<<I::Family as Read>::Error>> {
+    let frame_type = check_frame_type::<L, K>(r#type.value.get(), role)
         .map_err(|source| ReadFrameHeadError::Unexpected { source })?;
-    let length = read_length(io)
+    let length = read_length(&mut *io)
         .await
         .map_err(|source| ReadFrameHeadError::Frame { source })?;
     // invariant: the frame type is the value that was read at this width.
-    let r#type = VarIntField::new(frame_type, r#type.width()).expect("the width held the value");
-    Ok((r#type, length))
+    let value =
+        VarIntField::new(frame_type, r#type.value.width()).expect("the width held the value");
+    Ok((
+        ReadValue {
+            value,
+            metadata: r#type.metadata,
+        },
+        length,
+    ))
 }
 
 /// Reads and checks the head of the next frame, or `None` at the end of the
@@ -121,22 +131,27 @@ async fn read_after_type<
 async fn read_head<
     L: FrameSetOn<K>,
     K: StreamKind,
-    I: ReceiverAccess<Family: Read<Metadata = ()>>,
+    I: ReceiverAccess<Family: Read<Metadata = M>>,
+    M: Combine + Unpin,
 >(
     io: &mut I,
     role: Role,
-) -> Result<Option<Head<L, K>>, ReadFrameHeadError<<I::Family as Read>::Error>> {
-    let Some(r#type) = read_type(io)
+) -> Result<Option<Head<L, K, M>>, ReadFrameHeadError<<I::Family as Read>::Error>> {
+    let Some(r#type) = read_type(&mut *io)
         .await
         .map_err(|source| ReadFrameHeadError::Frame { source })?
     else {
         return Ok(None);
     };
-    read_after_type::<L, K, I>(io, role, r#type).await.map(Some)
+    read_after_type::<L, K, I, M>(io, role, r#type)
+        .await
+        .map(Some)
 }
 
-impl<L: FrameSetOn<K>, K: StreamKind, I: ReceiverAccess<Family: Read<Metadata = ()>>>
-    FrameStream<L, K, I>
+impl<L: FrameSetOn<K>, K: StreamKind, I, M> FrameStream<L, K, I, M>
+where
+    I: ReceiverAccess<Family: Read<Metadata = M>>,
+    M: Combine + Unpin,
 {
     /// Reads the first frame of the stream `io` at an endpoint of role
     /// `role`, which receives the frames, and gives the stream at it.
@@ -151,7 +166,7 @@ impl<L: FrameSetOn<K>, K: StreamKind, I: ReceiverAccess<Family: Read<Metadata = 
         mut io: I,
         role: Role,
     ) -> Result<Option<Self>, ReadFrameHeadError<<I::Family as Read>::Error>> {
-        let Some((r#type, length)) = read_head::<L, K, I>(&mut io, role).await? else {
+        let Some((r#type, length)) = read_head::<L, K, I, M>(&mut io, role).await? else {
             return Ok(None);
         };
         Ok(Some(Self::at(io, role, r#type, length)))
@@ -162,56 +177,55 @@ impl<L: FrameSetOn<K>, K: StreamKind, I: ReceiverAccess<Family: Read<Metadata = 
     pub(crate) async fn with_type(
         mut io: I,
         role: Role,
-        r#type: VarIntField<VarInt>,
+        r#type: ReadValue<VarIntField<VarInt>, M>,
     ) -> Result<Self, ReadFrameHeadError<<I::Family as Read>::Error>> {
-        let (r#type, length) = read_after_type::<L, K, I>(&mut io, role, r#type).await?;
+        let (r#type, length) = read_after_type::<L, K, I, M>(&mut io, role, r#type).await?;
         Ok(Self::at(io, role, r#type, length))
     }
 
     fn at(
         io: I,
         role: Role,
-        r#type: VarIntField<FrameType<L::FrameType>>,
-        length: VarIntField<VarInt>,
+        r#type: ReadValue<VarIntField<FrameType<L::FrameType>>, M>,
+        length: ReadValue<VarIntField<VarInt>, M>,
     ) -> Self {
         Self {
-            io,
             role,
             r#type,
-            payload: FramePayload::new(length.get().get()),
+            payload: FramePayload::new(io, length.value.get().get()),
             length,
             head: ReadLimit(u64::MAX),
             state: FrameStreamState::InFrame,
             marker: PhantomData,
         }
     }
+}
 
-    /// The current frame. Its payload is the stream composed with what is
-    /// left of the payload, which ends at the end of the payload.
-    pub fn frame(&mut self) -> Frame<FrameType<L::FrameType>, Composed<&mut I, &mut FramePayload>> {
-        Frame::new(
-            self.r#type,
-            self.length,
-            Composed::new(&mut self.io, &mut self.payload),
-        )
+impl<L: FrameSetOn<K>, K: StreamKind, I, M: Clone> FrameStream<L, K, I, M> {
+    /// The current frame, with the metadata of the bytes of its head. Its
+    /// payload lends the stream limited to what is left of the payload,
+    /// which ends at the end of the payload.
+    pub fn frame(&mut self) -> Frame<FrameType<L::FrameType>, &mut FramePayload<I>, M> {
+        Frame::from_parts(self.r#type.clone(), self.length.clone(), &mut self.payload)
     }
 }
 
-impl<L: FrameSetOn<K>, K: StreamKind, I> FrameStream<L, K, I> {
+impl<L: FrameSetOn<K>, K: StreamKind, I, M> FrameStream<L, K, I, M> {
     /// The role of this endpoint, which receives the frames.
     pub const fn role(&self) -> Role {
         self.role
     }
 
-    /// The access, giving up the stream.
+    /// The access, giving up the stream, wherever it is.
     pub fn into_io(self) -> I {
-        self.io
+        self.payload.source
     }
 }
 
-impl<L: FrameSetOn<K>, K: StreamKind, I> FrameStream<L, K, I>
+impl<L: FrameSetOn<K>, K: StreamKind, I, M> FrameStream<L, K, I, M>
 where
-    I: ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>, Metadata = ()>>,
+    I: ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>, Metadata = M>>,
+    M: Combine + Unpin + Clone,
     u64: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
     Infinite: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
 {
@@ -233,7 +247,7 @@ where
     pub async fn next_frame(
         &mut self,
     ) -> Result<
-        Option<Frame<FrameType<L::FrameType>, Composed<&mut I, &mut FramePayload>>>,
+        Option<Frame<FrameType<L::FrameType>, &mut FramePayload<I>, M>>,
         NextFrameError<<I::Family as Read>::Error>,
     > {
         Ok(if self.advance().await? {
@@ -255,14 +269,14 @@ where
     pub async fn next_known_frame(
         &mut self,
     ) -> Result<
-        Option<Frame<FrameType<L::FrameType>, Composed<&mut I, &mut FramePayload>>>,
+        Option<Frame<FrameType<L::FrameType>, &mut FramePayload<I>, M>>,
         NextFrameError<<I::Family as Read>::Error>,
     > {
         loop {
             if !self.advance().await? {
                 return Ok(None);
             }
-            if let FrameType::Known(_) = self.r#type.get() {
+            if let FrameType::Known(_) = self.r#type.value.get() {
                 return Ok(Some(self.frame()));
             }
         }
@@ -273,8 +287,7 @@ where
         match self.state {
             FrameStreamState::InFrame => {
                 // A dropped skip resumes: the payload counts what it skipped.
-                let mut payload = Composed::new(&mut self.io, &mut self.payload);
-                if let Err(source) = payload.skip_to_end().await {
+                if let Err(source) = self.payload.access().skip_to_end().await {
                     self.state = FrameStreamState::Interrupted;
                     return Err(NextFrameError::Skip { source });
                 }
@@ -289,12 +302,12 @@ where
             }
             FrameStreamState::Ended => return Ok(false),
         }
-        let mut head = Composed::new(&mut self.io, &mut self.head);
-        match read_head::<L, K, _>(&mut head, self.role).await {
+        let mut head = Composed::new(&mut self.payload.source, &mut self.head);
+        match read_head::<L, K, _, M>(&mut head, self.role).await {
             Ok(Some((r#type, length))) => {
+                self.payload.limit = PayloadLimit::new(length.value.get().get());
                 self.r#type = r#type;
                 self.length = length;
-                self.payload = FramePayload::new(length.get().get());
                 self.state = FrameStreamState::InFrame;
                 Ok(true)
             }
@@ -310,7 +323,8 @@ where
     }
 }
 
-impl<L: FrameSetOn<K>, K: StreamKind, I> core::fmt::Debug for FrameStream<L, K, I>
+impl<L: FrameSetOn<K>, K: StreamKind, I, M: core::fmt::Debug> core::fmt::Debug
+    for FrameStream<L, K, I, M>
 where
     L::FrameType: core::fmt::Debug,
 {
@@ -319,7 +333,7 @@ where
             .field("role", &self.role)
             .field("type", &self.r#type)
             .field("length", &self.length)
-            .field("payload", &self.payload)
+            .field("payload", &self.payload.limit)
             .field("state", &self.state)
             .finish_non_exhaustive()
     }
@@ -429,7 +443,7 @@ impl<I> UnknownStream<I> {
     }
 }
 
-impl<I: ReceiverAccess<Family: Skip<Metadata = ()>>> UnknownStream<I>
+impl<I: ReceiverAccess<Family: Skip>> UnknownStream<I>
 where
     Infinite: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
 {
@@ -451,16 +465,19 @@ impl<I> TypedStream for UnknownStream<I> {
 }
 
 /// A unidirectional stream ([RFC 9114 §6.2]) whose type has been read: the
-/// stream `S`, which gives its type, and the width of the Stream Type field,
-/// so that it is written back in as many bytes as it was read in.
+/// stream `S`, which gives its type, the width of the Stream Type field, so
+/// that it is written back in as many bytes as it was read in, and the
+/// metadata `M` of the bytes of the field.
 ///
 /// Read from the wire, `S` is a [`ReceivedStream`] of the streams of the
-/// parts; its `transpose` methods move the width onto each kind of stream.
+/// parts; its `transpose` methods move the width and the metadata onto each
+/// kind of stream.
 ///
 /// [RFC 9114 §6.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2
 #[derive(Debug)]
-pub struct UnidirectionalStream<S> {
+pub struct UnidirectionalStream<S, M = ()> {
     width: VarIntWidth,
+    type_metadata: M,
     stream: S,
 }
 
@@ -472,9 +489,15 @@ impl<S: TypedStream> UnidirectionalStream<S> {
     /// [`VarIntWidthError`] if the type does not fit `width`.
     pub fn new(stream: S, width: VarIntWidth) -> Result<Self, VarIntWidthError> {
         VarIntField::new(stream.stream_type(), width)?;
-        Ok(Self { width, stream })
+        Ok(Self {
+            width,
+            type_metadata: (),
+            stream,
+        })
     }
+}
 
+impl<S: TypedStream, M> UnidirectionalStream<S, M> {
     /// The Stream Type field.
     pub fn type_field(&self) -> VarIntField<VarInt> {
         // invariant: the width was checked to hold the type when it was made.
@@ -483,15 +506,25 @@ impl<S: TypedStream> UnidirectionalStream<S> {
     }
 }
 
-impl<S> UnidirectionalStream<S> {
-    /// The stream whose type was read at `width`.
-    pub(crate) const fn read(stream: S, width: VarIntWidth) -> Self {
-        Self { width, stream }
+impl<S, M> UnidirectionalStream<S, M> {
+    /// The stream whose type was read at `width`, with the metadata of the
+    /// bytes of the type.
+    pub(crate) const fn read(stream: S, width: VarIntWidth, type_metadata: M) -> Self {
+        Self {
+            width,
+            type_metadata,
+            stream,
+        }
     }
 
     /// The width of the Stream Type field.
     pub const fn width(&self) -> VarIntWidth {
         self.width
+    }
+
+    /// The metadata of the bytes of the Stream Type field.
+    pub const fn type_metadata(&self) -> &M {
+        &self.type_metadata
     }
 
     /// The stream.
@@ -504,36 +537,57 @@ impl<S> UnidirectionalStream<S> {
         &mut self.stream
     }
 
-    /// The stream, giving up the width of its type.
+    /// The stream, giving up the width of its type and the metadata of its
+    /// bytes.
     pub fn into_stream(self) -> S {
         self.stream
     }
+
+    /// The stream and the metadata of the bytes of its type, giving up the
+    /// width.
+    pub(crate) fn into_parts(self) -> (S, M) {
+        (self.stream, self.type_metadata)
+    }
 }
 
-impl<S, U> UnidirectionalStream<ReceivedStream<S, U>> {
-    /// The stream, with the width of its type, as one a part claims or one
-    /// no part claims.
-    pub fn transpose(self) -> ReceivedStream<UnidirectionalStream<S>, UnidirectionalStream<U>> {
-        let width = self.width;
-        match self.stream {
+impl<S, U, M> UnidirectionalStream<ReceivedStream<S, U>, M> {
+    /// The stream, with the width of its type and the metadata of its bytes,
+    /// as one a part claims or one no part claims.
+    pub fn transpose(
+        self,
+    ) -> ReceivedStream<UnidirectionalStream<S, M>, UnidirectionalStream<U, M>> {
+        let Self {
+            width,
+            type_metadata,
+            stream,
+        } = self;
+        match stream {
             ReceivedStream::Known(stream) => {
-                ReceivedStream::Known(UnidirectionalStream::read(stream, width))
+                ReceivedStream::Known(UnidirectionalStream::read(stream, width, type_metadata))
             }
             ReceivedStream::Unknown(stream) => {
-                ReceivedStream::Unknown(UnidirectionalStream::read(stream, width))
+                ReceivedStream::Unknown(UnidirectionalStream::read(stream, width, type_metadata))
             }
         }
     }
 }
 
-impl<H, T> UnidirectionalStream<Coproduct<H, T>> {
-    /// The stream, with the width of its type, as the stream of the part
-    /// that claims it.
-    pub fn transpose(self) -> Coproduct<UnidirectionalStream<H>, UnidirectionalStream<T>> {
-        let width = self.width;
-        match self.stream {
-            Coproduct::Inl(stream) => Coproduct::Inl(UnidirectionalStream::read(stream, width)),
-            Coproduct::Inr(stream) => Coproduct::Inr(UnidirectionalStream::read(stream, width)),
+impl<H, T, M> UnidirectionalStream<Coproduct<H, T>, M> {
+    /// The stream, with the width of its type and the metadata of its bytes,
+    /// as the stream of the part that claims it.
+    pub fn transpose(self) -> Coproduct<UnidirectionalStream<H, M>, UnidirectionalStream<T, M>> {
+        let Self {
+            width,
+            type_metadata,
+            stream,
+        } = self;
+        match stream {
+            Coproduct::Inl(stream) => {
+                Coproduct::Inl(UnidirectionalStream::read(stream, width, type_metadata))
+            }
+            Coproduct::Inr(stream) => {
+                Coproduct::Inr(UnidirectionalStream::read(stream, width, type_metadata))
+            }
         }
     }
 }

@@ -2,26 +2,25 @@
 //! The Push ID of PUSH_PROMISE (RFC 9114 §7.2.5).
 mod common;
 
-use common::{Dribble, run};
+use common::{Dribble, field_bytes, frame_bytes, read_some, run};
+use core::num::NonZeroUsize;
 use frunk_core::HList;
 use hatate_wire::{
     Role,
     error_code::{ErrorCode, ErrorCodeOf as _},
     frame::{
-        FrameWidths, Http3FrameType, PushId,
-        codec::{
-            ReadPushPromisePushIdError, ReadPushPromisePushIdExt as _,
-            WritePushPromiseFrameHostExt as _,
-        },
-        payload::PayloadError,
+        Frame, FrameWidths, Http3FrameType, PushId, PushPromiseFrameType,
+        payload::{FramePayload, PayloadError},
+        push_promise::{PushPromisePayload, ReadPushPromisePushIdError},
     },
     stream::{FrameStream, kind::RequestStreamKind},
 };
+use nitori_call::{ConstructedAccess, ReceiverAccess, call};
+use nitori_codec::{DecodeFrom as _, payload::Chunks, prelude::*};
+use nitori_io::{Read, ReadChunk, Write, calls::ReadValue};
+use sakuya_var_int::{VarInt, VarIntField, VarIntWidth, stream::ReadVarIntError};
 
 type Parts = HList![hatate_wire::Part];
-use nitori_call::{ReceiverAccess, call};
-use nitori_io::{Read, prelude::*};
-use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
 /// What a PUSH_PROMISE frame leaves after its Push ID was read.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,7 +38,7 @@ struct Promise {
 #[call(sync)]
 async fn read_promise<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
-) -> Result<Promise, ReadPushPromisePushIdError<PayloadError<F::Error>>>
+) -> Result<Promise, ReadPushPromisePushIdError<ReadVarIntError<PayloadError<F::Error>>>>
 where
     <F as Read>::Error: core::fmt::Debug,
 {
@@ -54,24 +53,12 @@ where
         Http3FrameType::PushPromise.value()
     );
     let widths = frame.widths();
-    let push_id = frame.payload().read_push_promise_push_id().await?;
-    let remaining = stream.frame().into_payload().into_parts().1.remaining();
-    let mut section = Vec::new();
-    let mut frame = stream.frame();
-    loop {
-        let mut buffer = [0; 3];
-        let count = frame
-            .payload()
-            .read(&mut &mut buffer[..])
-            .await
-            .unwrap()
-            .map_or(0, |segment| segment.count.get());
-        if count == 0 {
-            break;
-        }
-        section.extend_from_slice(&buffer[..count]);
-    }
-    assert_eq!(stream.frame().into_payload().into_parts().1.remaining(), 0);
+    let mut promise =
+        PushPromisePayload::<&mut FramePayload<_>, ()>::decode_from(&mut **frame.payload()).await?;
+    let remaining = promise.section.remaining();
+    let section = read_some(&mut promise.section, 1000).await.unwrap();
+    let push_id = promise.push_id.value;
+    assert_eq!(promise.section.remaining(), 0);
     Ok(Promise {
         push_id,
         widths,
@@ -85,11 +72,9 @@ fn push_id(value: u64, width: VarIntWidth) -> VarIntField<PushId> {
 }
 
 fn wire(widths: FrameWidths, push_id: VarIntField<PushId>, section: &[u8]) -> Vec<u8> {
-    let mut hosts = (Vec::new(), section);
-    hosts
-        .sync_write_push_promise_frame_unpin(widths, push_id)
-        .unwrap();
-    hosts.0
+    let mut payload = field_bytes(push_id);
+    payload.extend_from_slice(section);
+    frame_bytes(Http3FrameType::PushPromise.value(), widths, &payload)
 }
 
 #[test]
@@ -121,16 +106,101 @@ fn the_push_id_of_every_width_is_read_and_the_section_stays_in_the_payload() {
     assert!(promise.section.is_empty());
 }
 
+/// Reads the PUSH_PROMISE frame at the start of the stream and writes it
+/// back whole, as it was read.
+#[call(sync)]
+async fn write_frame_back<R: ReadChunk<Metadata = ()>, W: Write<Report = ()>>(
+    source: &mut impl ReceiverAccess<Family = R>,
+    sink: &mut impl ReceiverAccess<Family = W>,
+) where
+    <R as Read>::Error: core::fmt::Debug,
+    <W as Write>::Error: core::fmt::Debug,
+{
+    let mut stream = FrameStream::<Parts, RequestStreamKind, _>::read(&mut *source, Role::Client)
+        .await
+        .unwrap()
+        .unwrap();
+    let frame = stream.frame().map_payload(|payload| Chunks {
+        source: payload,
+        chunk_maximum: NonZeroUsize::new(3).unwrap(),
+    });
+    sink.encode(frame).await.unwrap();
+}
+
+/// Reads the PUSH_PROMISE frame at the start of the stream and writes its
+/// payload back as the Push ID and the section.
+#[call(sync)]
+async fn write_payload_back<R: ReadChunk<Metadata = ()>, W: Write<Report = ()>>(
+    source: &mut impl ReceiverAccess<Family = R>,
+    sink: &mut impl ReceiverAccess<Family = W>,
+) where
+    <R as Read>::Error: core::fmt::Debug,
+    <W as Write>::Error: core::fmt::Debug,
+{
+    let mut stream = FrameStream::<Parts, RequestStreamKind, _>::read(&mut *source, Role::Client)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut frame = stream.frame();
+    let promise =
+        PushPromisePayload::<&mut FramePayload<_>, ()>::decode_from(&mut **frame.payload())
+            .await
+            .unwrap();
+    sink.encode(PushPromisePayload {
+        push_id: promise.push_id,
+        section: Chunks {
+            source: promise.section,
+            chunk_maximum: NonZeroUsize::new(3).unwrap(),
+        },
+    })
+    .await
+    .unwrap();
+}
+
 #[test]
 fn what_is_read_is_written_back_to_the_same_bytes() {
     for width in VarIntWidth::ALL {
         let widths = FrameWidths::new(VarIntWidth::Two, VarIntWidth::Two);
-        let original = wire(widths, push_id(5, width), &[1, 2, 3, 4, 5]);
-        let promise = (&original[..]).sync_read_promise_unpin().unwrap();
-        assert_eq!(
-            wire(promise.widths, promise.push_id, &promise.section),
-            original
-        );
+        let id = push_id(5, width);
+        let original = wire(widths, id, &[1, 2, 3, 4, 5]);
+        let mut output = Vec::new();
+        (&mut &original[..], &mut output).sync_write_frame_back_unpin();
+        assert_eq!(output, original);
+        // The Push ID keeps its width.
+        let mut output = Vec::new();
+        (&mut &original[..], &mut output).sync_write_payload_back_unpin();
+        assert_eq!(output, original[4..]);
+    }
+}
+
+#[test]
+fn a_promise_is_written_and_read_back() {
+    for section in [&b""[..], b"field section"] {
+        let id = push_id(55, VarIntWidth::One);
+        let frame = nitori_call::__private::run_sync(Frame::new(
+            PushPromiseFrameType,
+            PushPromisePayload {
+                push_id: ReadValue {
+                    value: id,
+                    metadata: (),
+                },
+                section: Chunks {
+                    source: ConstructedAccess::new(section),
+                    chunk_maximum: NonZeroUsize::new(4).unwrap(),
+                },
+            },
+        ))
+        .unwrap();
+        // The Length is the Push ID and the section, in the shortest width.
+        assert_eq!(frame.length().get().get(), 1 + section.len() as u64);
+        assert_eq!(frame.widths(), FrameWidths::SHORTEST);
+        let mut output = Vec::new();
+        output.sync_encode_unpin(frame).unwrap();
+        let expected = wire(FrameWidths::SHORTEST, id, section);
+        assert_eq!(output, expected);
+        let promise = (&expected[..]).sync_read_promise_unpin().unwrap();
+        assert_eq!(promise.push_id, id);
+        assert_eq!(promise.section, section);
     }
 }
 

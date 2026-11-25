@@ -71,7 +71,7 @@ where
         type_field: VarIntField::new(frame.frame_type().value(), type_field.width()).unwrap(),
         length: frame.length(),
         widths: frame.widths(),
-        remaining: frame.into_payload().into_parts().1.remaining(),
+        remaining: frame.into_payload().remaining(),
     };
     Ok(Some(Received { ty, head }))
 }

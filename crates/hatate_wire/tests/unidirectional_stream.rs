@@ -24,7 +24,7 @@ use hatate_wire_qpack::{
     QpackStreamType,
     stream::{QpackDecoderStream, QpackEncoderStream},
 };
-use nitori_call::{ReceiverAccess, call};
+use nitori_call::{AsAccess, ReceiverAccess, call};
 use nitori_io::{Read, Skip, prelude::*};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
@@ -121,7 +121,7 @@ fn field_bytes(field: VarIntField<VarInt>) -> Vec<u8> {
 }
 
 /// Reads at most `take` bytes from `io`, stopping at the end.
-async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
+async fn read_some<A: AsAccess<Family: Read<Metadata = ()>>>(
     io: &mut A,
     take: usize,
 ) -> Result<Vec<u8>, <A::Family as Read>::Error> {
@@ -130,6 +130,7 @@ async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
     while bytes.len() < take {
         let want = (take - bytes.len()).min(buffer.len());
         let count = io
+            .access()
             .read(&mut &mut buffer[..want])
             .await?
             .map_or(0, |segment| segment.count.get());
@@ -141,7 +142,7 @@ async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
     Ok(bytes)
 }
 
-async fn seen<T: ClaimedValue + Copy, P: ReceiverAccess<Family: Read<Metadata = ()>>>(
+async fn seen<T: ClaimedValue + Copy, P: AsAccess<Family: Read<Metadata = ()>>>(
     mut frame: Frame<FrameType<T>, P>,
 ) -> Seen
 where
@@ -169,7 +170,7 @@ macro_rules! start {
             io: &mut A,
             discard: bool,
         ) -> Result<Option<Started>, Failed> {
-            let stream = match read_unidirectional_stream::<Parts, $class, _>(&mut *io).await {
+            let stream = match read_unidirectional_stream::<Parts, $class, _, ()>(&mut *io).await {
                 Ok(Some(stream)) => stream,
                 Ok(None) => return Ok(None),
                 Err(error) => return Err(failed(&error)),
@@ -624,10 +625,11 @@ async fn control_frames<
     io: &mut A,
     known: bool,
 ) -> (Vec<u64>, End) {
-    let stream = read_unidirectional_stream::<Parts, ServerInitiatedUnidirectional, _>(&mut *io)
-        .await
-        .unwrap()
-        .unwrap();
+    let stream =
+        read_unidirectional_stream::<Parts, ServerInitiatedUnidirectional, _, ()>(&mut *io)
+            .await
+            .unwrap()
+            .unwrap();
     let ReceivedStream::Known(known_stream) = stream.transpose() else {
         panic!("not a stream of a part");
     };
@@ -701,10 +703,11 @@ async fn qpack_instructions<
 >(
     io: &mut A,
 ) -> (Vec<String>, End) {
-    let stream = read_unidirectional_stream::<Parts, ServerInitiatedUnidirectional, _>(&mut *io)
-        .await
-        .unwrap()
-        .unwrap();
+    let stream =
+        read_unidirectional_stream::<Parts, ServerInitiatedUnidirectional, _, ()>(&mut *io)
+            .await
+            .unwrap()
+            .unwrap();
     let ReceivedStream::Known(known_stream) = stream.transpose() else {
         panic!("not a stream of a part");
     };

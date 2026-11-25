@@ -5,8 +5,10 @@
 //! what it had read: the bytes the host handed over are consumed from the
 //! stream, and the integer or setting they began is lost. `FramePayload`
 //! counts the bytes the host handed over, so its remaining length stays
-//! equal to the unread bytes of the payload; what a new read makes of the
-//! rest is the subject of the tests below.
+//! equal to the unread bytes of the payload. What a new read makes of the
+//! rest is the subject of the tests below: a value decoded directly from
+//! the payload starts in the middle of the lost one, and one decoded
+//! through `FramePayload::decode` fails with `PayloadError::Interrupted`.
 //!
 //! A `FrameStream` is kept inside a call, so each test drops a future in the
 //! call, after a number of polls, and goes on in the same call. Every host
@@ -24,10 +26,14 @@ use frunk_core::HList;
 use hatate_wire::{
     Role,
     error_code::{ErrorCode, ErrorCodeOf as _},
-    frame::{FrameWidths, Http3FrameType, control::codec::*},
+    frame::{
+        GoawayId, Http3FrameType,
+        codec::DecodeToEndError,
+        payload::{FramePayload, PayloadError},
+    },
     settings::{
         Setting,
-        codec::ReadSettingExt as _,
+        codec::SettingParameter,
         set::{Settings, SettingsOf},
     },
     stream::{
@@ -35,9 +41,10 @@ use hatate_wire::{
         kind::{ControlStreamKind, RequestStreamKind},
     },
 };
-use nitori_call::{ReceiverAccess, call};
-use nitori_io::{ExactLen, Read, Skip, prelude::*};
-use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
+use nitori_call::{AsAccess, ReceiverAccess, call};
+use nitori_codec::DecodeFrom as _;
+use nitori_io::{Read, Skip, calls::ReadValue, prelude::*};
+use sakuya_var_int::{VarInt, VarIntField, VarIntWidth, stream::ReadVarIntError};
 
 type Parts = HList![hatate_wire::Part];
 
@@ -74,7 +81,21 @@ fn remaining<
 where
     Parts: hatate_wire::frame::set::FrameSetOn<K>,
 {
-    stream.frame().into_payload().into_parts().1.remaining()
+    stream.frame().into_payload().remaining()
+}
+
+/// The integer of a GOAWAY frame, which must take all the payload, decoded
+/// directly from the payload.
+async fn read_goaway<S: AsAccess<Family: Read<Error = Infallible, Metadata = ()>>>(
+    payload: &mut FramePayload<S>,
+) -> Result<u64, DecodeToEndError<ReadVarIntError<PayloadError<Infallible>>>> {
+    let id = ReadValue::<VarIntField<GoawayId>, ()>::decode_from(&mut *payload)
+        .await
+        .map_err(|source| DecodeToEndError::Value { source })?;
+    match core::num::NonZeroU64::new(payload.remaining()) {
+        None => Ok(id.value.get().get().get()),
+        Some(left) => Err(DecodeToEndError::Unread { left }),
+    }
 }
 
 /// What the GOAWAY read again made of the integer.
@@ -101,25 +122,15 @@ async fn goaway_dropped<
         .unwrap()
         .unwrap();
     assert_eq!(remaining(&mut stream), 8);
-    let done = poll_then_drop(
-        stream
-            .frame()
-            .payload()
-            .read_goaway_frame(FrameWidths::SHORTEST),
-        polls,
-    );
+    let done = poll_then_drop(read_goaway(&mut **stream.frame().payload()), polls);
     let left = remaining(&mut stream);
     if !again {
         return (done, left, None);
     }
-    let result = stream
-        .frame()
-        .payload()
-        .read_goaway_frame(FrameWidths::SHORTEST)
-        .await;
+    let result = read_goaway(&mut **stream.frame().payload()).await;
     let again = match result {
-        Ok(frame) => Again::Id(frame.id().get().get().get()),
-        Err(error @ ReadIntegerFrameError::Trailing { .. }) => Again::Trailing(error.error_code()),
+        Ok(id) => Again::Id(id),
+        Err(error @ DecodeToEndError::Unread { .. }) => Again::Trailing(error.error_code()),
         Err(_) => Again::Other,
     };
     (done, left, Some((again, remaining(&mut stream))))
@@ -177,26 +188,26 @@ fn a_goaway_dropped_in_the_middle_keeps_the_count_exact() {
     }
 }
 
-/// Reads one setting from the payload of the current frame.
-async fn one_setting<
-    S: ReceiverAccess<Family = F>,
-    F: Read<Metadata = ()> + ExactLen<LengthError = !>,
->(
-    source: &mut S,
+/// Reads one setting from the payload of the current frame, through
+/// `FramePayload::decode`.
+async fn one_setting<S: AsAccess<Family: Read<Error = Infallible, Metadata = ()>>>(
+    payload: &mut FramePayload<S>,
     settings: &mut Settings<<Parts as SettingsOf>::Settings>,
-) -> String
-where
-    <F as ExactLen>::Length: TryInto<u64>,
-    <F as Read>::Error: core::fmt::Debug,
-{
-    match source.read_setting(settings).await {
-        Ok(Some(Setting::Known(setting))) => format!("known {setting:?}"),
-        Ok(Some(Setting::Unknown(setting))) => format!(
+) -> String {
+    if payload.remaining() == 0 {
+        return "end".to_string();
+    }
+    let parameter = match payload.decode::<SettingParameter, _>().await {
+        Ok(parameter) => parameter,
+        Err(error) => return format!("error {error:?}"),
+    };
+    match settings.insert(parameter) {
+        Ok(Setting::Known(setting)) => format!("known {setting:?}"),
+        Ok(Setting::Unknown(setting)) => format!(
             "unknown {:#x}={:#x}",
             setting.identifier().get().get(),
             setting.value().get().get()
         ),
-        Ok(None) => "end".to_string(),
         Err(error) => format!("error {error:?}"),
     }
 }
@@ -206,7 +217,7 @@ where
 /// the end of the payload.
 #[call(sync)]
 async fn setting_dropped<
-    F: Read<Error = Infallible, Metadata = ()>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -218,20 +229,33 @@ async fn setting_dropped<
         .unwrap()
         .unwrap();
     let mut settings = Settings::<<Parts as SettingsOf>::Settings>::new();
-    let done = poll_then_drop(one_setting(stream.frame().payload(), &mut settings), polls);
+    let done = poll_then_drop(
+        one_setting(&mut **stream.frame().payload(), &mut settings),
+        polls,
+    );
     let left = remaining(&mut stream);
     let mut results = Vec::new();
     if again {
         // Continue with new reads to the end of the payload: they never
         // panic and never pass its end.
         for _ in 0..6 {
-            let text = one_setting(stream.frame().payload(), &mut settings).await;
+            let text = one_setting(&mut **stream.frame().payload(), &mut settings).await;
             let end = text == "end" || text.starts_with("error");
             results.push(text);
             if end {
                 break;
             }
         }
+    }
+    if again {
+        // What is left of the payload can be skipped, interrupted or not.
+        stream
+            .frame()
+            .payload()
+            .access()
+            .skip_to_end()
+            .await
+            .unwrap();
     }
     let end = remaining(&mut stream);
     (done, left, results, end)
@@ -271,14 +295,13 @@ fn a_settings_frame_dropped_in_the_middle_keeps_the_count_exact() {
                 ]
             );
         } else if !done {
-            // Observed: bytes consumed by the dropped read are lost, and the
-            // new read starts in the middle of a setting, so what it reads is
-            // a misparse (here, after 0x21 is lost, 0x01 reads as
-            // QPACK_MAX_TABLE_CAPACITY with the value 0x400a).
-            assert_ne!(
-                results,
-                ["unknown 0xa=0x102", "unknown 0x22=0x3", "end"],
-                "polls {polls}"
+            // Bytes consumed by the dropped read are lost, and the payload
+            // is interrupted: the new read fails and does not misread what
+            // is left, which is skipped.
+            assert_eq!(results.len(), 1, "polls {polls}: {results:?}");
+            assert!(
+                results[0].starts_with("error") && results[0].contains("Interrupted"),
+                "polls {polls}: {results:?}"
             );
         }
         assert_eq!(end, 0, "{results:?}");
@@ -352,10 +375,9 @@ async fn drop_next<
         Step::Frame(ty(stream.frame().frame_type()), left)
     } else {
         match stream.next_frame().await {
-            Ok(Some(frame)) => Step::Frame(
-                ty(frame.frame_type()),
-                frame.into_payload().into_parts().1.remaining(),
-            ),
+            Ok(Some(frame)) => {
+                Step::Frame(ty(frame.frame_type()), frame.into_payload().remaining())
+            }
             Ok(None) => Step::End,
             Err(NextFrameError::Interrupted) => Step::Interrupted,
             Err(error) => Step::Failed(error.error_code()),
@@ -528,10 +550,16 @@ async fn skip_dropped<
         .unwrap()
         .unwrap();
     assert_eq!(remaining(&mut stream), 6);
-    let done = poll_then_drop(stream.frame().payload().skip_to_end(), polls);
+    let done = poll_then_drop(stream.frame().payload().access().skip_to_end(), polls);
     let left = remaining(&mut stream);
     if again {
-        stream.frame().payload().skip_to_end().await.unwrap();
+        stream
+            .frame()
+            .payload()
+            .access()
+            .skip_to_end()
+            .await
+            .unwrap();
     }
     (done, left, remaining(&mut stream))
 }

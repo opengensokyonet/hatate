@@ -15,7 +15,7 @@ use hatate_wire::{
     frame::{FrameType, Http3FrameType},
     registry::ClaimedValue,
 };
-use nitori_call::ReceiverAccess;
+use nitori_call::AsAccess;
 use nitori_io::{Read, prelude::*};
 
 /// A stream that gives at most `chunk` bytes per read and answers
@@ -230,6 +230,67 @@ impl nitori_io::Skip for Broken {
     }
 }
 
+/// A stream that gives its bytes and then fails every read and skip.
+pub struct Failing<'a> {
+    input: &'a [u8],
+}
+
+impl<'a> Failing<'a> {
+    pub fn new(input: &'a [u8]) -> Self {
+        Self { input }
+    }
+}
+
+nitori_call::family_receiver!(impl ['a] for Failing<'a>);
+
+impl nitori_io::Read for Failing<'_> {
+    type Error = Boom;
+    type Metadata = ();
+    fn poll_read<'visit, B: BufMut + ?Sized>(
+        host: Pin<&mut Self::ReceiverView<'visit>>,
+        _cx: &mut Context<'_>,
+        dst: &mut B,
+    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
+    where
+        Self: 'visit,
+    {
+        let this = host.get_pin_mut().get_mut();
+        if this.input.is_empty() {
+            return Poll::Ready(Err(Boom));
+        }
+        let count = this.input.len().min(dst.remaining_mut());
+        let (head, tail) = this.input.split_at(count);
+        dst.put_slice(head);
+        this.input = tail;
+        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| {
+            nitori_io::ReadSegment {
+                count,
+                metadata: (),
+            }
+        })))
+    }
+}
+
+impl nitori_io::Skip for Failing<'_> {
+    type Count = usize;
+    fn poll_skip<'visit, M: nitori_io::Min<usize, Output = usize> + Clone>(
+        host: Pin<&mut Self::ReceiverView<'visit>>,
+        _cx: &mut Context<'_>,
+        maximum: M,
+    ) -> Poll<Result<Option<usize>, Self::Error>>
+    where
+        Self: 'visit,
+    {
+        let this = host.get_pin_mut().get_mut();
+        if this.input.is_empty() {
+            return Poll::Ready(Err(Boom));
+        }
+        let count = nitori_io::Min::min(maximum, this.input.len());
+        this.input = &this.input[count..];
+        Poll::Ready(Ok(Some(count)))
+    }
+}
+
 /// A stream that can only read, by bytes or by chunks, never skip: at most
 /// `chunk` bytes per read, after one `Pending`.
 pub struct ReadOnly<'a> {
@@ -322,27 +383,46 @@ impl nitori_io::ReadChunk for ReadOnly<'_> {
     }
 }
 
-/// A stream whose skips report one byte more than they were allowed.
-pub struct Overskip;
+/// A stream that gives its bytes, and whose skips report one byte more than
+/// they were allowed.
+pub struct Overskip<'a> {
+    input: &'a [u8],
+}
 
-nitori_call::family_receiver!(impl [] for Overskip);
+impl<'a> Overskip<'a> {
+    pub fn new(input: &'a [u8]) -> Self {
+        Self { input }
+    }
+}
 
-impl nitori_io::Read for Overskip {
+nitori_call::family_receiver!(impl ['a] for Overskip<'a>);
+
+impl nitori_io::Read for Overskip<'_> {
     type Error = Infallible;
     type Metadata = ();
     fn poll_read<'visit, B: BufMut + ?Sized>(
-        _host: Pin<&mut Self::ReceiverView<'visit>>,
+        host: Pin<&mut Self::ReceiverView<'visit>>,
         _cx: &mut Context<'_>,
-        _dst: &mut B,
+        dst: &mut B,
     ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'visit,
     {
-        Poll::Ready(Ok(None))
+        let this = host.get_pin_mut().get_mut();
+        let count = this.input.len().min(dst.remaining_mut());
+        let (head, tail) = this.input.split_at(count);
+        dst.put_slice(head);
+        this.input = tail;
+        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| {
+            nitori_io::ReadSegment {
+                count,
+                metadata: (),
+            }
+        })))
     }
 }
 
-impl nitori_io::Skip for Overskip {
+impl nitori_io::Skip for Overskip<'_> {
     type Count = usize;
     fn poll_skip<'visit, M: nitori_io::Min<usize, Output = usize> + Clone>(
         _host: Pin<&mut Self::ReceiverView<'visit>>,
@@ -377,8 +457,33 @@ pub const fn known(frame_type: Http3FrameType) -> Ty {
     Ty::Known(frame_type.value().get())
 }
 
+/// The bytes of a field, at its width.
+pub fn field_bytes<T: Copy + Into<sakuya_var_int::VarInt> + TryFrom<sakuya_var_int::VarInt>>(
+    field: sakuya_var_int::VarIntField<T>,
+) -> Vec<u8> {
+    let (bytes, length) = field.to_encoding();
+    bytes[..length].to_vec()
+}
+
+/// The bytes of a frame of the type `frame_type` with the payload `payload`:
+/// the Type and the Length at `widths`, then the payload.
+pub fn frame_bytes(
+    frame_type: sakuya_var_int::VarInt,
+    widths: hatate_wire::frame::FrameWidths,
+    payload: &[u8],
+) -> Vec<u8> {
+    use sakuya_var_int::{VarInt, VarIntField};
+    let mut bytes = field_bytes(VarIntField::new(frame_type, widths.type_width()).unwrap());
+    let length = VarInt::new(u64::try_from(payload.len()).unwrap()).unwrap();
+    bytes.extend(field_bytes(
+        VarIntField::new(length, widths.length_width()).unwrap(),
+    ));
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
 /// Reads at most `take` bytes from `io`, stopping at EOF.
-pub async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
+pub async fn read_some<A: AsAccess<Family: Read<Metadata = ()>>>(
     io: &mut A,
     take: usize,
 ) -> Result<Vec<u8>, <A::Family as Read>::Error> {
@@ -387,6 +492,7 @@ pub async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
     while bytes.len() < take {
         let want = (take - bytes.len()).min(buffer.len());
         let count = io
+            .access()
             .read(&mut &mut buffer[..want])
             .await?
             .map_or(0, |segment| segment.count.get());

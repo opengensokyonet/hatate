@@ -212,8 +212,8 @@ impl<H: KeyedSetting, T: SettingList> SettingList for HCons<H, T> {
 }
 
 /// The settings of one SETTINGS frame for the list of setting types `L`: a
-/// slot for each type, filled as
-/// [`read_setting`](super::codec::read_setting) reads the frame.
+/// slot for each type, filled as the parameters of the frame are
+/// [inserted](Settings::insert).
 ///
 /// Settings whose identifier no type of `L` claims are not kept: the peer
 /// may send any number of them, and they are handed to the caller as they

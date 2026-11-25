@@ -29,7 +29,7 @@ use hatate_wire::{
     stream_type::StreamTypePart,
 };
 use nitori_call::ReceiverAccess;
-use nitori_io::Read;
+use nitori_io::{Combine, Read, calls::ReadValue};
 use sakuya_var_int::{VarInt, VarIntField};
 use snafu::Snafu;
 
@@ -127,16 +127,16 @@ impl StreamTypePart for Part {
 impl<C: StreamClass, L> StreamPart<C, L> for Part {
     type Claimed = CNil;
     type Rejection = CNil;
-    type Stream<I> = CNil;
+    type Stream<I, M> = CNil;
     type ReadError<E> = CNil;
 
     fn judge(_value: VarInt, _skipped: bool) -> StreamVerdict<CNil, CNil> {
         StreamVerdict::NotClaimed
     }
 
-    async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
+    async fn read<I: ReceiverAccess<Family: Read<Metadata = M>>, M: Combine + Unpin + Clone>(
         claimed: CNil,
-        _field: VarIntField<VarInt>,
+        _field: ReadValue<VarIntField<VarInt>, M>,
         _io: I,
     ) -> Result<CNil, CNil> {
         match claimed {}

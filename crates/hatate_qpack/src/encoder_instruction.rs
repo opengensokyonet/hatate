@@ -64,15 +64,6 @@ impl<A: ReceiverAccess> EncoderStream<A>
 where
     A::Family: Read<Metadata = ()>,
 {
-    /// The stream on `io`, an access or an exclusive borrow of one, at an
-    /// instruction boundary. Nothing is read.
-    pub fn new(io: A) -> Self {
-        Self {
-            io,
-            state: StreamState::Boundary,
-        }
-    }
-
     /// Reads the start of the next instruction. Numeric instructions finish
     /// here. Insertions lend this stream to their first state. Limits apply to
     /// all wire octets and to the sum of the decoded literal octets,
@@ -141,6 +132,15 @@ where
 }
 
 impl<A> EncoderStream<A> {
+    /// The stream on `io`, an access or an exclusive borrow of one, at an
+    /// instruction boundary. Nothing is read.
+    pub fn new(io: A) -> Self {
+        Self {
+            io,
+            state: StreamState::Boundary,
+        }
+    }
+
     /// The access, giving up the stream.
     pub fn into_io(self) -> A {
         self.io

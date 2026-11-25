@@ -64,15 +64,6 @@ impl<A: ReceiverAccess> DecoderStream<A>
 where
     A::Family: Read<Metadata = ()>,
 {
-    /// The stream on `io`, an access or an exclusive borrow of one, at an
-    /// instruction boundary. Nothing is read.
-    pub fn new(io: A) -> Self {
-        Self {
-            io,
-            state: StreamState::Boundary,
-        }
-    }
-
     /// Reads the next instruction. The limit counts the first octet and all
     /// continuations.
     ///
@@ -110,6 +101,15 @@ where
 }
 
 impl<A> DecoderStream<A> {
+    /// The stream on `io`, an access or an exclusive borrow of one, at an
+    /// instruction boundary. Nothing is read.
+    pub fn new(io: A) -> Self {
+        Self {
+            io,
+            state: StreamState::Boundary,
+        }
+    }
+
     /// The access, giving up the stream.
     pub fn into_io(self) -> A {
         self.io

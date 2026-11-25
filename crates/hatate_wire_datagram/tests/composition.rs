@@ -10,10 +10,12 @@ use hatate_wire::{
     Role,
     error_code::{ErrorCode, ErrorCodeOf},
     frame::{FrameWidths, payload::PayloadError, set::FramePartOn},
+    parts::PartsError,
     settings::{
-        Keyed, KeyedSetting, MaxFieldSectionSize, Setting,
+        Http2SettingIdentifierError, Keyed, KeyedSetting, MaxFieldSectionSize, Setting,
         codec::{
-            ReadSettingError, ReadSettingExt as _, SettingsFrame, WriteSettingsFrameHostExt as _,
+            DecodeSettingParameterError, DuplicateSettingError, InsertSettingError,
+            SettingParameter, SettingsFrame, WriteSettingsFrameHostExt as _,
         },
         set::{SettingList, Settings, SettingsOf},
     },
@@ -49,6 +51,60 @@ hatate_wire::assert_claims_valid!(HList![
     hatate_wire::Part
 ]);
 
+/// The failures of reading a parameter of a SETTINGS frame and of inserting
+/// it into the settings.
+#[derive(Debug)]
+#[allow(dead_code)] // Read through `Debug`.
+enum ReadSettingError<E, V> {
+    Identifier {
+        source: sakuya_var_int::stream::ReadVarIntError<E>,
+    },
+    Http2Identifier {
+        source: Http2SettingIdentifierError,
+    },
+    Value {
+        source: sakuya_var_int::stream::ReadVarIntError<E>,
+    },
+    Rejected {
+        source: PartsError<V>,
+    },
+    Duplicate {
+        source: DuplicateSettingError,
+    },
+}
+
+impl<E, V> From<DecodeSettingParameterError<E>> for ReadSettingError<E, V> {
+    fn from(error: DecodeSettingParameterError<E>) -> Self {
+        match error {
+            DecodeSettingParameterError::Identifier { source } => Self::Identifier { source },
+            DecodeSettingParameterError::Http2Identifier { source } => {
+                Self::Http2Identifier { source }
+            }
+            DecodeSettingParameterError::Value { source } => Self::Value { source },
+        }
+    }
+}
+
+impl<E, V> From<InsertSettingError<V>> for ReadSettingError<E, V> {
+    fn from(error: InsertSettingError<V>) -> Self {
+        match error {
+            InsertSettingError::Rejected { source } => Self::Rejected { source },
+            InsertSettingError::Duplicate { source } => Self::Duplicate { source },
+        }
+    }
+}
+
+impl<E: ErrorCodeOf<ErrorCode>, V> ErrorCodeOf<ErrorCode> for ReadSettingError<PayloadError<E>, V> {
+    fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Identifier { source } | Self::Value { source } => source.error_code(),
+            Self::Http2Identifier { .. } | Self::Rejected { .. } | Self::Duplicate { .. } => {
+                Some(ErrorCode::H3_SETTINGS_ERROR)
+            }
+        }
+    }
+}
+
 type AllList = <All as SettingsOf>::Settings;
 type AllSetting = <AllList as SettingList>::Setting;
 type AllValueErrors = <AllList as SettingList>::ValueErrors;
@@ -77,10 +133,15 @@ where
     let mut frame = stream.frame();
     assert_eq!(frame.frame_type().value().get(), 0x04);
     let mut read = Vec::new();
-    while let Some(setting) = frame.payload().read_setting(settings).await? {
-        read.push(setting);
+    while frame.payload().remaining() > 0 {
+        let parameter = frame
+            .payload()
+            .decode::<SettingParameter, _>()
+            .await
+            .map_err(ReadSettingError::from)?;
+        read.push(settings.insert(parameter)?);
     }
-    let payload = frame.into_payload().into_parts().1;
+    let payload = frame.into_payload();
     assert_eq!(payload.remaining(), 0, "the payload was read to its end");
     Ok(read)
 }
@@ -121,7 +182,7 @@ macro_rules! streams {
             <F as Read>::Error: core::fmt::Debug
                 + hatate_wire::error_code::ErrorCodeOf<hatate_wire::error_code::ErrorCode>,
         {
-            match read_bidirectional_stream::<$list, ClientInitiatedBidirectional, _>(&mut *io)
+            match read_bidirectional_stream::<$list, ClientInitiatedBidirectional, _, ()>(&mut *io)
                 .await
             {
                 Err(error) => Started::Rejected(error.error_code().unwrap()),
@@ -151,12 +212,12 @@ macro_rules! streams {
                 + hatate_wire::error_code::ErrorCodeOf<hatate_wire::error_code::ErrorCode>,
         {
             let stream = if server {
-                read_unidirectional_stream::<$list, ServerInitiatedUnidirectional, _>(&mut *io)
+                read_unidirectional_stream::<$list, ServerInitiatedUnidirectional, _, ()>(&mut *io)
                     .await
                     .unwrap()
                     .map(|stream| stream.into_stream())
             } else {
-                read_unidirectional_stream::<$list, ClientInitiatedUnidirectional, _>(&mut *io)
+                read_unidirectional_stream::<$list, ClientInitiatedUnidirectional, _, ()>(&mut *io)
                     .await
                     .unwrap()
                     .map(|stream| stream.into_stream())

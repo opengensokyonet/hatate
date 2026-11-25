@@ -240,7 +240,7 @@ macro_rules! dropped_log {
                 break;
             }
         }
-        let left = stream.frame().into_payload().into_parts().1.remaining();
+        let left = stream.frame().into_payload().remaining();
         log.push(format!("completed {completed}, payload left {left}"));
         let step = if completed {
             format!("reached {:?}", ty(stream.frame().frame_type()))

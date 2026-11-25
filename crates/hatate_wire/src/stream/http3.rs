@@ -37,7 +37,7 @@ use hatate_wire_qpack::{
 };
 use nitori_call::{Composed, ReceiverAccess};
 use nitori_codec::prelude::*;
-use nitori_io::{Infinite, Min, Read, Skip};
+use nitori_io::{Combine, Infinite, Min, Read, Skip, calls::ReadValue};
 use sakuya_var_int::{VarInt, VarIntField, stream::ReadVarIntError};
 use snafu::{ResultExt, Snafu};
 
@@ -57,11 +57,11 @@ pub enum Http3UnidirectionalStream<C, P, E, D> {
     QpackDecoder(D),
 }
 
-/// The unidirectional stream of the HTTP/3 part on the access `I`, in a
-/// connection whose list of parts is `L`.
-pub type Http3UnidirectionalStreamOf<L, I> = Http3UnidirectionalStream<
-    ControlStream<L, I>,
-    PushStream<L, I>,
+/// The unidirectional stream of the HTTP/3 part on the access `I`, whose
+/// bytes carry the metadata `M`, in a connection whose list of parts is `L`.
+pub type Http3UnidirectionalStreamOf<L, I, M = ()> = Http3UnidirectionalStream<
+    ControlStream<L, I, M>,
+    PushStream<L, I, M>,
     QpackEncoderStream<I>,
     QpackDecoderStream<I>,
 >;
@@ -79,30 +79,40 @@ impl<C: TypedStream, P: TypedStream, E: TypedStream, D: TypedStream> TypedStream
     }
 }
 
-impl<C, P, E, D> UnidirectionalStream<Http3UnidirectionalStream<C, P, E, D>> {
-    /// The stream, with the width of its type, as the kind of stream it is.
+impl<C, P, E, D, M> UnidirectionalStream<Http3UnidirectionalStream<C, P, E, D>, M> {
+    /// The stream, with the width of its type and the metadata of its bytes,
+    /// as the kind of stream it is.
     #[allow(clippy::type_complexity)] // The four kinds, each with its width.
     pub fn transpose(
         self,
     ) -> Http3UnidirectionalStream<
-        UnidirectionalStream<C>,
-        UnidirectionalStream<P>,
-        UnidirectionalStream<E>,
-        UnidirectionalStream<D>,
+        UnidirectionalStream<C, M>,
+        UnidirectionalStream<P, M>,
+        UnidirectionalStream<E, M>,
+        UnidirectionalStream<D, M>,
     > {
         let width = self.width();
-        match self.into_stream() {
-            Http3UnidirectionalStream::Control(stream) => {
-                Http3UnidirectionalStream::Control(UnidirectionalStream::read(stream, width))
-            }
-            Http3UnidirectionalStream::Push(stream) => {
-                Http3UnidirectionalStream::Push(UnidirectionalStream::read(stream, width))
-            }
+        let (stream, type_metadata) = self.into_parts();
+        match stream {
+            Http3UnidirectionalStream::Control(stream) => Http3UnidirectionalStream::Control(
+                UnidirectionalStream::read(stream, width, type_metadata),
+            ),
+            Http3UnidirectionalStream::Push(stream) => Http3UnidirectionalStream::Push(
+                UnidirectionalStream::read(stream, width, type_metadata),
+            ),
             Http3UnidirectionalStream::QpackEncoder(stream) => {
-                Http3UnidirectionalStream::QpackEncoder(UnidirectionalStream::read(stream, width))
+                Http3UnidirectionalStream::QpackEncoder(UnidirectionalStream::read(
+                    stream,
+                    width,
+                    type_metadata,
+                ))
             }
             Http3UnidirectionalStream::QpackDecoder(stream) => {
-                Http3UnidirectionalStream::QpackDecoder(UnidirectionalStream::read(stream, width))
+                Http3UnidirectionalStream::QpackDecoder(UnidirectionalStream::read(
+                    stream,
+                    width,
+                    type_metadata,
+                ))
             }
         }
     }
@@ -306,11 +316,12 @@ impl ErrorCodeOf<ErrorCode> for FinishError {
 /// H3_CLOSED_CRITICAL_STREAM, and it has no last frame.
 ///
 /// [RFC 9114 §6.2.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
-pub struct ControlStream<L: FrameSetOn<ControlStreamKind>, I> {
-    frames: FrameStream<L, ControlStreamKind, Composed<I, CriticalStream>>,
+pub struct ControlStream<L: FrameSetOn<ControlStreamKind>, I, M = ()> {
+    frames: FrameStream<L, ControlStreamKind, Composed<I, CriticalStream>, M>,
 }
 
-impl<L: FrameSetOn<ControlStreamKind>, I> core::fmt::Debug for ControlStream<L, I>
+impl<L: FrameSetOn<ControlStreamKind>, I, M: core::fmt::Debug> core::fmt::Debug
+    for ControlStream<L, I, M>
 where
     L::FrameType: core::fmt::Debug,
 {
@@ -321,10 +332,12 @@ where
     }
 }
 
-/// The frame a [`ControlStream`] on `I` gives.
-pub type ControlFrame<'s, L, I> = Frame<
+/// The frame a [`ControlStream`] on `I`, whose bytes carry the metadata `M`,
+/// gives.
+pub type ControlFrame<'s, L, I, M = ()> = Frame<
     FrameType<<L as FrameSetOn<ControlStreamKind>>::FrameType>,
-    Composed<&'s mut Composed<I, CriticalStream>, &'s mut FramePayload>,
+    &'s mut FramePayload<Composed<I, CriticalStream>>,
+    M,
 >;
 
 /// The failure of reading a [`ControlStream`] on `I`.
@@ -365,23 +378,25 @@ fn is_settings<C: ClaimedValue>(frame_type: FrameType<C>) -> bool {
     matches!(frame_type, FrameType::Known(known) if known.value() == Http3FrameType::Settings.value())
 }
 
-impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess> ControlStream<L, I>
+impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess, M> ControlStream<L, I, M>
 where
-    Composed<I, CriticalStream>: ReceiverAccess<Family: Read<Metadata = ()>>,
+    Composed<I, CriticalStream>: ReceiverAccess<Family: Read<Metadata = M>>,
+    M: Combine + Unpin + Clone,
 {
     /// The current frame, as [`FrameStream::frame`] gives it. The first one
     /// is SETTINGS ([RFC 9114 §6.2.1]): the stream is read only if it is.
     ///
     /// [RFC 9114 §6.2.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
-    pub fn frame(&mut self) -> ControlFrame<'_, L, I> {
+    pub fn frame(&mut self) -> ControlFrame<'_, L, I, M> {
         self.frames.frame()
     }
 }
 
-impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess> ControlStream<L, I>
+impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess, M> ControlStream<L, I, M>
 where
     Composed<I, CriticalStream>:
-        ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>, Metadata = ()>>,
+        ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>, Metadata = M>>,
+    M: Combine + Unpin + Clone,
     u64: Min<
             <<Composed<I, CriticalStream> as ReceiverAccess>::Family as Skip>::Count,
             Output = <<Composed<I, CriticalStream> as ReceiverAccess>::Family as Skip>::Count,
@@ -399,7 +414,9 @@ where
     ///
     /// [`ControlStreamError`], whose failures of the stream are
     /// [`CriticalStreamError`].
-    pub async fn next_frame(&mut self) -> Result<ControlFrame<'_, L, I>, ControlStreamErrorOf<I>> {
+    pub async fn next_frame(
+        &mut self,
+    ) -> Result<ControlFrame<'_, L, I, M>, ControlStreamErrorOf<I>> {
         let frame = self
             .frames
             .next_frame()
@@ -421,7 +438,7 @@ where
     /// [`ControlStreamError`], as for [`next_frame`](Self::next_frame).
     pub async fn next_known_frame(
         &mut self,
-    ) -> Result<ControlFrame<'_, L, I>, ControlStreamErrorOf<I>> {
+    ) -> Result<ControlFrame<'_, L, I, M>, ControlStreamErrorOf<I>> {
         let frame = self
             .frames
             .next_known_frame()
@@ -436,14 +453,14 @@ where
     }
 }
 
-impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess> ControlStream<L, I> {
+impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess, M> ControlStream<L, I, M> {
     /// The access, giving up the stream.
     pub fn into_io(self) -> I {
         self.frames.into_io().into_parts().0
     }
 }
 
-impl<L: FrameSetOn<ControlStreamKind>, I> TypedStream for ControlStream<L, I> {
+impl<L: FrameSetOn<ControlStreamKind>, I, M> TypedStream for ControlStream<L, I, M> {
     fn stream_type(&self) -> VarInt {
         Http3StreamType::Control.value()
     }
@@ -452,12 +469,12 @@ impl<L: FrameSetOn<ControlStreamKind>, I> TypedStream for ControlStream<L, I> {
 /// A push stream ([RFC 9114 §6.2.2]): its Push ID, and its frames.
 ///
 /// [RFC 9114 §6.2.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.2
-pub struct PushStream<L: FrameSetOn<PushStreamKind>, I> {
-    push_id: VarIntField<PushId>,
-    frames: FrameStream<L, PushStreamKind, I>,
+pub struct PushStream<L: FrameSetOn<PushStreamKind>, I, M = ()> {
+    push_id: ReadValue<VarIntField<PushId>, M>,
+    frames: FrameStream<L, PushStreamKind, I, M>,
 }
 
-impl<L: FrameSetOn<PushStreamKind>, I> core::fmt::Debug for PushStream<L, I>
+impl<L: FrameSetOn<PushStreamKind>, I, M: core::fmt::Debug> core::fmt::Debug for PushStream<L, I, M>
 where
     L::FrameType: core::fmt::Debug,
 {
@@ -469,25 +486,37 @@ where
     }
 }
 
-impl<L: FrameSetOn<PushStreamKind>, I> PushStream<L, I> {
+impl<L: FrameSetOn<PushStreamKind>, I, M> PushStream<L, I, M> {
     /// The Push ID, at the width it had on the wire. Whether it is within
     /// the permitted range is a question for the connection.
     pub const fn push_id(&self) -> VarIntField<PushId> {
-        self.push_id
+        self.push_id.value
+    }
+
+    /// The metadata of the bytes of the Push ID.
+    pub const fn push_id_metadata(&self) -> &M {
+        &self.push_id.metadata
     }
 
     /// The frames of the stream.
-    pub fn frames(&mut self) -> &mut FrameStream<L, PushStreamKind, I> {
+    pub fn frames(&mut self) -> &mut FrameStream<L, PushStreamKind, I, M> {
         &mut self.frames
     }
 
-    /// The Push ID and the frames of the stream.
-    pub fn into_parts(self) -> (VarIntField<PushId>, FrameStream<L, PushStreamKind, I>) {
+    /// The Push ID, with the metadata of its bytes, and the frames of the
+    /// stream.
+    #[allow(clippy::type_complexity)] // The Push ID with its metadata, and the frames.
+    pub fn into_parts(
+        self,
+    ) -> (
+        ReadValue<VarIntField<PushId>, M>,
+        FrameStream<L, PushStreamKind, I, M>,
+    ) {
         (self.push_id, self.frames)
     }
 }
 
-impl<L: FrameSetOn<PushStreamKind>, I> TypedStream for PushStream<L, I> {
+impl<L: FrameSetOn<PushStreamKind>, I, M> TypedStream for PushStream<L, I, M> {
     fn stream_type(&self) -> VarInt {
         Http3StreamType::Push.value()
     }
@@ -551,17 +580,18 @@ impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for Http3UnidirectionalSt
 
 /// Reads what follows the type `stream_type` of a unidirectional stream
 /// received by an endpoint of role `role`.
-async fn read_unidirectional<L, I>(
+async fn read_unidirectional<L, I, M>(
     stream_type: Http3StreamType,
     role: Role,
     mut io: I,
 ) -> Result<
-    Http3UnidirectionalStreamOf<L, I>,
+    Http3UnidirectionalStreamOf<L, I, M>,
     Http3UnidirectionalStreamError<<I::Family as Read>::Error>,
 >
 where
     L: FrameSetOn<ControlStreamKind> + FrameSetOn<PushStreamKind>,
-    I: ReceiverAccess<Family: Read<Metadata = ()>>,
+    I: ReceiverAccess<Family: Read<Metadata = M>>,
+    M: Combine + Unpin,
 {
     use http3_unidirectional_stream_error::{
         ControlSnafu, MissingSettingsSnafu, PushIdSnafu, PushSnafu,
@@ -569,25 +599,24 @@ where
     Ok(match stream_type {
         Http3StreamType::Control => {
             // invariant: a critical stream reports its end as a failure.
-            let frames: FrameStream<L, ControlStreamKind, _> =
+            let frames: FrameStream<L, ControlStreamKind, _, M> =
                 FrameStream::read(Composed::new(io, CriticalStream), role)
                     .await
                     .context(ControlSnafu)?
                     .expect("a critical stream does not end");
             // The first frame is SETTINGS; a reserved or unknown one is not.
             let settings = Http3FrameType::Settings.value();
-            if !matches!(frames.r#type.get(), FrameType::Known(known) if known.value() == settings)
+            if !matches!(frames.r#type.value.get(), FrameType::Known(known) if known.value() == settings)
             {
                 return MissingSettingsSnafu {
-                    frame_type: frames.r#type.to_var_int(),
+                    frame_type: frames.r#type.value.to_var_int(),
                 }
                 .fail();
             }
             Http3UnidirectionalStream::Control(ControlStream { frames })
         }
         Http3StreamType::Push => {
-            let push_id = io
-                .decode::<VarIntField<PushId>>()
+            let push_id = ReadValue::<VarIntField<PushId>, M>::decode_from(&mut io)
                 .await
                 .context(PushIdSnafu)?;
             Http3UnidirectionalStream::Push(PushStream {
@@ -660,7 +689,7 @@ macro_rules! unidirectional_part {
         {
             type Claimed = Http3StreamType;
             type Rejection = $rejection;
-            type Stream<I> = Http3UnidirectionalStreamOf<L, I>;
+            type Stream<I, M> = Http3UnidirectionalStreamOf<L, I, M>;
             type ReadError<E> = Http3UnidirectionalStreamError<E>;
 
             fn judge(value: VarInt, _skipped: bool) -> StreamVerdict<Http3StreamType, $rejection> {
@@ -669,12 +698,17 @@ macro_rules! unidirectional_part {
                 Http3StreamType::of(value).map_or(StreamVerdict::NotClaimed, judge)
             }
 
-            async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
+            async fn read<
+                I: ReceiverAccess<Family: Read<Metadata = M>>,
+                M: Combine + Unpin + Clone,
+            >(
                 claimed: Http3StreamType,
-                _field: VarIntField<VarInt>,
+                _field: ReadValue<VarIntField<VarInt>, M>,
                 io: I,
-            ) -> Result<Self::Stream<I>, Http3UnidirectionalStreamError<<I::Family as Read>::Error>>
-            {
+            ) -> Result<
+                Self::Stream<I, M>,
+                Http3UnidirectionalStreamError<<I::Family as Read>::Error>,
+            > {
                 read_unidirectional(claimed, <$class as StreamClass>::RECEIVER, io).await
             }
         }
@@ -706,7 +740,7 @@ unidirectional_part!(ServerInitiatedUnidirectional, CNil, StreamVerdict::Claimed
 impl<L: FrameSetOn<RequestStreamKind>> StreamPart<ClientInitiatedBidirectional, L> for Part {
     type Claimed = ();
     type Rejection = UnexpectedFrameTypeError;
-    type Stream<I> = FrameStream<L, RequestStreamKind, I>;
+    type Stream<I, M> = FrameStream<L, RequestStreamKind, I, M>;
     type ReadError<E> = ReadFrameHeadError<E>;
 
     fn judge(value: VarInt, _skipped: bool) -> StreamVerdict<(), UnexpectedFrameTypeError> {
@@ -725,12 +759,14 @@ impl<L: FrameSetOn<RequestStreamKind>> StreamPart<ClientInitiatedBidirectional, 
         }
     }
 
-    async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
+    async fn read<I: ReceiverAccess<Family: Read<Metadata = M>>, M: Combine + Unpin + Clone>(
         (): (),
-        field: VarIntField<VarInt>,
+        field: ReadValue<VarIntField<VarInt>, M>,
         io: I,
-    ) -> Result<FrameStream<L, RequestStreamKind, I>, ReadFrameHeadError<<I::Family as Read>::Error>>
-    {
+    ) -> Result<
+        FrameStream<L, RequestStreamKind, I, M>,
+        ReadFrameHeadError<<I::Family as Read>::Error>,
+    > {
         let receiver = <ClientInitiatedBidirectional as StreamClass>::RECEIVER;
         FrameStream::with_type(io, receiver, field).await
     }
@@ -744,7 +780,7 @@ impl<L: FrameSetOn<RequestStreamKind>> StreamPart<ClientInitiatedBidirectional, 
 impl<L> StreamPart<ServerInitiatedBidirectional, L> for Part {
     type Claimed = CNil;
     type Rejection = ServerBidirectionalStreamError;
-    type Stream<I> = CNil;
+    type Stream<I, M> = CNil;
     type ReadError<E> = CNil;
 
     fn judge(
@@ -754,9 +790,9 @@ impl<L> StreamPart<ServerInitiatedBidirectional, L> for Part {
         StreamVerdict::ErrorUnlessClaimed(ServerBidirectionalStreamError)
     }
 
-    async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
+    async fn read<I: ReceiverAccess<Family: Read<Metadata = M>>, M: Combine + Unpin + Clone>(
         claimed: CNil,
-        _field: VarIntField<VarInt>,
+        _field: ReadValue<VarIntField<VarInt>, M>,
         _io: I,
     ) -> Result<CNil, CNil> {
         match claimed {}

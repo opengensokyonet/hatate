@@ -1,11 +1,18 @@
-//! The payload of a frame, composed onto the stream it is on.
+//! The payload of a frame and the stream it is read from.
 //!
-//! [`FramePayload`] delimits a payload of a known length:
-//! `io.compose(&mut payload)` reads at most the rest of it from `io`, then
-//! answers EOF, so whoever consumes the payload cannot read the next frame.
-//! It passes on [`Read`] and [`ReadChunk`], and [`Skip`] where the stream
-//! skips, and reports its exact remaining length ([`ExactLen`]). A stream that ends inside the payload is a
-//! truncated frame ([`PayloadError::Truncated`]), not an early EOF.
+//! [`FramePayload`] holds the stream and what is left of the payload, and
+//! lends the stream limited to that rest ([`AsAccess`]): reads end at the end
+//! of the payload, so whoever consumes the payload cannot read the next frame.
+//! The limited stream passes on [`Read`] and [`ReadChunk`], and [`Skip`] where
+//! the stream skips, and reports its exact remaining length ([`ExactLen`]). A
+//! stream that ends inside the payload is a truncated frame
+//! ([`PayloadError::Truncated`]), not an early EOF.
+//!
+//! [`FramePayload::finish`] skips what is left and gives the stream back at
+//! the frame boundary. A payload dropped without it leaves the stream inside
+//! the payload; to read frame after frame, read them on a
+//! [`FrameStream`](crate::stream::FrameStream), which skips for itself.
+use super::codec::DecodeToEndError;
 use crate::error_code::{ErrorCode, ErrorCodeOf};
 use bytes::{Buf, BufMut};
 use core::{
@@ -14,31 +21,222 @@ use core::{
     pin::Pin,
     task::{Context, Poll, ready},
 };
-use nitori_call::{Compose, ReceiverFamily};
-use nitori_io::{ChunkSegment, ExactLen, Min, Read, ReadChunk, ReadSegment, Skip};
+use nitori_call::{AsAccess, Compose, Composed, Lent, ReceiverFamily};
+use nitori_codec::DecodeFrom;
+use nitori_io::{
+    ChunkSegment, ExactLen, Infinite, Min, Read, ReadChunk, ReadSegment, Skip, prelude::*,
+};
 use snafu::Snafu;
 
-/// The part of a frame's payload not yet consumed, composed onto the stream
-/// the frame is on. A frame read from a stream holds it
-/// ([`Frame`](super::Frame)); finishing the frame skips what is left.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FramePayload {
-    remaining: u64,
-    failed: bool,
+/// The payload of a frame ([RFC 9114 §7.1]): the stream `S` it is read
+/// from, at a point inside the payload, and what is left of the payload.
+///
+/// It lends `S` limited to the rest of the payload ([`AsAccess`]), as an
+/// owned value and as `&mut`. [`finish`](Self::finish) skips what is left
+/// and gives `S` back at the frame boundary; [`into_source`](Self::into_source)
+/// gives it back when nothing is left. Dropped without either, it leaves the
+/// stream inside the payload.
+///
+/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+#[must_use = "a payload not finished leaves its stream inside the payload"]
+#[derive(Debug)]
+pub struct FramePayload<S> {
+    pub(crate) source: S,
+    pub(crate) limit: PayloadLimit,
 }
 
-impl FramePayload {
-    /// A payload of `length` bytes.
-    pub const fn new(length: u64) -> Self {
+impl<S> FramePayload<S> {
+    /// The payload of `length` bytes that `source` is at the start of.
+    pub(crate) const fn new(source: S, length: u64) -> Self {
         Self {
-            remaining: length,
-            failed: false,
+            source,
+            limit: PayloadLimit::new(length),
         }
     }
 
     /// The bytes of the payload not yet consumed.
     pub const fn remaining(&self) -> u64 {
-        self.remaining
+        self.limit.remaining
+    }
+
+    /// The stream, at the frame boundary, if nothing of the payload is left
+    /// and reading it has not failed; otherwise the payload itself.
+    ///
+    /// # Errors
+    ///
+    /// The payload, when bytes of it are left or reading it failed.
+    pub fn into_source(self) -> Result<S, Self> {
+        if self.limit.remaining == 0 && self.limit.state != PayloadState::Failed {
+            Ok(self.source)
+        } else {
+            Err(self)
+        }
+    }
+}
+
+impl<S: AsAccess> FramePayload<S>
+where
+    S::Family: Skip<Count: Clone + Min<u64, Output = u64>>,
+    u64: Min<<S::Family as Skip>::Count, Output = <S::Family as Skip>::Count>,
+    Infinite: Min<<S::Family as Skip>::Count, Output = <S::Family as Skip>::Count>,
+{
+    /// Skips what is left of the payload and gives the stream back at the
+    /// frame boundary.
+    ///
+    /// A call dropped before it completes resumes where it stopped: the
+    /// payload counts what it skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`PayloadError`] when the stream fails or ends inside the payload,
+    /// or reading it had already failed; the stream is then inside the
+    /// payload and is not given back.
+    pub async fn finish(mut self) -> Result<S, PayloadError<<S::Family as Read>::Error>> {
+        self.access().skip_to_end().await?;
+        Ok(self.source)
+    }
+}
+
+impl<S: AsAccess> FramePayload<S> {
+    /// Reads a value of the payload, such as a field of a frame.
+    ///
+    /// A call dropped before it completes is detected: if it read nothing,
+    /// the next value starts over; if it read some of the bytes of the value,
+    /// the payload is interrupted, and later reads of it fail with
+    /// [`PayloadError::Interrupted`], which the value's error carries. What is
+    /// left can still be skipped ([`finish`](Self::finish),
+    /// [`FrameStream::next_frame`](crate::stream::FrameStream::next_frame)).
+    /// Decoding `V` from the payload directly does not detect it.
+    ///
+    /// # Errors
+    ///
+    /// The value's error.
+    pub async fn decode<V, E>(&mut self) -> Result<V, E>
+    where
+        V: for<'a> DecodeFrom<&'a mut Self, Error = E>,
+    {
+        self.limit.begin_value();
+        let value = V::decode_from(&mut *self).await;
+        self.limit.end_value();
+        value
+    }
+
+    /// Reads a value of the payload as [`decode`](Self::decode) does, which
+    /// must take all of what is left of it, such as the integer of a GOAWAY.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeToEndError`]: the value's error, or bytes of the payload
+    /// left after it.
+    pub async fn decode_to_end<V, E>(&mut self) -> Result<V, DecodeToEndError<E>>
+    where
+        V: for<'a> DecodeFrom<&'a mut Self, Error = E>,
+    {
+        let value = self
+            .decode::<V, E>()
+            .await
+            .map_err(|source| DecodeToEndError::Value { source })?;
+        match NonZeroU64::new(self.limit.remaining) {
+            None => Ok(value),
+            Some(left) => Err(DecodeToEndError::Unread { left }),
+        }
+    }
+}
+
+/// The stream limited to the rest of the payload.
+impl<S: AsAccess> AsAccess for FramePayload<S> {
+    type Family = PayloadSource<Lent<S::Family>>;
+    type Access<'a>
+        = Composed<S::Access<'a>, &'a mut PayloadLimit>
+    where
+        Self: 'a;
+    fn access(&mut self) -> Self::Access<'_> {
+        Composed::new(self.source.access(), &mut self.limit)
+    }
+}
+
+/// The stream limited to the rest of the payload, for a payload borrowed
+/// from a frame.
+impl<S: AsAccess> AsAccess for &mut FramePayload<S> {
+    type Family = PayloadSource<Lent<S::Family>>;
+    type Access<'a>
+        = Composed<S::Access<'a>, &'a mut PayloadLimit>
+    where
+        Self: 'a;
+    fn access(&mut self) -> Self::Access<'_> {
+        Composed::new(self.source.access(), &mut self.limit)
+    }
+}
+
+/// What is left of the payload of a frame, as composition state on the
+/// stream: it limits reads to the rest of the payload. A [`FramePayload`]
+/// keeps it; its stream, composed with it, is the payload source
+/// ([`PayloadSource`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadLimit {
+    remaining: u64,
+    state: PayloadState,
+}
+
+/// Where reading a payload is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadState {
+    /// No value is being read: reads and skips go on.
+    Open,
+    /// A value is being read through [`FramePayload::decode`], which began
+    /// when `start` bytes were left.
+    Value {
+        /// The bytes left when the value began.
+        start: u64,
+    },
+    /// A value was dropped after it had read some of its bytes: what it left
+    /// unread cannot be read as anything else, so reads fail and skips go on.
+    Interrupted,
+    /// Reading failed: neither reads nor skips go on.
+    Failed,
+}
+
+impl PayloadLimit {
+    /// A payload of `length` bytes.
+    pub(crate) const fn new(length: u64) -> Self {
+        Self {
+            remaining: length,
+            state: PayloadState::Open,
+        }
+    }
+
+    /// Whether a read may go on: not after a failure, nor after a value was
+    /// interrupted.
+    fn check_read<E>(&self) -> Result<(), PayloadError<E>> {
+        match self.state {
+            PayloadState::Open | PayloadState::Value { .. } => Ok(()),
+            PayloadState::Interrupted => Err(PayloadError::Interrupted),
+            PayloadState::Failed => Err(PayloadError::Failed),
+        }
+    }
+
+    /// A value begins. One begun before and dropped before it finished
+    /// either read nothing, and this one starts over, or read some of its
+    /// bytes, and the payload is interrupted.
+    fn begin_value(&mut self) {
+        match self.state {
+            PayloadState::Value { start } if start != self.remaining => {
+                self.state = PayloadState::Interrupted;
+            }
+            PayloadState::Open | PayloadState::Value { .. } => {
+                self.state = PayloadState::Value {
+                    start: self.remaining,
+                };
+            }
+            PayloadState::Interrupted | PayloadState::Failed => {}
+        }
+    }
+
+    /// The value begun last finished, whether it was read or failed.
+    fn end_value(&mut self) {
+        if let PayloadState::Value { .. } = self.state {
+            self.state = PayloadState::Open;
+        }
     }
 
     /// Takes `count` consumed bytes off the remaining length.
@@ -58,8 +256,8 @@ impl FramePayload {
         cx: &mut Context<'_>,
         destination: &mut O,
     ) -> PayloadPoll<F> {
-        if self.failed {
-            return Poll::Ready(Err(PayloadError::Failed));
+        if let Err(error) = self.check_read() {
+            return Poll::Ready(Err(error));
         }
         let Some(missing) = NonZeroU64::new(self.remaining) else {
             return Poll::Ready(Ok(None));
@@ -69,7 +267,7 @@ impl FramePayload {
         let result = ready!(F::poll_read(parent, cx, &mut destination.limit(allowed)));
         match result {
             Ok(None) if !empty => {
-                self.failed = true;
+                self.state = PayloadState::Failed;
                 Poll::Ready(Err(PayloadError::Truncated { missing }))
             }
             Ok(None) => Poll::Ready(Ok(None)),
@@ -78,7 +276,7 @@ impl FramePayload {
                 Poll::Ready(Ok(Some(segment)))
             }
             Err(source) => {
-                self.failed = true;
+                self.state = PayloadState::Failed;
                 Poll::Ready(Err(PayloadError::Host { source }))
             }
         }
@@ -109,6 +307,11 @@ pub enum PayloadError<E> {
     /// Reading this payload has already failed.
     #[snafu(display("frame payload has already failed"))]
     Failed,
+    /// A value read from this payload was dropped after it had read some of
+    /// its bytes ([`FramePayload::decode`]): the rest of the payload can only
+    /// be skipped.
+    #[snafu(display("frame payload was left inside a value"))]
+    Interrupted,
 }
 
 /// H3_FRAME_ERROR when the stream ended inside the payload
@@ -122,12 +325,13 @@ impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for PayloadError<E> {
         match self {
             Self::Truncated { .. } => Some(ErrorCode::H3_FRAME_ERROR),
             Self::Host { source } => source.error_code(),
-            Self::Failed => None,
+            Self::Failed | Self::Interrupted => None,
         }
     }
 }
 
-/// The receiver family of a [`FramePayload`] composed onto a parent stream.
+/// The receiver family of a stream limited to a frame payload by a
+/// [`PayloadLimit`].
 pub struct PayloadSource<F>(PhantomData<fn(F) -> F>);
 
 pin_project_lite::pin_project! {
@@ -140,7 +344,7 @@ pin_project_lite::pin_project! {
     {
         #[pin]
         parent: F::ReceiverView<'v>,
-        state: &'v mut FramePayload,
+        state: &'v mut PayloadLimit,
     }
 }
 
@@ -151,7 +355,7 @@ impl<F: ReceiverFamily> ReceiverFamily for PayloadSource<F> {
         Self: 'v;
 }
 
-impl<F: ReceiverFamily> Compose<F> for FramePayload {
+impl<F: ReceiverFamily> Compose<F> for PayloadLimit {
     type Family = PayloadSource<F>;
     fn compose<'v>(self: Pin<&'v mut Self>, parent: F::ReceiverView<'v>) -> PayloadView<'v, F>
     where
@@ -209,8 +413,8 @@ impl<F: ReadChunk> ReadChunk for PayloadSource<F> {
     {
         let view = host.project();
         let state = view.state;
-        if state.failed {
-            return Poll::Ready(Err(PayloadError::Failed));
+        if let Err(error) = state.check_read() {
+            return Poll::Ready(Err(error));
         }
         let Some(missing) = NonZeroU64::new(state.remaining) else {
             return Poll::Ready(Ok(None));
@@ -226,11 +430,11 @@ impl<F: ReadChunk> ReadChunk for PayloadSource<F> {
                 Poll::Ready(Ok(Some(chunk)))
             }
             Ok(None) => {
-                state.failed = true;
+                state.state = PayloadState::Failed;
                 Poll::Ready(Err(PayloadError::Truncated { missing }))
             }
             Err(source) => {
-                state.failed = true;
+                state.state = PayloadState::Failed;
                 Poll::Ready(Err(PayloadError::Host { source }))
             }
         }
@@ -272,7 +476,7 @@ where
     {
         let view = host.project();
         let state = view.state;
-        if state.failed {
+        if state.state == PayloadState::Failed {
             return Poll::Ready(Err(PayloadError::Failed));
         }
         let Some(missing) = NonZeroU64::new(state.remaining) else {
@@ -297,11 +501,11 @@ where
                 Poll::Ready(Ok(Some(count)))
             }
             Ok(None) => {
-                state.failed = true;
+                state.state = PayloadState::Failed;
                 Poll::Ready(Err(PayloadError::Truncated { missing }))
             }
             Err(source) => {
-                state.failed = true;
+                state.state = PayloadState::Failed;
                 Poll::Ready(Err(PayloadError::Host { source }))
             }
         }

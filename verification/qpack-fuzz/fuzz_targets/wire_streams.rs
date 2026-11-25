@@ -263,7 +263,7 @@ macro_rules! unidirectional {
             io: &mut A,
             discard: bool,
         ) -> Outcome {
-            let stream = match read_unidirectional_stream::<Parts, $class, _>(&mut *io).await {
+            let stream = match read_unidirectional_stream::<Parts, $class, _, ()>(&mut *io).await {
                 Ok(Some(stream)) => stream,
                 Ok(None) => return Ok(None),
                 Err(error) => return Err(unidirectional_failed(&error)),
@@ -312,7 +312,7 @@ macro_rules! bidirectional {
             io: &mut A,
             discard: bool,
         ) -> Outcome {
-            let stream = match read_bidirectional_stream::<Parts, $class, _>(&mut *io).await {
+            let stream = match read_bidirectional_stream::<Parts, $class, _, ()>(&mut *io).await {
                 Ok(Some(stream)) => stream,
                 Ok(None) => return Ok(None),
                 Err(error) => return Err(bidirectional_failed(&error)),

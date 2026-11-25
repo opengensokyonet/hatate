@@ -1,4 +1,5 @@
-//! Reading settings one at a time, and writing a SETTINGS frame.
+//! Reading the parameters of a SETTINGS frame one at a time, and writing a
+//! SETTINGS frame.
 use super::{
     Http2SettingIdentifier, Http2SettingIdentifierError, Setting, UnknownSetting,
     set::{SettingList, Settings},
@@ -16,9 +17,9 @@ use crate::{
 };
 use alloc::vec::Vec;
 use core::fmt;
-use nitori_call::{ReceiverAccess, call};
-use nitori_codec::prelude::*;
-use nitori_io::{ExactLen, prelude::*};
+use nitori_call::{AsAccess, ReceiverAccess, call};
+use nitori_codec::{DecodeFrom, prelude::*};
+use nitori_io::{Combine, Read, calls::ReadValue, prelude::*};
 use sakuya_var_int::{
     VarInt, VarIntField,
     stream::{ReadVarIntError, WriteVarIntError},
@@ -44,84 +45,56 @@ impl DuplicateSettingError {
     }
 }
 
-/// Reads the next setting from the payload of a SETTINGS frame into
-/// `settings`, whose list of setting types it reads with.
+/// A parameter of a SETTINGS frame as read ([RFC 9114 §7.2.4.1]): the
+/// identifier and the value, each with the metadata `M` of its bytes, before
+/// the list of setting types interprets them ([`Settings::insert`]).
 ///
-/// `io` is the payload, such as a [`FramePayload`](crate::frame::payload::FramePayload)
-/// composed onto the control stream. Returns `None` at its end. A setting
-/// whose identifier a type of the list claims is checked by that type, put
-/// into its slot of `settings`, and returned as [`Setting::Known`]; its
-/// identifier may occur once in a frame. One that no type claims is
-/// [`Setting::Unknown`]: it is returned and not kept, and may repeat.
+/// Read the parameters of a SETTINGS frame one at a time with
+/// [`FramePayload::decode`](crate::frame::payload::FramePayload::decode)
+/// until nothing of the payload is left, and insert each into a new
+/// [`Settings`] for the frame. A parameter of an identifier of HTTP/2 is
+/// rejected as it is read.
 ///
-/// Use a new [`Settings`] for each frame.
-///
-/// A read dropped before it completes may have taken bytes of the setting
-/// it began, and a later read would start inside that setting and give a
-/// wrong one without failing: after such a drop, do not read this frame
-/// further, and skip it with [`FrameStream::next_frame`](crate::stream::FrameStream::next_frame).
-///
-/// # Errors
-///
-/// [`ReadSettingError`]; its [`ErrorCodeOf::error_code`] gives the
-/// connection error it calls for.
-#[call(sync)]
-pub async fn read_setting<
-    L: SettingList,
-    F: Read<Metadata = ()> + ExactLen<LengthError = !>,
-    A: ReceiverAccess<Family = F>,
->(
-    io: &mut A,
-    settings: &mut Settings<L>,
-) -> Result<Option<Setting<L::Setting>>, ReadSettingError<F::Error, L::ValueErrors>>
-where
-    <F as ExactLen>::Length: TryInto<u64>,
-{
-    let Ok(remaining) = io.remaining_len().await;
-    if matches!(remaining.try_into(), Ok(0u64)) {
-        return Ok(None);
-    }
-    let identifier = io
-        .decode::<VarIntField<VarInt>>()
-        .await
-        .context(read_setting_error::IdentifierSnafu)?;
-    if let Some(identifier) = Http2SettingIdentifier::of(identifier.get()) {
-        return Err(ReadSettingError::Http2Identifier {
-            source: Http2SettingIdentifierError::new(identifier),
-        });
-    }
-    let value = io
-        .decode::<VarIntField<VarInt>>()
-        .await
-        .context(read_setting_error::ValueSnafu)?;
-    let Some(setting) = L::setting_of(identifier, value) else {
-        // invariant: HTTP/2 identifiers were rejected above.
-        return Ok(Some(Setting::Unknown(UnknownSetting { identifier, value })));
-    };
-    if L::is_taken(settings.slots(), identifier.get()) {
-        return Err(DuplicateSettingError::new(identifier.get()).into());
-    }
-    let setting = setting
-        .map_err(PartsError::new)
-        .context(read_setting_error::RejectedSnafu)?;
-    L::insert(settings.slots_mut(), &setting);
-    Ok(Some(Setting::Known(setting)))
+/// [RFC 9114 §7.2.4.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SettingParameter<M = ()> {
+    /// The identifier.
+    pub identifier: ReadValue<VarIntField<VarInt>, M>,
+    /// The value.
+    pub value: ReadValue<VarIntField<VarInt>, M>,
 }
 
-/// Failures of [`read_setting`]. `V` is the sum of the value failures of
-/// the setting types.
+impl<S, M> DecodeFrom<S> for SettingParameter<M>
+where
+    S: AsAccess<Family: Read<Metadata = M>>,
+    M: Combine + Unpin,
+{
+    type Error = DecodeSettingParameterError<<S::Family as Read>::Error>;
+
+    async fn decode_from(mut source: S) -> Result<Self, Self::Error> {
+        let identifier = ReadValue::<VarIntField<VarInt>, M>::decode_from(source.access())
+            .await
+            .context(decode_setting_parameter_error::IdentifierSnafu)?;
+        if let Some(identifier) = Http2SettingIdentifier::of(identifier.value.get()) {
+            return Err(DecodeSettingParameterError::Http2Identifier {
+                source: Http2SettingIdentifierError::new(identifier),
+            });
+        }
+        let value = ReadValue::<VarIntField<VarInt>, M>::decode_from(source.access())
+            .await
+            .context(decode_setting_parameter_error::ValueSnafu)?;
+        Ok(Self { identifier, value })
+    }
+}
+
+/// Failures of reading a [`SettingParameter`] from a source whose failures
+/// are `E`.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-pub enum ReadSettingError<E, V> {
+pub enum DecodeSettingParameterError<E> {
     /// The identifier could not be read.
     #[snafu(display("could not read setting identifier"))]
     Identifier {
-        /// The failure of reading the integer.
-        source: ReadVarIntError<E>,
-    },
-    /// The value could not be read.
-    #[snafu(display("could not read setting value"))]
-    Value {
         /// The failure of reading the integer.
         source: ReadVarIntError<E>,
     },
@@ -131,6 +104,73 @@ pub enum ReadSettingError<E, V> {
         /// The identifier received.
         source: Http2SettingIdentifierError,
     },
+    /// The value could not be read.
+    #[snafu(display("could not read setting value"))]
+    Value {
+        /// The failure of reading the integer.
+        source: ReadVarIntError<E>,
+    },
+}
+
+/// H3_FRAME_ERROR when the payload ends inside the parameter ([RFC 9114
+/// §7.1]), H3_SETTINGS_ERROR for an identifier of HTTP/2 ([RFC 9114
+/// §7.2.4.1]); otherwise the code of the source's failure, such as
+/// H3_FRAME_ERROR when the stream ended inside a frame read through a
+/// [`FramePayload`](crate::frame::payload::FramePayload). `None` when the
+/// stream failed.
+///
+/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+/// [RFC 9114 §7.2.4.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for DecodeSettingParameterError<E> {
+    fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Identifier { source } | Self::Value { source } => {
+                payload_integer_error_code(source)
+            }
+            Self::Http2Identifier { .. } => Some(ErrorCode::H3_SETTINGS_ERROR),
+        }
+    }
+}
+
+impl<L: SettingList> Settings<L> {
+    /// Interprets `parameter`, read from the SETTINGS frame these settings
+    /// are for, with the list of setting types.
+    ///
+    /// A parameter whose identifier a type of the list claims is checked by
+    /// that type, put into its slot, and returned as [`Setting::Known`]; its
+    /// identifier may occur once in a frame. One that no type claims is
+    /// [`Setting::Unknown`]: it is returned and not kept, and may repeat.
+    /// The metadata of the parameter is not kept.
+    ///
+    /// # Errors
+    ///
+    /// [`InsertSettingError`]; its [`ErrorCodeOf::error_code`] gives the
+    /// connection error it calls for.
+    pub fn insert<M>(
+        &mut self,
+        parameter: SettingParameter<M>,
+    ) -> Result<Setting<L::Setting>, InsertSettingError<L::ValueErrors>> {
+        let identifier = parameter.identifier.value;
+        let value = parameter.value.value;
+        let Some(setting) = L::setting_of(identifier, value) else {
+            return Ok(Setting::Unknown(UnknownSetting { identifier, value }));
+        };
+        if L::is_taken(self.slots(), identifier.get()) {
+            return Err(DuplicateSettingError::new(identifier.get()).into());
+        }
+        let setting = setting
+            .map_err(PartsError::new)
+            .context(insert_setting_error::RejectedSnafu)?;
+        L::insert(self.slots_mut(), &setting);
+        Ok(Setting::Known(setting))
+    }
+}
+
+/// Failures of [`Settings::insert`]. `V` is the sum of the value failures of
+/// the setting types.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum InsertSettingError<V> {
     /// The setting type that claims the identifier rejects the value.
     #[snafu(display("invalid setting value"))]
     Rejected {
@@ -145,25 +185,12 @@ pub enum ReadSettingError<E, V> {
     },
 }
 
-/// H3_FRAME_ERROR when the payload ends inside a setting ([RFC 9114 §7.1]),
-/// H3_SETTINGS_ERROR for a setting that is not valid ([RFC 9114 §7.2.4]);
-/// otherwise the code of the source's failure, such as H3_FRAME_ERROR when
-/// the stream ended inside a frame read through a
-/// [`FramePayload`](crate::frame::payload::FramePayload). `None` when the
-/// stream failed.
+/// H3_SETTINGS_ERROR ([RFC 9114 §7.2.4]).
 ///
-/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
 /// [RFC 9114 §7.2.4]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4
-impl<E: ErrorCodeOf<ErrorCode>, V> ErrorCodeOf<ErrorCode> for ReadSettingError<E, V> {
+impl<V> ErrorCodeOf<ErrorCode> for InsertSettingError<V> {
     fn error_code(&self) -> Option<ErrorCode> {
-        match self {
-            Self::Identifier { source } | Self::Value { source } => {
-                payload_integer_error_code(source)
-            }
-            Self::Http2Identifier { .. } | Self::Rejected { .. } | Self::Duplicate { .. } => {
-                Some(ErrorCode::H3_SETTINGS_ERROR)
-            }
-        }
+        Some(ErrorCode::H3_SETTINGS_ERROR)
     }
 }
 
@@ -310,7 +337,7 @@ pub enum SettingsFrameError {
     },
 }
 
-/// Writes `frame`.
+/// Writes `frame`, and gives the merged report of everything it wrote.
 ///
 /// # Errors
 ///
@@ -319,27 +346,30 @@ pub enum SettingsFrameError {
 #[call(sync)]
 pub async fn write_settings_frame<
     L: SettingList,
-    F: Write<Report = ()>,
+    F: Write<Report: Combine>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
     frame: &SettingsFrame<L>,
-) -> Result<(), WriteSettingsFrameError<F::Error>> {
+) -> Result<<F as Write>::Report, WriteSettingsFrameError<F::Error>> {
     let type_field = VarIntField::new(Http3FrameType::Settings.value(), frame.widths.type_width())
         .expect("every width holds the frame type 0x04");
-    write_head(io, type_field, frame.length)
+    let mut report = write_head(io, type_field, frame.length)
         .await
         .context(write_settings_frame_error::HeadSnafu)?;
     for (index, setting) in frame.settings.iter().enumerate() {
         let (identifier, value) = fields::<L>(setting);
-        io.encode(identifier)
+        let identifier = io
+            .encode(identifier)
             .await
             .context(write_settings_frame_error::IdentifierSnafu { index })?;
-        io.encode(value)
+        let value = io
+            .encode(value)
             .await
             .context(write_settings_frame_error::ValueSnafu { index })?;
+        report = report.combine(identifier).combine(value);
     }
-    Ok(())
+    Ok(report)
 }
 
 /// Failures of [`write_settings_frame`].

@@ -2,8 +2,8 @@
 //! Datagrams and Extended CONNECT: heads, SETTINGS, the integer frames,
 //! PUSH_PROMISE (its Push ID, then the rest of the payload), and the payload
 //! of every other frame, which is collected. Every frame read whole is
-//! written back (the collected ones through `write_frame` and
-//! `write_push_promise_frame`) and must equal its bytes.
+//! written back (its Type and Length at the widths they were read with, then
+//! its payload) and must equal its bytes.
 //!
 //! The first byte sets how the stream arrives: its low four bits plus one are
 //! the bytes given per read, and its high four bits the period of a
@@ -23,19 +23,10 @@ use frunk_core::HList;
 use hatate_wire::{
     Role,
     frame::{
-        Frame, Http3FrameType,
-        codec::{
-            ReadPushPromisePushIdExt as _, WriteFrameExt as _, WritePushPromiseFrameHostExt as _,
-        },
-        control::codec::{
-            ReadCancelPushFrameExt as _, ReadGoawayFrameExt as _, ReadMaxPushIdFrameExt as _,
-            WriteCancelPushFrameExt as _, WriteGoawayFrameExt as _, WriteMaxPushIdFrameExt as _,
-        },
+        GoawayId, Http3FrameType, PushId, payload::FramePayload, push_promise::PushPromisePayload,
     },
     settings::{
-        codec::{
-            ReadSettingExt as _, SettingsFrame, SettingsFrameError, WriteSettingsFrameExt as _,
-        },
+        codec::{SettingParameter, SettingsFrame, SettingsFrameError, WriteSettingsFrameExt as _},
         set::{Settings, SettingsOf},
     },
     stream::{
@@ -44,9 +35,10 @@ use hatate_wire::{
     },
 };
 use libfuzzer_sys::fuzz_target;
-use nitori_call::{ReceiverAccess, call};
-use nitori_io::{ExactLen, Min, Read, Skip, Write, prelude::*};
-use sakuya_var_int::{VarInt, VarIntField};
+use nitori_call::{AsAccess, ConstructedAccess, ReceiverAccess, call};
+use nitori_codec::{DecodeFrom as _, payload::Chunks, prelude::*};
+use nitori_io::{Min, Read, Skip, Write, calls::ReadValue, prelude::*};
+use sakuya_var_int::VarIntField;
 
 type Parts = HList![
     hatate_wire::Part,
@@ -138,31 +130,16 @@ fn complete<T>(future: impl Future<Output = T>) -> T {
 }
 
 /// The rest of `payload`, read to its end; `None` if reading failed.
-async fn collect<A: ReceiverAccess<Family: Read<Metadata = ()>>>(payload: &mut A) -> Option<Vec<u8>> {
+async fn collect<A: AsAccess<Family: Read<Metadata = ()>>>(payload: &mut A) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     loop {
         let mut buffer = [0; 64];
-        match payload.read(&mut &mut buffer[..]).await {
+        match payload.access().read(&mut &mut buffer[..]).await {
             Ok(None) => return Some(bytes),
             Ok(Some(segment)) => bytes.extend_from_slice(&buffer[..segment.count.get()]),
             Err(_) => return None,
         }
     }
-}
-
-/// Writes the frame of this Type and Length whose payload is the second
-/// receiver of the host.
-#[call(sync)]
-async fn write_payload<R: Read<Metadata = ()> + ExactLen<LengthError = !>, F: Write<Report = ()>>(
-    out: &mut impl ReceiverAccess<Family = F>,
-    payload: &mut impl ReceiverAccess<Family = R>,
-    r#type: VarIntField<VarInt>,
-    length: VarIntField<VarInt>,
-) -> Result<(), hatate_wire::frame::codec::WriteFrameError<R::Error, F::Error>>
-where
-    <R as ExactLen>::Length: TryInto<u64>,
-{
-    out.write_frame(Frame::new(r#type, length, payload)).await
 }
 
 /// Walks the frames of a stream of this kind, writes each frame read whole to
@@ -190,12 +167,16 @@ macro_rules! walk {
                 Some(Http3FrameType::Settings) => {
                     let mut slots = Settings::<<Parts as SettingsOf>::Settings>::new();
                     let mut settings = Vec::new();
-                    loop {
-                        match frame.payload().read_setting(&mut slots).await {
-                            Ok(Some(setting)) => settings.push(setting),
-                            Ok(None) => break,
-                            Err(_) => return,
-                        }
+                    while frame.payload().remaining() > 0 {
+                        let Ok(parameter) =
+                            frame.payload().decode::<SettingParameter, _>().await
+                        else {
+                            return;
+                        };
+                        let Ok(setting) = slots.insert(parameter) else {
+                            return;
+                        };
+                        settings.push(setting);
                     }
                     match SettingsFrame::<<Parts as SettingsOf>::Settings>::new(settings, widths) {
                         Ok(settings_frame) => {
@@ -213,44 +194,85 @@ macro_rules! walk {
                     }
                 }
                 Some(Http3FrameType::CancelPush) => {
-                    let Ok(read) = frame.payload().read_cancel_push_frame(widths).await else {
+                    let Ok(read) = frame
+                        .payload()
+                        .decode_to_end::<ReadValue<VarIntField<PushId>, ()>, _>()
+                        .await
+                    else {
                         return;
                     };
-                    let Ok(()) = $out.write_cancel_push_frame(read).await else {
+                    let (Ok(_), Ok(_), Ok(_)) = (
+                        $out.encode(type_field).await,
+                        $out.encode(length_field).await,
+                        $out.encode(read).await,
+                    ) else {
                         panic!("a CANCEL_PUSH frame was not written");
                     };
                     whole = true;
                 }
                 Some(Http3FrameType::Goaway) => {
-                    let Ok(read) = frame.payload().read_goaway_frame(widths).await else {
+                    let Ok(read) = frame
+                        .payload()
+                        .decode_to_end::<ReadValue<VarIntField<GoawayId>, ()>, _>()
+                        .await
+                    else {
                         return;
                     };
-                    let Ok(()) = $out.write_goaway_frame(read).await else {
+                    let (Ok(_), Ok(_), Ok(_)) = (
+                        $out.encode(type_field).await,
+                        $out.encode(length_field).await,
+                        $out.encode(read).await,
+                    ) else {
                         panic!("a GOAWAY frame was not written");
                     };
                     whole = true;
                 }
                 Some(Http3FrameType::MaxPushId) => {
-                    let Ok(read) = frame.payload().read_max_push_id_frame(widths).await else {
+                    let Ok(read) = frame
+                        .payload()
+                        .decode_to_end::<ReadValue<VarIntField<PushId>, ()>, _>()
+                        .await
+                    else {
                         return;
                     };
-                    let Ok(()) = $out.write_max_push_id_frame(read).await else {
+                    let (Ok(_), Ok(_), Ok(_)) = (
+                        $out.encode(type_field).await,
+                        $out.encode(length_field).await,
+                        $out.encode(read).await,
+                    ) else {
                         panic!("a MAX_PUSH_ID frame was not written");
                     };
                     whole = true;
                 }
                 Some(Http3FrameType::PushPromise) => {
-                    let Ok(push_id) = frame.payload().read_push_promise_push_id().await else {
+                    let Ok(mut promise) =
+                        PushPromisePayload::<&mut FramePayload<_>, ()>::decode_from(
+                            &mut **frame.payload(),
+                        )
+                        .await
+                    else {
                         return;
                     };
-                    let Some(section) = collect(frame.payload()).await else {
+                    let Some(section) = collect(&mut promise.section).await else {
                         return;
                     };
-                    let mut again = (Vec::<u8>::new(), &section[..]);
-                    let Ok(()) = again.write_push_promise_frame_unpin(widths, push_id).await else {
+                    let mut again = ConstructedAccess::new(Vec::<u8>::new());
+                    let (Ok(_), Ok(_), Ok(_)) = (
+                        again.encode(type_field).await,
+                        again.encode(length_field).await,
+                        again
+                            .encode(PushPromisePayload {
+                                push_id: promise.push_id,
+                                section: Chunks {
+                                    source: ConstructedAccess::new(&section[..]),
+                                    chunk_maximum: core::num::NonZeroUsize::MIN,
+                                },
+                            })
+                            .await,
+                    ) else {
                         panic!("a PUSH_PROMISE frame was not written");
                     };
-                    assert_eq!(again.0, &wire[start..end]);
+                    assert_eq!(again.into_inner(), &wire[start..end]);
                 }
                 _ => {
                     // DATA, HEADERS and the frames of types no part claims.
@@ -258,17 +280,21 @@ macro_rules! walk {
                         return;
                     };
                     assert_eq!(bytes.len() as u64, length);
-                    let mut again = (Vec::<u8>::new(), &bytes[..]);
-                    if let Err(error) = again.write_payload_unpin(type_field, length_field).await {
-                        panic!("a frame of the payload was not written: {error}");
-                    }
-                    assert_eq!(again.0, &wire[start..end]);
+                    let mut again = ConstructedAccess::new(Vec::<u8>::new());
+                    let (Ok(_), Ok(_), Ok(_)) = (
+                        again.encode(type_field).await,
+                        again.encode(length_field).await,
+                        again.encode(&bytes[..]).await,
+                    ) else {
+                        panic!("a frame of the payload was not written");
+                    };
+                    assert_eq!(again.into_inner(), &wire[start..end]);
                 }
             }
             if whole {
                 // The frame was written from what was read: the payload was
                 // read to its end, or the frame is not the bytes it was.
-                if frame.into_payload().into_parts().1.remaining() == 0 {
+                if frame.into_payload().remaining() == 0 {
                     $expected.extend_from_slice(&wire[start..end]);
                 } else {
                     return;

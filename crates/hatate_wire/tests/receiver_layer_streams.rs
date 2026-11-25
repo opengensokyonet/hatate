@@ -49,7 +49,7 @@ macro_rules! drain_code {
 macro_rules! start_log {
     ($io:expr, $w:ident, $class:ty, $discard:expr) => {{
         let mut log: Vec<String> = Vec::new();
-        match $w!(read_unidirectional_stream::<Parts, $class, _>($io)) {
+        match $w!(read_unidirectional_stream::<Parts, $class, _, ()>($io)) {
             Ok(None) => {
                 log.push("no stream".to_string());
                 (log, None)
@@ -342,6 +342,7 @@ macro_rules! bidi_log {
             Parts,
             ClientInitiatedBidirectional,
             _,
+            (),
         >($io))
         {
             Ok(None) => {
@@ -449,11 +450,11 @@ fn the_streams_and_their_futures_are_send_when_the_receiver_is() {
         let next = stream.next_known_frame();
         assert_send(&next);
     }
-    let start = read_unidirectional_stream::<Parts, ServerInitiatedUnidirectional, _>(
+    let start = read_unidirectional_stream::<Parts, ServerInitiatedUnidirectional, _, ()>(
         ConstructedAccess::new(Dribble::new(&input, 1)),
     );
     assert_send(&start);
-    let bidirectional = read_bidirectional_stream::<Parts, ClientInitiatedBidirectional, _>(
+    let bidirectional = read_bidirectional_stream::<Parts, ClientInitiatedBidirectional, _, ()>(
         ConstructedAccess::new(Dribble::new(&input, 1)),
     );
     assert_send(&bidirectional);

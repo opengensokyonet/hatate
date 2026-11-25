@@ -12,14 +12,16 @@ use hatate_wire::{
     Role,
     error_code::{ErrorCode, ErrorCodeOf},
     frame::{
-        Http3FrameType,
-        codec::{ReadFrameError, ReadFrameHeadError, UnexpectedFrameTypeError, WriteFrameExt as _},
+        GoawayId, Http3FrameType, PushId,
+        codec::{ReadFrameError, ReadFrameHeadError, UnexpectedFrameTypeError},
+        payload::FramePayload,
+        push_promise::PushPromisePayload,
         set::FrameSetOn,
     },
     registry::reserved,
     settings::{
         Setting,
-        codec::ReadSettingExt as _,
+        codec::SettingParameter,
         set::{Settings, SettingsOf},
     },
     stream::{
@@ -28,7 +30,8 @@ use hatate_wire::{
     },
 };
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::{Read, Skip, Write};
+use nitori_codec::{DecodeFrom as _, payload::Buffered, prelude::*};
+use nitori_io::{Read, Skip, Write, calls::ReadValue};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
 fn var_int(value: u64, width: VarIntWidth) -> Vec<u8> {
@@ -451,7 +454,7 @@ where
     let mut last = stream.frame();
     let last_ty = ty(last.frame_type());
     let payload = read_some(last.payload(), 8).await.unwrap();
-    let remaining = last.into_payload().into_parts().1.remaining();
+    let remaining = last.into_payload().remaining();
     (
         first,
         known,
@@ -589,17 +592,25 @@ async fn settings_and_goaway<
     assert_eq!(ty(frame.frame_type()), h3(Http3FrameType::Settings));
     let mut settings = Settings::<<Parts as SettingsOf>::Settings>::new();
     let mut count = 0;
-    while let Some(setting) = frame.payload().read_setting(&mut settings).await.unwrap() {
+    while frame.payload().remaining() > 0 {
+        let parameter = frame
+            .payload()
+            .decode::<SettingParameter, _>()
+            .await
+            .unwrap();
+        let setting = settings.insert(parameter).unwrap();
         assert!(matches!(setting, Setting::Known(_)));
         count += 1;
     }
     let mut frame = stream.next_frame().await.unwrap().unwrap();
     assert_eq!(ty(frame.frame_type()), h3(Http3FrameType::Goaway));
-    let widths = frame.widths();
-    use hatate_wire::frame::control::codec::ReadGoawayFrameExt as _;
-    let goaway = frame.payload().read_goaway_frame(widths).await.unwrap();
+    let goaway = frame
+        .payload()
+        .decode_to_end::<ReadValue<VarIntField<GoawayId>, ()>, _>()
+        .await
+        .unwrap();
     assert!(stream.next_frame().await.unwrap().is_none());
-    (count, goaway.id().get().get().get())
+    (count, goaway.value.get().get().get())
 }
 
 #[test]
@@ -628,35 +639,30 @@ async fn cancel_push_and_max_push_id<
 >(
     io: &mut impl ReceiverAccess<Family = F>,
 ) -> (u64, usize, u64, usize) {
-    use hatate_wire::frame::control::codec::{
-        ReadCancelPushFrameExt as _, ReadMaxPushIdFrameExt as _,
-    };
     let mut stream = FrameStream::<Parts, ControlStreamKind, _>::read(&mut *io, Role::Server)
         .await
         .unwrap()
         .unwrap();
     let mut frame = stream.frame();
     assert_eq!(ty(frame.frame_type()), h3(Http3FrameType::CancelPush));
-    let widths = frame.widths();
     let cancel = frame
         .payload()
-        .read_cancel_push_frame(widths)
+        .decode_to_end::<ReadValue<VarIntField<PushId>, ()>, _>()
         .await
         .unwrap();
     let mut frame = stream.next_frame().await.unwrap().unwrap();
     assert_eq!(ty(frame.frame_type()), h3(Http3FrameType::MaxPushId));
-    let widths = frame.widths();
     let max = frame
         .payload()
-        .read_max_push_id_frame(widths)
+        .decode_to_end::<ReadValue<VarIntField<PushId>, ()>, _>()
         .await
         .unwrap();
     assert!(stream.next_frame().await.unwrap().is_none());
     (
-        cancel.push_id().get().get().get(),
-        cancel.push_id().encoded_len(),
-        max.push_id().get().get().get(),
-        max.push_id().encoded_len(),
+        cancel.value.get().get().get(),
+        cancel.value.encoded_len(),
+        max.value.get().get().get(),
+        max.value.encoded_len(),
     )
 }
 
@@ -676,15 +682,18 @@ async fn push_promise<
 >(
     io: &mut impl ReceiverAccess<Family = F>,
 ) -> (u64, Vec<u8>, bool) {
-    use hatate_wire::frame::codec::ReadPushPromisePushIdExt as _;
     let mut stream = FrameStream::<Parts, RequestStreamKind, _>::read(&mut *io, Role::Client)
         .await
         .unwrap()
         .unwrap();
     let mut frame = stream.frame();
     assert_eq!(ty(frame.frame_type()), h3(Http3FrameType::PushPromise));
-    let push_id = frame.payload().read_push_promise_push_id().await.unwrap();
-    let section = read_some(frame.payload(), 100).await.unwrap();
+    let mut promise =
+        PushPromisePayload::<&mut FramePayload<_>, ()>::decode_from(&mut **frame.payload())
+            .await
+            .unwrap();
+    let section = read_some(&mut promise.section, 100).await.unwrap();
+    let push_id = promise.push_id.value;
     let next = stream.next_frame().await.unwrap();
     (push_id.get().get().get(), section, next.is_none())
 }
@@ -696,8 +705,8 @@ fn push_promise_reads_its_push_id_through_the_payload_of_the_current_frame() {
     assert_eq!(input.sync_push_promise_unpin(), (7, vec![0xaa, 0xbb], true));
 }
 
-/// Reads every frame of a stream and writes each back with `write_frame`,
-/// its payload copied from the frame's own payload; the types it saw.
+/// Reads every frame of a stream and writes each back with its payload
+/// copied from the frame's own payload; the types it saw.
 #[call(sync)]
 async fn copy_frames<
     K: StreamKind,
@@ -721,9 +730,13 @@ where
     };
     loop {
         types.push(ty(stream.frame().frame_type()));
-        output.write_frame(stream.frame()).await.unwrap();
+        let frame = stream.frame().map_payload(|payload| Buffered {
+            source: payload,
+            buffer: [0u8; 5],
+        });
+        output.encode(frame).await.unwrap();
         // The frame's payload was copied to its end.
-        assert_eq!(stream.frame().into_payload().into_parts().1.remaining(), 0);
+        assert_eq!(stream.frame().into_payload().remaining(), 0);
         if stream.next_frame().await.unwrap().is_none() {
             return types;
         }

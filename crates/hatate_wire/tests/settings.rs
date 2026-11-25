@@ -10,13 +10,15 @@ use frunk_core::{
 };
 use hatate_wire::{
     Part, Role,
-    error_code::{ErrorCode, ErrorCodeOf as _},
+    error_code::{ErrorCode, ErrorCodeOf},
     frame::{FrameWidths, Http3FrameType, payload::PayloadError},
+    parts::PartsError,
     settings::{
-        Http2SettingIdentifier, Keyed, KeyedSetting, MaxFieldSectionSize, Setting, UnknownSetting,
+        Http2SettingIdentifier, Http2SettingIdentifierError, Keyed, KeyedSetting,
+        MaxFieldSectionSize, Setting, UnknownSetting,
         codec::{
-            ReadSettingError, ReadSettingExt as _, SettingsFrame, SettingsFrameError,
-            WriteSettingsFrameHostExt as _,
+            DecodeSettingParameterError, DuplicateSettingError, InsertSettingError,
+            SettingParameter, SettingsFrame, SettingsFrameError, WriteSettingsFrameHostExt as _,
         },
         set::{SettingList, Settings, SettingsOf, SettingsPart},
     },
@@ -25,12 +27,56 @@ use hatate_wire::{
 use hatate_wire_qpack::{QpackBlockedStreams, QpackMaxTableCapacity};
 use nitori_call::{ReceiverAccess, call};
 use nitori_io::Read;
-use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
+use sakuya_var_int::{VarInt, VarIntField, VarIntWidth, stream::ReadVarIntError};
 
 type Parts = HList![Part];
 type List = <Parts as SettingsOf>::Settings;
 type Item = Setting<<List as SettingList>::Setting>;
 type Error = ReadSettingError<PayloadError<Infallible>, <List as SettingList>::ValueErrors>;
+
+/// The failures of reading a parameter of a SETTINGS frame and of inserting
+/// it into the settings.
+#[derive(Debug)]
+#[allow(dead_code)] // Read through `Debug`.
+enum ReadSettingError<E, V> {
+    Identifier { source: ReadVarIntError<E> },
+    Http2Identifier { source: Http2SettingIdentifierError },
+    Value { source: ReadVarIntError<E> },
+    Rejected { source: PartsError<V> },
+    Duplicate { source: DuplicateSettingError },
+}
+
+impl<E, V> From<DecodeSettingParameterError<E>> for ReadSettingError<E, V> {
+    fn from(error: DecodeSettingParameterError<E>) -> Self {
+        match error {
+            DecodeSettingParameterError::Identifier { source } => Self::Identifier { source },
+            DecodeSettingParameterError::Http2Identifier { source } => {
+                Self::Http2Identifier { source }
+            }
+            DecodeSettingParameterError::Value { source } => Self::Value { source },
+        }
+    }
+}
+
+impl<E, V> From<InsertSettingError<V>> for ReadSettingError<E, V> {
+    fn from(error: InsertSettingError<V>) -> Self {
+        match error {
+            InsertSettingError::Rejected { source } => Self::Rejected { source },
+            InsertSettingError::Duplicate { source } => Self::Duplicate { source },
+        }
+    }
+}
+
+impl<E: ErrorCodeOf<ErrorCode>, V> ErrorCodeOf<ErrorCode> for ReadSettingError<PayloadError<E>, V> {
+    fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Identifier { source } | Self::Value { source } => source.error_code(),
+            Self::Http2Identifier { .. } | Self::Rejected { .. } | Self::Duplicate { .. } => {
+                Some(ErrorCode::H3_SETTINGS_ERROR)
+            }
+        }
+    }
+}
 
 /// Reads one whole SETTINGS frame into `settings`, and finishes its payload
 /// when every setting was read.
@@ -47,11 +93,16 @@ async fn read_settings<L: SettingList, F: Read<Metadata = ()>, A: ReceiverAccess
     let mut head = stream.frame();
     assert_eq!(head.frame_type().value(), Http3FrameType::Settings.value());
     let mut read = Vec::new();
-    while let Some(setting) = head.payload().read_setting(settings).await? {
-        read.push(setting);
+    while head.payload().remaining() > 0 {
+        let parameter = head
+            .payload()
+            .decode::<SettingParameter, _>()
+            .await
+            .map_err(ReadSettingError::from)?;
+        read.push(settings.insert(parameter)?);
     }
     assert_eq!(
-        stream.frame().into_payload().into_parts().1.remaining(),
+        stream.frame().into_payload().remaining(),
         0,
         "the payload was read to its end"
     );

@@ -12,7 +12,7 @@ use hatate_wire::{
     error_code::{ErrorCode, ErrorCodeOf},
     frame::{
         FrameType,
-        codec::{UnexpectedFrameTypeError, WriteFrameExt as _},
+        codec::UnexpectedFrameTypeError,
         set::{FramePart, FramePartOn},
     },
     registry::ClaimedValues,
@@ -25,8 +25,9 @@ use hatate_wire::{
         part::{StreamPart, StreamVerdict},
     },
 };
-use nitori_call::{ReceiverAccess, call};
-use nitori_io::{Read, Skip, Write, prelude::*};
+use nitori_call::{AsAccess, ReceiverAccess, call};
+use nitori_codec::{payload::Buffered, prelude::*};
+use nitori_io::{Combine, Read, Skip, Write, calls::ReadValue, prelude::*};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
 /// A part that exists for these tests: it claims the value 0x41 on the
@@ -74,7 +75,7 @@ macro_rules! probe_part {
         impl<L> StreamPart<$class, L> for Probe {
             type Claimed = bool;
             type Rejection = ProbeRejection;
-            type Stream<I> = ProbeStream;
+            type Stream<I, M> = ProbeStream;
             type ReadError<E> = CNil;
 
             fn judge(value: VarInt, skipped: bool) -> StreamVerdict<bool, ProbeRejection> {
@@ -85,9 +86,12 @@ macro_rules! probe_part {
                 }
             }
 
-            async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
+            async fn read<
+                I: ReceiverAccess<Family: Read<Metadata = M>>,
+                M: Combine + Unpin + Clone,
+            >(
                 skipped: bool,
-                _field: VarIntField<VarInt>,
+                _field: ReadValue<VarIntField<VarInt>, M>,
                 _io: I,
             ) -> Result<ProbeStream, CNil> {
                 Ok(ProbeStream { skipped })
@@ -217,7 +221,7 @@ fn failed<
 }
 
 /// Reads at most `take` bytes from `io`, stopping at the end.
-async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
+async fn read_some<A: AsAccess<Family: Read<Metadata = ()>>>(
     io: &mut A,
     take: usize,
 ) -> Result<Vec<u8>, <A::Family as Read>::Error> {
@@ -226,6 +230,7 @@ async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
     while bytes.len() < take {
         let want = (take - bytes.len()).min(buffer.len());
         let count = io
+            .access()
             .read(&mut &mut buffer[..want])
             .await?
             .map_or(0, |segment| segment.count.get());
@@ -296,7 +301,7 @@ macro_rules! start {
             io: &mut A,
             discard: bool,
         ) -> Result<Option<Started>, Failed> {
-            let stream = match read_bidirectional_stream::<$list, $class, _>(&mut *io).await {
+            let stream = match read_bidirectional_stream::<$list, $class, _, ()>(&mut *io).await {
                 Ok(Some(stream)) => stream,
                 Ok(None) => return Ok(None),
                 Err(error) => return Err(failed(&error)),
@@ -593,14 +598,18 @@ async fn rewrite<
     W::Error: core::fmt::Debug,
 {
     let Some(ReceivedStream::Known(Coproduct::Inl(mut request))) =
-        read_bidirectional_stream::<Plain, ClientInitiatedBidirectional, _>(&mut *io)
+        read_bidirectional_stream::<Plain, ClientInitiatedBidirectional, _, ()>(&mut *io)
             .await
             .unwrap()
     else {
         panic!("not a request stream");
     };
     loop {
-        out.write_frame(request.frame()).await.unwrap();
+        let frame = request.frame().map_payload(|payload| Buffered {
+            source: payload,
+            buffer: [0u8; 5],
+        });
+        out.encode(frame).await.unwrap();
         if request.next_frame().await.unwrap().is_none() {
             break;
         }

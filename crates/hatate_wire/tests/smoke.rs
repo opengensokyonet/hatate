@@ -5,16 +5,17 @@ use common::{Ty, known, ty};
 use frunk_core::HList;
 use hatate_wire::{
     Role,
-    frame::{Http3FrameType, control::codec::ReadGoawayFrameExt as _},
+    frame::{GoawayId, Http3FrameType},
     settings::{
         Setting,
-        codec::ReadSettingExt as _,
+        codec::SettingParameter,
         set::{Settings, SettingsOf},
     },
     stream::{FrameStream, kind::ControlStreamKind},
 };
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::Skip;
+use nitori_io::{Skip, calls::ReadValue};
+use sakuya_var_int::VarIntField;
 
 type Parts = HList![hatate_wire::Part];
 hatate_wire::assert_claims_valid!(Parts);
@@ -37,17 +38,26 @@ where
     assert_eq!(ty(frame.frame_type()), known(Http3FrameType::Settings));
     let mut count = 0;
     let mut settings = Settings::<<Parts as SettingsOf>::Settings>::new();
-    while let Some(setting) = frame.payload().read_setting(&mut settings).await.unwrap() {
+    while frame.payload().remaining() > 0 {
+        let parameter = frame
+            .payload()
+            .decode::<SettingParameter, _>()
+            .await
+            .unwrap();
+        let setting = settings.insert(parameter).unwrap();
         assert!(matches!(setting, Setting::Known(_) | Setting::Unknown(_)));
         count += 1;
     }
     let mut frame = stream.next_frame().await.unwrap().unwrap();
     assert_eq!(ty(frame.frame_type()), known(Http3FrameType::Goaway));
-    let widths = frame.widths();
-    let goaway = frame.payload().read_goaway_frame(widths).await.unwrap();
+    let goaway = frame
+        .payload()
+        .decode_to_end::<ReadValue<VarIntField<GoawayId>, ()>, _>()
+        .await
+        .unwrap();
     assert!(stream.next_frame().await.unwrap().is_none());
     let _: Ty = ty(stream.frame().frame_type());
-    (count, goaway.id().get().get().get())
+    (count, goaway.value.get().get().get())
 }
 
 #[test]

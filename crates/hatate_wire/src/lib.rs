@@ -32,8 +32,12 @@
 //! read: the bytes the stream handed over stay consumed, and a
 //! [`FramePayload`](frame::payload::FramePayload) counts them, but the
 //! integer or setting they began is lost. Reading cannot resume from there;
-//! the stream is inside the object. A frame needs no finishing: the next
-//! frame of a [`FrameStream`](stream::FrameStream) skips what is left of it.
+//! the stream is inside the object. A value read through
+//! [`FramePayload::decode`](frame::payload::FramePayload::decode) detects
+//! this: later reads of the payload fail as interrupted, and a value dropped
+//! before it read anything starts over. A frame of a
+//! [`FrameStream`](stream::FrameStream) needs no finishing: the next frame
+//! skips what is left of it.
 //!
 //! [RFC 9114]: https://www.rfc-editor.org/rfc/rfc9114.html
 //! [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9

@@ -10,8 +10,9 @@
 //! stream), bit 2 the role of the endpoint, bit 3 whether the walk uses
 //! `next_known_frame` (which skips reserved and unknown frames after the
 //! first) or `next_frame`, and bits 4 to 7 how many bytes of each payload are
-//! read; 15 is the mode that writes every frame back whole with `write_frame`
-//! instead, which must give the bytes of the frames it was read from. The
+//! read; 15 is the mode that writes every frame back whole, encoding the
+//! frame with its payload copied from the stream, instead, which must give
+//! the bytes of the frames it was read from. The
 //! rest is the stream, read with a host that skips natively and once more with
 //! a host that only reads, made to skip by `ReadSkip`; both must give what an
 //! independent reading of the bytes calls for, which includes the failure and
@@ -29,17 +30,15 @@ use frunk_core::HList;
 use hatate_wire::{
     Role,
     error_code::{ErrorCode, ErrorCodeOf},
-    frame::codec::{
-        ReadFrameError, ReadFrameHeadError, UnexpectedFrameTypeError, WriteFrameError,
-        WriteFrameExt as _,
-    },
+    frame::codec::{EncodeFrameError, ReadFrameError, ReadFrameHeadError, UnexpectedFrameTypeError},
     stream::{
         FrameStream, NextFrameError,
         kind::{ControlStreamKind, PushStreamKind, RequestStreamKind},
     },
 };
 use libfuzzer_sys::fuzz_target;
-use nitori_call::{ReceiverAccess, call};
+use nitori_call::{AsAccess, ReceiverAccess, call};
+use nitori_codec::{payload::Buffered, prelude::*};
 use nitori_io::{Min, Read, Skip, Write, adapters::ReadSkip, prelude::*};
 
 type Parts = HList![
@@ -190,7 +189,7 @@ fn next_failure<E: ErrorCodeOf<ErrorCode>>(error: &NextFrameError<E>) -> Failure
 }
 
 /// Reads at most `take` bytes from `io`, stopping at EOF.
-async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
+async fn read_some<A: AsAccess<Family: Read<Metadata = ()>>>(
     io: &mut A,
     take: usize,
 ) -> Result<Vec<u8>, <A::Family as Read>::Error> {
@@ -199,6 +198,7 @@ async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
     while bytes.len() < take {
         let want = Ord::min(take - bytes.len(), buffer.len());
         let count = io
+            .access()
             .read(&mut &mut buffer[..want])
             .await?
             .map_or(0, |segment| segment.count.get());
@@ -229,9 +229,13 @@ macro_rules! walk {
             let mut frame = stream.frame();
             let frame_type = frame.frame_type().value().get();
             if take == WRITE_BACK {
-                match $out.write_frame(frame).await {
-                    Ok(()) => seen.push((frame_type, Vec::new())),
-                    Err(WriteFrameError::Payload { .. }) => return (seen, Some(Failure::Payload)),
+                let frame = frame.map_payload(|payload| Buffered {
+                    source: payload,
+                    buffer: [0u8; 7],
+                });
+                match $out.encode(frame).await {
+                    Ok(_) => seen.push((frame_type, Vec::new())),
+                    Err(EncodeFrameError::Payload { .. }) => return (seen, Some(Failure::Payload)),
                     Err(error) => panic!("a frame that was read was not written: {error}"),
                 }
             } else {

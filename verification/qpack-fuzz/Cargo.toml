@@ -14,6 +14,7 @@ resolver = "3"
 [dependencies]
 nitori_io = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "0de5f36b921c891815d138226c6180c6aa70953b", default-features = false }
 nitori_call = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "0de5f36b921c891815d138226c6180c6aa70953b", default-features = false }
+nitori_codec = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "0de5f36b921c891815d138226c6180c6aa70953b", default-features = false }
 hatate_qpack = { path = "../../crates/hatate_qpack" }
 hatate_wire = { path = "../../crates/hatate_wire" }
 hatate_wire_datagram = { path = "../../crates/hatate_wire_datagram" }

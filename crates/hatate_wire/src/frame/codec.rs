@@ -1,7 +1,8 @@
-//! Reading and checking frame heads, writing frames and frame heads, and
-//! reading the Push ID of a PUSH_PROMISE.
+//! Reading and checking frame heads, decoding and encoding frames, and
+//! writing frame heads.
 use super::{
-    Frame, FrameType, FrameWidths, Http2FrameType, Http2FrameTypeError, Http3FrameType, PushId,
+    Frame, FrameType, Http2FrameType, Http2FrameTypeError,
+    payload::{FramePayload, PayloadError},
     set::{FrameKind, FrameSetOn},
 };
 use crate::{
@@ -10,30 +11,32 @@ use crate::{
     stream::kind::StreamKind,
 };
 use core::num::NonZeroU64;
-use nitori_call::{ReceiverAccess, call};
-use nitori_codec::prelude::*;
-use nitori_io::{ExactLen, calls::WriteAllError, prelude::*};
+use nitori_call::{AsAccess, ReceiverAccess};
+use nitori_codec::{DecodeFrom, EncodeInto, prelude::*};
+use nitori_io::{Combine, Read, Write, calls::ReadValue};
 use sakuya_var_int::{
     VarInt, VarIntField, VarIntWidth, VarIntWidthError,
     stream::{ReadVarIntError, WriteVarIntError},
 };
 use snafu::{ResultExt, Snafu};
 
-/// The Type of the next frame, or `None` at the end of the stream.
-pub(crate) async fn read_type<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
-    io: &mut I,
-) -> Result<Option<VarIntField<VarInt>>, ReadFrameError<<I::Family as Read>::Error>> {
-    match io.decode::<VarIntField<VarInt>>().await {
+/// The Type of the next frame, with the metadata of its bytes, or `None` at
+/// the end of the stream.
+pub(crate) async fn read_type<S: AsAccess<Family: Read<Metadata = M>>, M: Combine + Unpin>(
+    io: S,
+) -> Result<Option<ReadValue<VarIntField<VarInt>, M>>, ReadFrameError<<S::Family as Read>::Error>> {
+    match ReadValue::<VarIntField<VarInt>, M>::decode_from(io).await {
         Ok(field) => Ok(Some(field)),
         Err(error) if error.is_incomplete() && error.completed() == 0 => Ok(None),
         Err(source) => Err(ReadFrameError::Type { source }),
     }
 }
 
-pub(crate) async fn read_length<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
-    io: &mut I,
-) -> Result<VarIntField<VarInt>, ReadFrameError<<I::Family as Read>::Error>> {
-    io.decode::<VarIntField<VarInt>>()
+/// The Length of a frame, with the metadata of its bytes.
+pub(crate) async fn read_length<S: AsAccess<Family: Read<Metadata = M>>, M: Combine + Unpin>(
+    io: S,
+) -> Result<ReadValue<VarIntField<VarInt>, M>, ReadFrameError<<S::Family as Read>::Error>> {
+    ReadValue::<VarIntField<VarInt>, M>::decode_from(io)
         .await
         .context(read_frame_error::LengthSnafu)
 }
@@ -186,22 +189,26 @@ impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadFrameHeadError<E>
 /// Writes the Type and Length of a frame, each at its width: the step every
 /// writer of a frame takes before its payload, which must follow, of exactly
 /// `length` bytes. A type of HTTP/2 is reported before anything is written.
-pub(crate) async fn write_head<F: Write<Report = ()>, A: ReceiverAccess<Family = F>>(
+/// The result is the merged report of writing the Type and the Length.
+pub(crate) async fn write_head<F: Write<Report: Combine>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     type_field: VarIntField<VarInt>,
     length: VarIntField<VarInt>,
-) -> Result<(), WriteFrameHeadError<F::Error>> {
+) -> Result<F::Report, WriteFrameHeadError<F::Error>> {
     if let Some(frame_type) = Http2FrameType::of(type_field.get()) {
         return Err(WriteFrameHeadError::Http2Type {
             source: Http2FrameTypeError::new(frame_type),
         });
     }
-    io.encode(type_field)
+    let r#type = io
+        .encode(type_field)
         .await
         .context(write_frame_head_error::TypeSnafu)?;
-    io.encode(length)
+    let length = io
+        .encode(length)
         .await
-        .context(write_frame_head_error::LengthSnafu)
+        .context(write_frame_head_error::LengthSnafu)?;
+    Ok(r#type.combine(length))
 }
 
 /// Failures of writing the Type and Length of a frame.
@@ -229,178 +236,268 @@ pub enum WriteFrameHeadError<E> {
     },
 }
 
-/// Writes `frame`: its Type and Length, each at its width, and then its
-/// payload, a source of exactly Length bytes, such as the bytes of a DATA
-/// or HEADERS frame, or of a frame of a type this crate does not read.
+/// Decodes a frame in stages: the Type and the Length now, and the payload,
+/// a [`FramePayload`] that holds the source, for the caller to read
+/// ([RFC 9114 §7.1]). The Type is read as a `VarInt` and converted to `T`.
 ///
-/// The Type is any type that gives its value on the wire: a frame read from
-/// a [`FrameStream`](crate::stream::FrameStream), whose type is a
-/// [`FrameType`], is written back as it was read; write the types of RFC 9114
-/// as [`Http3FrameType`], and others as a raw `VarInt`. A type of HTTP/2 is
-/// rejected. Pass the payload as a `&mut` borrow to keep it.
+/// To read frame after frame, with the checks of a kind of stream and the
+/// skipping of what a frame leaves, read them on a
+/// [`FrameStream`](crate::stream::FrameStream).
 ///
-/// # Errors
-///
-/// [`WriteFrameError`]. A payload whose exact length is not the Length and
-/// a type of HTTP/2 are reported before anything is written; a failure
-/// after that leaves the stream inside the frame.
-#[call(sync)]
-pub async fn write_frame<
+/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+impl<S, T, M> DecodeFrom<S> for Frame<T, FramePayload<S>, M>
+where
+    S: AsAccess<Family: Read<Metadata = M>>,
+    M: Combine + Unpin,
     T: Copy + Into<VarInt> + TryFrom<VarInt>,
-    R: Read + ExactLen<LengthError = !>,
-    P: ReceiverAccess<Family = R>,
-    F: Write<Report = ()>,
-    A: ReceiverAccess<Family = F>,
->(
-    io: &mut A,
-    frame: Frame<T, P>,
-) -> Result<(), WriteFrameError<R::Error, F::Error>>
-where
-    <R as ExactLen>::Length: TryInto<u64>,
 {
-    let length = frame.length;
-    // invariant: the field held the value at its width when it was made.
-    let r#type = VarIntField::new(frame.r#type.to_var_int(), frame.r#type.width())
-        .expect("a field's width holds its value");
-    let mut payload = frame.payload;
-    let Ok(remaining) = payload.remaining_len().await;
-    // A length that does not fit a u64 is not the Length either.
-    let payload_length = remaining.try_into().ok();
-    let declared = length.get().get();
-    if payload_length != Some(declared) {
-        return Err(WriteFrameError::Length {
-            source: FrameLengthMismatchError {
-                length: length.get(),
-                payload: payload_length,
+    type Error = DecodeFrameError<<S::Family as Read>::Error, T::Error>;
+
+    async fn decode_from(mut source: S) -> Result<Self, Self::Error> {
+        let r#type = ReadValue::<VarIntField<VarInt>, M>::decode_from(source.access())
+            .await
+            .map_err(|source| DecodeFrameError::Head {
+                source: ReadFrameError::Type { source },
+            })?;
+        let value = r#type.value.get();
+        if let Some(frame_type) = Http2FrameType::of(value) {
+            return Err(DecodeFrameError::Http2Type {
+                source: Http2FrameTypeError::new(frame_type),
+            });
+        }
+        let frame_type = T::try_from(value).map_err(|source| DecodeFrameError::Type { source })?;
+        let length = read_length(source.access())
+            .await
+            .map_err(|source| DecodeFrameError::Head { source })?;
+        // invariant: the frame type is the value that was read at this width.
+        let type_field =
+            VarIntField::new(frame_type, r#type.value.width()).expect("the width held the value");
+        let payload = FramePayload::new(source, length.value.get().get());
+        Ok(Frame::from_parts(
+            ReadValue {
+                value: type_field,
+                metadata: r#type.metadata,
             },
-        });
-    }
-    write_head(io, r#type, length)
-        .await
-        .context(write_frame_error::HeadSnafu)?;
-    copy_payload(io, &mut payload, declared)
-        .await
-        .context(write_frame_error::PayloadSnafu)
-}
-
-/// Failures of [`write_frame`].
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum WriteFrameError<R, W> {
-    /// The exact length of the payload is not the Length.
-    #[snafu(transparent)]
-    Length {
-        /// The Length and the length of the payload.
-        source: FrameLengthMismatchError,
-    },
-    /// The head could not be written.
-    #[snafu(display("could not write frame head"))]
-    Head {
-        /// The failure of writing the head.
-        source: WriteFrameHeadError<W>,
-    },
-    /// The payload could not be copied from its source.
-    #[snafu(display("could not write frame payload"))]
-    Payload {
-        /// The failure of copying it.
-        source: CopyPayloadError<R, W>,
-    },
-}
-
-/// The exact length of the payload of a frame to write is not its Length.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
-#[snafu(display("frame payload length is not the Length {}", length.get()))]
-pub struct FrameLengthMismatchError {
-    length: VarInt,
-    payload: Option<u64>,
-}
-
-impl FrameLengthMismatchError {
-    /// The value of the Length.
-    pub const fn length(&self) -> VarInt {
-        self.length
-    }
-
-    /// The exact length the payload reports, if it fits a `u64`; it is not
-    /// the Length.
-    pub const fn payload(&self) -> Option<u64> {
-        self.payload
+            length,
+            payload,
+        ))
     }
 }
 
-/// Writes a PUSH_PROMISE frame: `push_id`, then the encoded field section
-/// that `section` holds. The Length is the length of both, at the width in
-/// `widths`.
-///
-/// # Errors
-///
-/// [`WritePushPromiseFrameError`]. A Length that cannot be written is
-/// reported before anything is written; a failure after that leaves the
-/// stream inside the frame.
-#[call(sync)]
-pub async fn write_push_promise_frame<
-    R: Read + ExactLen<LengthError = !>,
-    P: ReceiverAccess<Family = R>,
-    F: Write<Report = ()>,
-    A: ReceiverAccess<Family = F>,
->(
-    io: &mut A,
-    section: &mut P,
-    widths: FrameWidths,
-    push_id: VarIntField<PushId>,
-) -> Result<(), WritePushPromiseFrameError<R::Error, F::Error>>
+/// Decodes a whole frame: the Type and the Length, then the payload as a
+/// `P` read from it ([`FramePayload::decode_to_end`]), which must take all of
+/// it, such as `ReadValue<VarIntField<GoawayId>, M>` for a GOAWAY frame.
+impl<S, T, P, M, E> DecodeFrom<S> for Frame<T, P, M>
 where
-    <R as ExactLen>::Length: TryInto<u64>,
+    S: AsAccess<Family: Read<Metadata = M>>,
+    M: Combine + Unpin,
+    T: Copy + Into<VarInt> + TryFrom<VarInt>,
+    P: for<'a> DecodeFrom<&'a mut FramePayload<S>, Error = E>,
 {
-    let section_length = exact_length(section)
-        .await
-        .context(write_push_promise_frame_error::LengthSnafu)?;
-    let length_field = length_field(
-        section_length,
-        push_id.encoded_len() as u64,
-        widths.length_width(),
-    )
-    .context(write_push_promise_frame_error::LengthSnafu)?;
-    let type_field = VarIntField::new(Http3FrameType::PushPromise.value(), widths.type_width())
-        .expect("every width holds the frame type 0x05");
-    write_head(io, type_field, length_field)
-        .await
-        .context(write_push_promise_frame_error::HeadSnafu)?;
-    io.encode(push_id)
-        .await
-        .context(write_push_promise_frame_error::PushIdSnafu)?;
-    copy_payload(io, section, section_length)
-        .await
-        .context(write_push_promise_frame_error::SectionSnafu)
+    type Error = DecodeWholeFrameError<<S::Family as Read>::Error, T::Error, E>;
+
+    async fn decode_from(source: S) -> Result<Self, Self::Error> {
+        let Frame {
+            r#type,
+            length,
+            payload: mut staged,
+        } = Frame::<T, FramePayload<S>, M>::decode_from(source)
+            .await
+            .map_err(|source| DecodeWholeFrameError::Frame { source })?;
+        let payload = staged
+            .decode_to_end::<P, E>()
+            .await
+            .map_err(|source| DecodeWholeFrameError::Payload { source })?;
+        Ok(Frame::from_parts(r#type, length, payload))
+    }
 }
 
-/// Failures of [`write_push_promise_frame`].
+/// Failures of decoding a frame in stages, from a source whose failures are
+/// `E`, into a frame whose Type converts from a `VarInt` failing with `T`.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-pub enum WritePushPromiseFrameError<R, W> {
-    /// The Length cannot state the push ID and the field section.
-    #[snafu(display("could not encode PUSH_PROMISE length"))]
-    Length {
-        /// Why the Length cannot be written.
-        source: FrameLengthError,
-    },
-    /// The head could not be written.
-    #[snafu(display("could not write PUSH_PROMISE head"))]
+pub enum DecodeFrameError<E, T> {
+    /// The Type or Length could not be read.
+    #[snafu(display("could not read frame head"))]
     Head {
-        /// The failure of writing the head.
-        source: WriteFrameHeadError<W>,
+        /// The failure of reading it.
+        source: ReadFrameError<E>,
     },
-    /// The push ID could not be written.
-    #[snafu(display("could not write push ID"))]
-    PushId {
+    /// The type is one HTTP/2 defines and HTTP/3 does not.
+    #[snafu(display("received a frame type of HTTP/2"))]
+    Http2Type {
+        /// The type received.
+        source: Http2FrameTypeError,
+    },
+    /// The type is not one the Type field holds, such as a frame of another
+    /// type for a field of one frame type ([`FrameTypeMismatchError`](super::FrameTypeMismatchError)).
+    #[snafu(display("frame type does not convert to the type of the field"))]
+    Type {
+        /// The failure of converting it.
+        source: T,
+    },
+}
+
+/// The code of [`ReadFrameError`] for a head that could not be read;
+/// H3_FRAME_UNEXPECTED for a type of HTTP/2 ([RFC 9114 §7.2.8]); `None`
+/// for a type of another frame, which is not an error of the connection.
+///
+/// [RFC 9114 §7.2.8]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
+impl<E: ErrorCodeOf<ErrorCode>, T> ErrorCodeOf<ErrorCode> for DecodeFrameError<E, T> {
+    fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Head { source } => source.error_code(),
+            Self::Http2Type { .. } => Some(ErrorCode::H3_FRAME_UNEXPECTED),
+            Self::Type { .. } => None,
+        }
+    }
+}
+
+/// Failures of decoding a whole frame: as [`DecodeFrameError`], and of
+/// reading its payload, failing with `P`.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum DecodeWholeFrameError<E, T, P> {
+    /// The frame could not be decoded up to its payload.
+    #[snafu(display("could not decode frame"))]
+    Frame {
+        /// The failure of decoding it.
+        source: DecodeFrameError<E, T>,
+    },
+    /// The payload could not be read whole.
+    #[snafu(display("could not decode frame payload"))]
+    Payload {
+        /// The failure of reading it.
+        source: DecodeToEndError<P>,
+    },
+}
+
+/// The code of the failure of decoding the frame or its payload.
+impl<E: ErrorCodeOf<ErrorCode>, T, P: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode>
+    for DecodeWholeFrameError<E, T, P>
+{
+    fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Frame { source } => source.error_code(),
+            Self::Payload { source } => source.error_code(),
+        }
+    }
+}
+
+/// Failures of [`FramePayload::decode_to_end`]: of reading the value,
+/// failing with `E`, or of the payload going on after it.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum DecodeToEndError<E> {
+    /// The value could not be read.
+    #[snafu(display("could not read the value of the frame payload"))]
+    Value {
+        /// The value's failure.
+        source: E,
+    },
+    /// Bytes follow the value within the payload.
+    #[snafu(display("frame payload continues for {left} bytes after its value"))]
+    Unread {
+        /// How many.
+        left: NonZeroU64,
+    },
+}
+
+/// H3_FRAME_ERROR when the payload goes on after its value ([RFC 9114
+/// §7.1]); otherwise the code of the value's failure.
+///
+/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for DecodeToEndError<E> {
+    fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Value { source } => source.error_code(),
+            Self::Unread { .. } => Some(ErrorCode::H3_FRAME_ERROR),
+        }
+    }
+}
+
+/// H3_FRAME_ERROR when the payload of a frame ends inside the integer
+/// ([RFC 9114 §7.1]); otherwise the code of the payload's failure, such as
+/// H3_FRAME_ERROR when the stream ended inside the frame. `None` when the
+/// stream failed.
+///
+/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadVarIntError<PayloadError<E>> {
+    fn error_code(&self) -> Option<ErrorCode> {
+        payload_integer_error_code(self)
+    }
+}
+
+/// Encodes a frame: its Type and Length, each at its width, and then its
+/// payload, which encodes itself into the sink. The output is the merged
+/// report of the head and the payload's output.
+impl<S, T, P, M> EncodeInto<S> for Frame<T, P, M>
+where
+    S: AsAccess<Family: Write<Report: Combine>>,
+    T: Copy + Into<VarInt> + TryFrom<VarInt>,
+    P: EncodeInto<S>,
+{
+    type Output = FrameOutput<<S::Family as Write>::Report, P::Output>;
+    type Error = EncodeFrameError<<S::Family as Write>::Error, P::Error>;
+
+    async fn encode_into(self, mut sink: S) -> Result<Self::Output, Self::Error> {
+        let r#type = self
+            .r#type
+            .value
+            .encode_into(sink.access())
+            .await
+            .context(encode_frame_error::TypeSnafu)?;
+        let length = self
+            .length
+            .value
+            .encode_into(sink.access())
+            .await
+            .context(encode_frame_error::LengthSnafu)?;
+        let payload = self
+            .payload
+            .encode_into(sink)
+            .await
+            .context(encode_frame_error::PayloadSnafu)?;
+        Ok(FrameOutput {
+            head: r#type.combine(length),
+            payload,
+        })
+    }
+}
+
+/// What encoding a frame produced: the merged report `R` of writing its Type
+/// and Length, and the output `O` of its payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FrameOutput<R, O> {
+    /// The merged report of writing the Type and Length.
+    pub head: R,
+    /// What encoding the payload produced.
+    pub payload: O,
+}
+
+/// Failures of encoding a frame into a sink whose failures are `W`, with a
+/// payload whose failures are `P`. A failure leaves the stream inside the
+/// frame.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum EncodeFrameError<W, P> {
+    /// The Type could not be written.
+    #[snafu(display("could not write frame type"))]
+    Type {
         /// The failure of writing the integer.
         source: WriteVarIntError<W>,
     },
-    /// The field section could not be copied from its source.
-    #[snafu(display("could not write PUSH_PROMISE field section"))]
-    Section {
-        /// The failure of copying it.
-        source: CopyPayloadError<R, W>,
+    /// The Length could not be written.
+    #[snafu(display("could not write frame length"))]
+    Length {
+        /// The failure of writing the integer.
+        source: WriteVarIntError<W>,
+    },
+    /// The payload could not be written.
+    #[snafu(display("could not write frame payload"))]
+    Payload {
+        /// The payload's failure.
+        source: P,
     },
 }
 
@@ -419,42 +516,6 @@ pub enum FrameLengthError {
     },
 }
 
-/// Copying the bytes of a payload from its source to the stream failed.
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum CopyPayloadError<R, W> {
-    /// The source ended before the length it reported.
-    #[snafu(display("frame payload source ended with {missing} bytes missing"))]
-    ShortSource {
-        /// Bytes of the reported length that the source did not supply.
-        missing: NonZeroU64,
-    },
-    /// The source failed.
-    #[snafu(display("could not read frame payload source"))]
-    Read {
-        /// The source's error.
-        source: R,
-    },
-    /// The bytes could not be written.
-    #[snafu(display("could not write frame payload"))]
-    Send {
-        /// The failure and the bytes accepted in this write.
-        source: WriteAllError<W>,
-    },
-}
-
-/// The exact remaining length of `source`.
-async fn exact_length<R: Read + ExactLen<LengthError = !>, P: ReceiverAccess<Family = R>>(
-    source: &mut P,
-) -> Result<u64, FrameLengthError>
-where
-    <R as ExactLen>::Length: TryInto<u64>,
-{
-    let Ok(length) = source.remaining_len().await;
-    // A length that does not fit a u64 exceeds 2^62 - 1 too.
-    length.try_into().map_err(|_| FrameLengthError::OutOfRange)
-}
-
 /// The Length field for `length` bytes from the source after `prefix`
 /// bytes of fields.
 pub(crate) fn length_field(
@@ -467,96 +528,6 @@ pub(crate) fn length_field(
         .and_then(|total| VarInt::new(total).ok())
         .ok_or(FrameLengthError::OutOfRange)?;
     VarIntField::new(total, width).context(frame_length_error::WidthSnafu)
-}
-
-/// Copies exactly `length` bytes from `source` to `io`.
-async fn copy_payload<
-    R: Read,
-    P: ReceiverAccess<Family = R>,
-    F: Write<Report = ()>,
-    A: ReceiverAccess<Family = F>,
->(
-    io: &mut A,
-    source: &mut P,
-    length: u64,
-) -> Result<(), CopyPayloadError<R::Error, F::Error>> {
-    let mut remaining = length;
-    let mut buffer = [0; 1024];
-    while let Some(missing) = NonZeroU64::new(remaining) {
-        let request = Ord::min(remaining, buffer.len() as u64) as usize;
-        let Some(segment) = source
-            .read(&mut &mut buffer[..request])
-            .await
-            .context(copy_payload_error::ReadSnafu)?
-        else {
-            return Err(CopyPayloadError::ShortSource { missing });
-        };
-        let count = segment.count.get();
-        // invariant: a read into a slice of `request` bytes fills at most
-        // `request`, which is at most `remaining`.
-        remaining = u64::try_from(count)
-            .ok()
-            .and_then(|count| remaining.checked_sub(count))
-            .expect("a read fills at most its destination");
-        io.write_all(&buffer[..count])
-            .await
-            .context(copy_payload_error::SendSnafu)?;
-    }
-    Ok(())
-}
-
-/// Reads the Push ID at the start of the payload of a PUSH_PROMISE frame
-/// ([RFC 9114 §7.2.5]). The encoded field section follows it, to the end of
-/// the payload.
-///
-/// `io` is the payload of the frame, a [`FramePayload`](crate::frame::payload::FramePayload) composed onto
-/// the request stream.
-///
-/// A read dropped before it completes may have taken bytes of the Push ID,
-/// and a later read would give a wrong one without failing: after such a
-/// drop, do not read this frame again, and skip it with
-/// [`FrameStream::next_frame`](crate::stream::FrameStream::next_frame).
-///
-/// # Errors
-///
-/// [`ReadPushPromisePushIdError`]; its [`ErrorCodeOf::error_code`] gives
-/// the connection error it calls for.
-///
-/// [RFC 9114 §7.2.5]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.5
-#[call(sync)]
-pub async fn read_push_promise_push_id<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
-    io: &mut A,
-) -> Result<VarIntField<PushId>, ReadPushPromisePushIdError<F::Error>> {
-    io.decode::<VarIntField<PushId>>()
-        .await
-        .context(ReadPushPromisePushIdSnafu)
-}
-
-/// The Push ID of a PUSH_PROMISE could not be read: the payload ended
-/// before it, or the stream failed.
-#[derive(Debug, Snafu)]
-#[snafu(display("could not read the push ID of PUSH_PROMISE"))]
-pub struct ReadPushPromisePushIdError<E> {
-    source: ReadVarIntError<E>,
-}
-
-impl<E> ReadPushPromisePushIdError<E> {
-    /// The failure of reading the integer.
-    pub const fn read_error(&self) -> &ReadVarIntError<E> {
-        &self.source
-    }
-}
-
-/// H3_FRAME_ERROR when the payload is shorter than the Push ID
-/// ([RFC 9114 §7.1]); otherwise the code of the source's failure, such as
-/// H3_FRAME_ERROR when the stream ended inside the frame. `None` when the
-/// stream failed.
-///
-/// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
-impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadPushPromisePushIdError<E> {
-    fn error_code(&self) -> Option<ErrorCode> {
-        payload_integer_error_code(&self.source)
-    }
 }
 
 /// The connection error for a failure reading an integer from a frame

@@ -24,7 +24,7 @@ use hatate_wire::{
     },
 };
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::{Read, Skip};
+use nitori_io::{Combine, Read, Skip, calls::ReadValue};
 use sakuya_var_int::{VarInt, VarIntField};
 
 const TYPE: u32 = 0x41;
@@ -56,7 +56,7 @@ macro_rules! parts {
         impl<L> StreamPart<ClientInitiatedBidirectional, L> for $part {
             type Claimed = ();
             type Rejection = CNil;
-            type Stream<I> = Taken;
+            type Stream<I, M> = Taken;
             type ReadError<E> = CNil;
 
             fn judge(value: VarInt, _skipped: bool) -> StreamVerdict<(), CNil> {
@@ -67,9 +67,12 @@ macro_rules! parts {
                 }
             }
 
-            async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
+            async fn read<
+                I: ReceiverAccess<Family: Read<Metadata = M>>,
+                M: Combine + Unpin + Clone,
+            >(
                 _claimed: (),
-                _field: VarIntField<VarInt>,
+                _field: ReadValue<VarIntField<VarInt>, M>,
                 _io: I,
             ) -> Result<Taken, CNil> {
                 Ok(Taken)
@@ -79,16 +82,19 @@ macro_rules! parts {
         impl<L> StreamPart<ServerInitiatedBidirectional, L> for $part {
             type Claimed = ();
             type Rejection = CNil;
-            type Stream<I> = Taken;
+            type Stream<I, M> = Taken;
             type ReadError<E> = CNil;
 
             fn judge(_value: VarInt, _skipped: bool) -> StreamVerdict<(), CNil> {
                 StreamVerdict::NotClaimed
             }
 
-            async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
+            async fn read<
+                I: ReceiverAccess<Family: Read<Metadata = M>>,
+                M: Combine + Unpin + Clone,
+            >(
                 _claimed: (),
-                _field: VarIntField<VarInt>,
+                _field: ReadValue<VarIntField<VarInt>, M>,
                 _io: I,
             ) -> Result<Taken, CNil> {
                 Ok(Taken)
@@ -134,7 +140,7 @@ macro_rules! start {
         >(
             io: &mut A,
         ) -> Whose {
-            match read_bidirectional_stream::<$list, ClientInitiatedBidirectional, _>(&mut *io)
+            match read_bidirectional_stream::<$list, ClientInitiatedBidirectional, _, ()>(&mut *io)
                 .await
             {
                 Ok(Some(ReceivedStream::Known($known))) => $whose,

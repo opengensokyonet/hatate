@@ -4,9 +4,10 @@
 //! identifier and a value. Each setting a part defines is a type of its own
 //! ([`KeyedSetting`]); a part lists its types ([`set::SettingsPart`]), and a
 //! connection's list of parts joins them into one list
-//! ([`set::SettingsOf`]). [`codec::read_setting`] reads one setting at a
-//! time from the payload into a [`set::Settings`], which holds one slot for
-//! each type of the list: the type that claims the identifier checks the
+//! ([`set::SettingsOf`]). The payload is read one parameter at a time
+//! ([`codec::SettingParameter`]) and each is inserted
+//! ([`set::Settings::insert`]) into a [`set::Settings`], which holds one slot
+//! for each type of the list: the type that claims the identifier checks the
 //! value, and an identifier that a type has already taken in the frame is a
 //! connection error of type H3_SETTINGS_ERROR. An identifier that no type
 //! claims is handed to the caller as [`Setting::Unknown`], to be ignored

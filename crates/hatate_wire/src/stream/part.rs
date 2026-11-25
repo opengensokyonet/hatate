@@ -14,7 +14,7 @@ use frunk_core::{
     hlist::{HCons, HNil},
 };
 use nitori_call::ReceiverAccess;
-use nitori_io::Read;
+use nitori_io::{Combine, Read, calls::ReadValue};
 use sakuya_var_int::{VarInt, VarIntField};
 
 /// A part's verdict on the value at the start of a stream: `T` is the value
@@ -53,8 +53,9 @@ pub trait StreamPart<C: StreamClass, L> {
     /// [`ErrorCodeOf`](crate::error_code::ErrorCodeOf) giving the
     /// connection error; `CNil` for a part that rejects none.
     type Rejection;
-    /// A stream of this part, on the access `I`.
-    type Stream<I>;
+    /// A stream of this part, on the access `I`, whose bytes carry the
+    /// metadata `M`.
+    type Stream<I, M>;
     /// The failures of reading what follows the value, from a source whose
     /// failures are `E`.
     type ReadError<E>;
@@ -72,14 +73,14 @@ pub trait StreamPart<C: StreamClass, L> {
     /// [`StreamTypePart::STREAM_TYPES`]: crate::stream_type::StreamTypePart::STREAM_TYPES
     fn judge(value: VarInt, skipped: bool) -> StreamVerdict<Self::Claimed, Self::Rejection>;
 
-    /// Reads what follows the value `claimed`, read as `field`, from `io`,
-    /// and gives the stream of this part.
+    /// Reads what follows the value `claimed`, read as `field` with the
+    /// metadata of its bytes, from `io`, and gives the stream of this part.
     #[allow(clippy::type_complexity)] // The part's stream and failure on `I`.
-    fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
+    fn read<I: ReceiverAccess<Family: Read<Metadata = M>>, M: Combine + Unpin + Clone>(
         claimed: Self::Claimed,
-        field: VarIntField<VarInt>,
+        field: ReadValue<VarIntField<VarInt>, M>,
         io: I,
-    ) -> impl Future<Output = Result<Self::Stream<I>, Self::ReadError<<I::Family as Read>::Error>>>;
+    ) -> impl Future<Output = Result<Self::Stream<I, M>, Self::ReadError<<I::Family as Read>::Error>>>;
 }
 
 /// What a list of parts, `HNil` or `HCons<P, Ps>`, makes of the start of a
@@ -97,7 +98,7 @@ pub trait StreamSet<C: StreamClass, L> {
     /// Why a part of this list rejects a stream.
     type Rejection;
     /// A stream of a part of this list.
-    type Stream<I>;
+    type Stream<I, M>;
     /// A failure of a part of this list.
     type ReadError<E>;
 
@@ -106,26 +107,26 @@ pub trait StreamSet<C: StreamClass, L> {
 
     /// Reads what follows `claimed`, as the part that claims it does.
     #[allow(clippy::type_complexity)] // The part's stream and failure on `I`.
-    fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
+    fn read<I: ReceiverAccess<Family: Read<Metadata = M>>, M: Combine + Unpin + Clone>(
         claimed: Self::Claimed,
-        field: VarIntField<VarInt>,
+        field: ReadValue<VarIntField<VarInt>, M>,
         io: I,
-    ) -> impl Future<Output = Result<Self::Stream<I>, Self::ReadError<<I::Family as Read>::Error>>>;
+    ) -> impl Future<Output = Result<Self::Stream<I, M>, Self::ReadError<<I::Family as Read>::Error>>>;
 }
 
 impl<C: StreamClass, L> StreamSet<C, L> for HNil {
     type Claimed = CNil;
     type Rejection = CNil;
-    type Stream<I> = CNil;
+    type Stream<I, M> = CNil;
     type ReadError<E> = CNil;
 
     fn judge(_value: VarInt, _skipped: bool) -> StreamVerdict<CNil, CNil> {
         StreamVerdict::NotClaimed
     }
 
-    async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
+    async fn read<I: ReceiverAccess<Family: Read<Metadata = M>>, M: Combine + Unpin + Clone>(
         claimed: CNil,
-        _field: VarIntField<VarInt>,
+        _field: ReadValue<VarIntField<VarInt>, M>,
         _io: I,
     ) -> Result<CNil, CNil> {
         match claimed {}
@@ -135,7 +136,7 @@ impl<C: StreamClass, L> StreamSet<C, L> for HNil {
 impl<C: StreamClass, L, P: StreamPart<C, L>, Ps: StreamSet<C, L>> StreamSet<C, L> for HCons<P, Ps> {
     type Claimed = Coproduct<P::Claimed, Ps::Claimed>;
     type Rejection = Coproduct<P::Rejection, Ps::Rejection>;
-    type Stream<I> = Coproduct<P::Stream<I>, Ps::Stream<I>>;
+    type Stream<I, M> = Coproduct<P::Stream<I, M>, Ps::Stream<I, M>>;
     type ReadError<E> = Coproduct<P::ReadError<E>, Ps::ReadError<E>>;
 
     fn judge(value: VarInt, skipped: bool) -> StreamVerdict<Self::Claimed, Self::Rejection> {
@@ -151,11 +152,11 @@ impl<C: StreamClass, L, P: StreamPart<C, L>, Ps: StreamSet<C, L>> StreamSet<C, L
         }
     }
 
-    async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
+    async fn read<I: ReceiverAccess<Family: Read<Metadata = M>>, M: Combine + Unpin + Clone>(
         claimed: Self::Claimed,
-        field: VarIntField<VarInt>,
+        field: ReadValue<VarIntField<VarInt>, M>,
         io: I,
-    ) -> Result<Self::Stream<I>, Self::ReadError<<I::Family as Read>::Error>> {
+    ) -> Result<Self::Stream<I, M>, Self::ReadError<<I::Family as Read>::Error>> {
         match claimed {
             Coproduct::Inl(claimed) => P::read(claimed, field, io)
                 .await

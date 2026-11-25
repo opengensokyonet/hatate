@@ -161,17 +161,19 @@ pub struct QpackEncoderStream<A> {
     stream: EncoderStream<Composed<A, CriticalStream>>,
 }
 
-impl<A: ReceiverAccess> QpackEncoderStream<A>
-where
-    Composed<A, CriticalStream>: ReceiverAccess<Family: Read<Metadata = ()>>,
-{
+impl<A> QpackEncoderStream<A> {
     /// The stream on `io`, right after its type. Nothing is read.
     pub fn new(io: A) -> Self {
         Self {
             stream: EncoderStream::new(Composed::new(io, CriticalStream)),
         }
     }
+}
 
+impl<A: ReceiverAccess> QpackEncoderStream<A>
+where
+    Composed<A, CriticalStream>: ReceiverAccess<Family: Read<Metadata = ()>>,
+{
     /// Reads the start of the next instruction, as
     /// [`EncoderStream::next_instruction`] does. The stream never ends: its
     /// end, at the boundary or inside the instruction, is
@@ -213,17 +215,19 @@ pub struct QpackDecoderStream<A> {
     stream: DecoderStream<Composed<A, CriticalStream>>,
 }
 
-impl<A: ReceiverAccess> QpackDecoderStream<A>
-where
-    Composed<A, CriticalStream>: ReceiverAccess<Family: Read<Metadata = ()>>,
-{
+impl<A> QpackDecoderStream<A> {
     /// The stream on `io`, right after its type. Nothing is read.
     pub fn new(io: A) -> Self {
         Self {
             stream: DecoderStream::new(Composed::new(io, CriticalStream)),
         }
     }
+}
 
+impl<A: ReceiverAccess> QpackDecoderStream<A>
+where
+    Composed<A, CriticalStream>: ReceiverAccess<Family: Read<Metadata = ()>>,
+{
     /// Reads the next instruction, as [`DecoderStream::next_instruction`]
     /// does. The stream never ends: its end is [`CriticalStreamError::Closed`]
     /// as the failure of the stream.
