@@ -7,7 +7,7 @@ use core::{
     task::{Context, Poll, ready},
 };
 use nitori_call::{Compose, Composed, ReceiverAccess, ReceiverFamily};
-use nitori_io::{Read, ReadChunk};
+use nitori_io::{ChunkSegment, Read, ReadChunk, ReadSegment};
 use snafu::Snafu;
 
 use crate::huffman::{self, SymbolDecoder};
@@ -87,6 +87,10 @@ pub enum InputError<E> {
     Failed,
 }
 
+type RawPoll<F> =
+    Poll<Result<Option<ReadSegment<<F as Read>::Metadata>>, InputError<<F as Read>::Error>>>;
+type HuffmanPoll<F> = Poll<Result<Option<ReadSegment<()>>, HuffmanReadError<<F as Read>::Error>>>;
+
 /// Composition state for raw input, excluding all following fields.
 pub struct RawLiteral {
     remaining: usize,
@@ -106,12 +110,12 @@ impl RawLiteral {
         parent: Pin<&mut F::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         destination: &mut O,
-    ) -> Poll<Result<usize, InputError<F::Error>>> {
+    ) -> RawPoll<F> {
         if self.failed {
             return Poll::Ready(Err(InputError::Failed));
         }
         let Some(missing) = NonZeroUsize::new(self.remaining) else {
-            return Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(None));
         };
         let empty = destination.remaining_mut() == 0;
         let result = ready!(F::poll_read(
@@ -120,13 +124,14 @@ impl RawLiteral {
             &mut destination.limit(self.remaining)
         ));
         match result {
-            Ok(0) if !empty => {
+            Ok(None) if !empty => {
                 self.failed = true;
                 Poll::Ready(Err(InputError::Truncated { missing }))
             }
-            Ok(n) => {
-                self.remaining -= n;
-                Poll::Ready(Ok(n))
+            Ok(None) => Poll::Ready(Ok(None)),
+            Ok(Some(segment)) => {
+                self.remaining -= segment.count.get();
+                Poll::Ready(Ok(Some(segment)))
             }
             Err(source) => {
                 self.failed = true;
@@ -140,21 +145,26 @@ impl RawLiteral {
 // therefore exactly the remaining declared payload, even for a live stream.
 impl<F: ReceiverFamily> nitori_io::ExactLen for Source<RawLiteral, F> {
     type Length = usize;
-    fn remaining_len<'v>(view: Pin<&mut Self::ReceiverView<'v>>) -> usize
+    type LengthError = !;
+    fn poll_remaining_len<'v>(
+        view: Pin<&mut Self::ReceiverView<'v>>,
+        _: &mut Context<'_>,
+    ) -> Poll<Result<usize, !>>
     where
         Self: 'v,
     {
-        view.project().state.remaining
+        Poll::Ready(Ok(view.project().state.remaining))
     }
 }
 
 impl<F: Read> Read for Source<RawLiteral, F> {
     type Error = InputError<F::Error>;
+    type Metadata = F::Metadata;
     fn poll_read<'v, O: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         dst: &mut O,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<ReadSegment<F::Metadata>>, Self::Error>>
     where
         Self: 'v,
     {
@@ -169,7 +179,7 @@ impl<F: ReadChunk> ReadChunk for Source<RawLiteral, F> {
         host: Pin<&mut Self::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         maximum: NonZeroUsize,
-    ) -> Poll<Result<Option<F::Chunk>, Self::Error>>
+    ) -> Poll<Result<Option<ChunkSegment<F::Chunk, <F as Read>::Metadata>>, Self::Error>>
     where
         Self: 'v,
     {
@@ -184,7 +194,7 @@ impl<F: ReadChunk> ReadChunk for Source<RawLiteral, F> {
         let result = ready!(F::poll_read_chunk(view.parent, cx, maximum.min(missing)));
         match result {
             Ok(Some(chunk)) => {
-                state.remaining -= chunk.remaining();
+                state.remaining -= chunk.chunk.remaining();
                 Poll::Ready(Ok(Some(chunk)))
             }
             Ok(None) => {
@@ -258,16 +268,22 @@ impl HuffmanLiteral {
         mut parent: Pin<&mut F::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         dst: &mut O,
-    ) -> Poll<Result<usize, HuffmanReadError<F::Error>>> {
+    ) -> HuffmanPoll<F> {
+        let segment = |written: usize| {
+            NonZeroUsize::new(written).map(|count| ReadSegment {
+                count,
+                metadata: (),
+            })
+        };
         let mut written = 0;
         loop {
             let decoder = match &mut self.decoding {
                 Decoding::Active(decoder) => decoder,
-                Decoding::Done(_) => return Poll::Ready(Ok(written)),
+                Decoding::Done(_) => return Poll::Ready(Ok(segment(written))),
                 Decoding::Failed => return Poll::Ready(Err(HuffmanReadError::Failed)),
                 Decoding::Deferred(_) => {
                     if written > 0 {
-                        return Poll::Ready(Ok(written));
+                        return Poll::Ready(Ok(segment(written)));
                     }
                     let Decoding::Deferred(source) =
                         core::mem::replace(&mut self.decoding, Decoding::Failed)
@@ -286,12 +302,12 @@ impl HuffmanLiteral {
             }
             let capacity = dst.remaining_mut();
             if capacity == 0 {
-                return Poll::Ready(Ok(written));
+                return Poll::Ready(Ok(segment(written)));
             }
             if self.pos == self.end {
                 // Never report Pending or a host failure after emitting bytes.
                 if written > 0 {
-                    return Poll::Ready(Ok(written));
+                    return Poll::Ready(Ok(segment(written)));
                 }
                 let request = capacity
                     .saturating_mul(30)
@@ -299,7 +315,9 @@ impl HuffmanLiteral {
                     .min(self.encoded.len());
                 let mut buffer = &mut self.encoded[..request];
                 self.end = match ready!(self.input.poll::<F, _>(parent.as_mut(), cx, &mut buffer)) {
-                    Ok(n) => n,
+                    // The request is nonempty, so the literal reports a segment
+                    // or an error; `None` would only be an empty request.
+                    Ok(read) => read.map_or(0, |segment| segment.count.get()),
                     Err(source) => {
                         self.decoding = Decoding::Failed;
                         return Poll::Ready(Err(HuffmanReadError::Input { source }));
@@ -327,11 +345,14 @@ impl HuffmanLiteral {
 
 impl<F: Read> Read for Source<HuffmanLiteral, F> {
     type Error = HuffmanReadError<F::Error>;
+    // Decoded bytes can span several segments of the parent, so they carry
+    // no attributes of their own.
+    type Metadata = ();
     fn poll_read<'v, O: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         dst: &mut O,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<ReadSegment<()>>, Self::Error>>
     where
         Self: 'v,
     {

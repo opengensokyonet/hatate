@@ -62,7 +62,7 @@ pub struct DecoderStream<A> {
 
 impl<A: ReceiverAccess> DecoderStream<A>
 where
-    A::Family: Read,
+    A::Family: Read<Metadata = ()>,
 {
     /// The stream on `io`, an access or an exclusive borrow of one, at an
     /// instruction boundary. Nothing is read.

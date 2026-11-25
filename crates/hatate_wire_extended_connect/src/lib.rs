@@ -134,7 +134,7 @@ impl<C: StreamClass, L> StreamPart<C, L> for Part {
         StreamVerdict::NotClaimed
     }
 
-    async fn read<I: ReceiverAccess<Family: Read>>(
+    async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
         claimed: CNil,
         _field: VarIntField<VarInt>,
         _io: I,

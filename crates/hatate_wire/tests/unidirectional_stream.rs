@@ -121,7 +121,7 @@ fn field_bytes(field: VarIntField<VarInt>) -> Vec<u8> {
 }
 
 /// Reads at most `take` bytes from `io`, stopping at the end.
-async fn read_some<A: ReceiverAccess<Family: Read>>(
+async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
     io: &mut A,
     take: usize,
 ) -> Result<Vec<u8>, <A::Family as Read>::Error> {
@@ -129,7 +129,10 @@ async fn read_some<A: ReceiverAccess<Family: Read>>(
     let mut buffer = [0; 7];
     while bytes.len() < take {
         let want = (take - bytes.len()).min(buffer.len());
-        let count = io.read(&mut &mut buffer[..want]).await?;
+        let count = io
+            .read(&mut &mut buffer[..want])
+            .await?
+            .map_or(0, |segment| segment.count.get());
         if count == 0 {
             break;
         }
@@ -138,7 +141,7 @@ async fn read_some<A: ReceiverAccess<Family: Read>>(
     Ok(bytes)
 }
 
-async fn seen<T: ClaimedValue + Copy, P: ReceiverAccess<Family: Read>>(
+async fn seen<T: ClaimedValue + Copy, P: ReceiverAccess<Family: Read<Metadata = ()>>>(
     mut frame: Frame<FrameType<T>, P>,
 ) -> Seen
 where
@@ -160,7 +163,7 @@ macro_rules! start {
     ($name:ident, $class:ty) => {
         #[call(sync)]
         async fn $name<
-            F: Read<Error = Infallible> + Skip<Count = usize>,
+            F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
             A: ReceiverAccess<Family = F>,
         >(
             io: &mut A,
@@ -615,7 +618,7 @@ fn ended(code: Option<ErrorCode>) -> End {
 /// and unknown ones after the first.
 #[call(sync)]
 async fn control_frames<
-    F: Read<Error = Infallible> + Skip<Count = usize>,
+    F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -693,7 +696,7 @@ fn a_control_stream_cut_inside_a_frame_is_a_closed_critical_stream() {
 /// stream fails or ends.
 #[call(sync)]
 async fn qpack_instructions<
-    F: Read<Error = Infallible> + Skip<Count = usize>,
+    F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,

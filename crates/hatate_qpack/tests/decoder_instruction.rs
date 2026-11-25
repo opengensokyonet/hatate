@@ -12,7 +12,7 @@ use nitori_io::{Read, calls::ReadArrayError};
 
 /// One instruction from a fresh stream.
 #[call(sync)]
-async fn one<F: Read, A: ReceiverAccess<Family = F>>(
+async fn one<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     max_wire_len: usize,
 ) -> Result<Option<D>, ReadError<F::Error>> {
@@ -21,7 +21,7 @@ async fn one<F: Read, A: ReceiverAccess<Family = F>>(
 
 /// `count` instructions from one stream, whatever each returns.
 #[call(sync)]
-async fn sequence<F: Read, A: ReceiverAccess<Family = F>>(
+async fn sequence<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     max_wire_len: usize,
     count: usize,
@@ -37,7 +37,9 @@ async fn sequence<F: Read, A: ReceiverAccess<Family = F>>(
 /// Reads one instruction, takes the access back and reads one more from a
 /// new stream on it.
 #[call(sync)]
-async fn handed_back<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> (D, Option<D>) {
+async fn handed_back<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+) -> (D, Option<D>) {
     let mut stream = DecoderStream::new(io);
     let first = stream.next_instruction(1).await.ok().flatten().unwrap();
     let io = stream.into_io();
@@ -196,11 +198,12 @@ nitori_call::family_receiver!(impl ['a] for Fragmented<'a>);
 
 impl nitori_io::Read for Fragmented<'_> {
     type Error = core::convert::Infallible;
+    type Metadata = ();
     fn poll_read<'visit, B: bytes::BufMut + ?Sized>(
         host: core::pin::Pin<&mut Self::ReceiverView<'visit>>,
         cx: &mut core::task::Context<'_>,
         dst: &mut B,
-    ) -> core::task::Poll<Result<usize, Self::Error>>
+    ) -> core::task::Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -213,16 +216,19 @@ impl nitori_io::Read for Fragmented<'_> {
         }
         this.waiting = false;
         let Some((&byte, rest)) = this.input.split_first() else {
-            return Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(None));
         };
         dst.put_u8(byte);
         this.input = rest;
-        Poll::Ready(Ok(1))
+        Poll::Ready(Ok(Some(nitori_io::ReadSegment {
+            count: core::num::NonZeroUsize::MIN,
+            metadata: (),
+        })))
     }
 }
 
 #[call(sync)]
-async fn pending_read<F: Read, A: ReceiverAccess<Family = F>>(
+async fn pending_read<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     max_wire_len: usize,
 ) -> Result<Option<D>, ReadError<F::Error>> {
@@ -261,7 +267,7 @@ fn integer_state_and_budget_survive_pending_between_every_octet() {
 /// Drops the read after `polls` pending polls, then asks again: the
 /// instruction, or `None` if the stream was left interrupted.
 #[call(sync)]
-async fn dropped_read<F: Read, A: ReceiverAccess<Family = F>>(
+async fn dropped_read<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     polls: usize,
 ) -> Option<D> {

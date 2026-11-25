@@ -67,7 +67,7 @@ impl<const VALUE: u32, const VERDICT: u8, C: StreamClass, L> StreamPart<C, L>
         }
     }
 
-    async fn read<I: ReceiverAccess<Family: Read>>(
+    async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
         (): (),
         _field: VarIntField<VarInt>,
         _io: I,

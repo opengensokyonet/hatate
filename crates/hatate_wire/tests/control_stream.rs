@@ -46,7 +46,7 @@ macro_rules! open {
     ($name:ident, $class:ty) => {
         #[call(sync)]
         async fn $name<
-            F: Read<Error = Infallible> + Skip<Count = usize>,
+            F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
             A: ReceiverAccess<Family = F>,
         >(
             io: &mut A,
@@ -180,7 +180,7 @@ enum Step {
 /// the access has left.
 #[call(sync)]
 async fn drop_next<
-    F: Read<Error = Infallible> + Skip<Count = usize>,
+    F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -260,7 +260,7 @@ fn a_control_stream_read_dropped_before_the_first_byte_of_a_head_reads_the_next_
 /// code of the failure.
 #[call(sync)]
 async fn frames_after_the_first<
-    F: Read<Error = Infallible> + Skip<Count = usize>,
+    F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,

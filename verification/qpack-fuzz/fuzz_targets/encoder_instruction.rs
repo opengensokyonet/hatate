@@ -71,13 +71,13 @@ async fn collect<A: ReceiverAccess>(
     block: NonZeroUsize,
 ) -> Option<Vec<u8>>
 where
-    A::Family: ReadChunk,
+    A::Family: ReadChunk<Metadata = ()>,
 {
     let mut out = Vec::new();
     match src {
         LiteralSource::Raw(mut raw) => {
             while let Some(chunk) = raw.read_chunk(block).await.ok()? {
-                out.put(chunk);
+                out.put(chunk.chunk);
             }
         }
         LiteralSource::Huffman(mut decoded) => {
@@ -85,7 +85,7 @@ where
                 .read(&mut (&mut out).limit(block.get()))
                 .await
                 .ok()?
-                != 0
+                .is_some()
             {}
         }
     }
@@ -107,7 +107,7 @@ async fn one<A: ReceiverAccess>(
     block: NonZeroUsize,
 ) -> Outcome
 where
-    A::Family: ReadChunk,
+    A::Family: ReadChunk<Metadata = ()>,
 {
     let start = match stream.next_instruction(wire, decoded).await {
         Ok(Some(start)) => start,
@@ -122,7 +122,7 @@ where
 
 async fn item<A: ReceiverAccess>(start: Started<'_, A>, block: NonZeroUsize) -> Option<Parsed>
 where
-    A::Family: ReadChunk,
+    A::Family: ReadChunk<Metadata = ()>,
 {
     match start {
         Started::SetDynamicTableCapacity(n) => Some(Parsed::Capacity(n)),
@@ -144,7 +144,7 @@ where
 }
 
 #[call(sync)]
-async fn parse<F: ReadChunk, A: ReceiverAccess<Family = F>>(
+async fn parse<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     wire: usize,
     decoded: usize,
@@ -163,7 +163,7 @@ async fn parse<F: ReadChunk, A: ReceiverAccess<Family = F>>(
 }
 
 #[call(sync)]
-async fn write_literals<N: Read + ExactLen, V: Read + ExactLen, W: Write>(
+async fn write_literals<N: Read<Metadata = ()> + ExactLen<LengthError = !>, V: Read<Metadata = ()> + ExactLen<LengthError = !>, W: Write<Report = ()>>(
     name: &mut impl ReceiverAccess<Family = N>,
     value: &mut impl ReceiverAccess<Family = V>,
     out: &mut impl ReceiverAccess<Family = W>,

@@ -96,7 +96,7 @@ pub enum StartError<E> {
 }
 
 #[call(sync)]
-pub(crate) async fn read_head<F: Read, A: ReceiverAccess<Family = F>>(
+pub(crate) async fn read_head<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     budget: &mut WireBudget,
     decoded_left: usize,
@@ -166,7 +166,7 @@ pub enum ValueError<E> {
 }
 
 #[call(sync)]
-pub(crate) async fn read_value_header<F: Read, A: ReceiverAccess<Family = F>>(
+pub(crate) async fn read_value_header<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     budget: &mut WireBudget,
     decoded_left: usize,

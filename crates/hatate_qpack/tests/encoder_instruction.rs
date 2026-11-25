@@ -14,8 +14,10 @@ use nitori_call::{ReceiverAccess, call};
 use nitori_io::prelude::*;
 
 #[call(sync)]
-async fn insertion<F: ReadChunk, A: ReceiverAccess<Family = F>>(io: &mut A, bad: bool)
-where
+async fn insertion<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    bad: bool,
+) where
     <F as Read>::Error: Debug,
 {
     let mut reader = EncoderStream::new(io);
@@ -32,7 +34,8 @@ where
             .read_chunk(NonZeroUsize::new(32).unwrap())
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .chunk;
         assert_eq!(raw.remaining(), 1);
         assert_eq!(raw.get_u8(), b'x');
         assert!(
@@ -49,7 +52,14 @@ where
         let LiteralSource::Huffman(mut source) = value.source() else {
             panic!()
         };
-        assert_eq!(source.read(&mut &mut byte[..]).await.unwrap(), 1);
+        assert_eq!(
+            source
+                .read(&mut &mut byte[..])
+                .await
+                .unwrap()
+                .map_or(0, |segment| segment.count.get()),
+            1
+        );
     }
     assert_eq!(byte, [b'a']);
     if bad {
@@ -83,7 +93,7 @@ fn name_then_huffman_value_on_the_same_cursor() {
 }
 
 #[call(sync)]
-async fn unread<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A, drop_name: bool)
+async fn unread<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(io: &mut A, drop_name: bool)
 where
     <F as Read>::Error: Debug,
 {
@@ -114,8 +124,11 @@ fn abandoned_name_never_advances_to_its_value_or_another_opcode() {
 }
 
 #[call(sync)]
-async fn limits<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A, wire: usize, decoded: usize)
-where
+async fn limits<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    wire: usize,
+    decoded: usize,
+) where
     <F as Read>::Error: Debug,
 {
     let mut reader = EncoderStream::new(io);
@@ -131,7 +144,7 @@ where
         let LiteralSource::Raw(mut raw) = name.source() else {
             panic!()
         };
-        assert_eq!(raw.read_array::<1>().await.unwrap(), [b'x']);
+        assert_eq!(raw.read_array::<1>().await.unwrap().value, [b'x']);
     }
     let next = name.finish().unwrap();
     if wire == 7 {
@@ -147,11 +160,11 @@ where
     let mut output = Vec::new();
     loop {
         match source.read(&mut output).await {
-            Ok(0) => {
+            Ok(None) => {
                 assert_eq!(decoded, 9);
                 break;
             }
-            Ok(_) => {}
+            Ok(Some(_)) => {}
             Err(HuffmanReadError::Coding {
                 source: huffman::DecodeError::OutputTooLong { limit },
             }) => {
@@ -184,8 +197,10 @@ fn two_budgets_follow_name_and_value_across_state_transitions() {
 }
 
 #[call(sync)]
-async fn reference<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A, truncated: bool)
-where
+async fn reference<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    truncated: bool,
+) where
     <F as Read>::Error: Debug,
 {
     let mut reader = EncoderStream::new(io);
@@ -207,13 +222,20 @@ where
     };
     if truncated {
         let mut dst = Vec::new();
-        assert_eq!(source.read(&mut dst).await.unwrap(), 3);
+        assert_eq!(
+            source
+                .read(&mut dst)
+                .await
+                .unwrap()
+                .map_or(0, |segment| segment.count.get()),
+            3
+        );
         assert!(
             matches!(source.read(&mut dst).await,Err(InputError::Truncated{missing}) if missing.get()==12)
         );
     } else {
         assert_eq!(
-            source.read_array::<15>().await.unwrap(),
+            source.read_array::<15>().await.unwrap().value,
             *b"www.example.com"
         );
         value.finish().unwrap();
@@ -236,11 +258,12 @@ struct Trickle<'a> {
 nitori_call::family_receiver!(impl ['a] for Trickle<'a>);
 impl Read for Trickle<'_> {
     type Error = core::convert::Infallible;
+    type Metadata = ();
     fn poll_read<'v, B: bytes::BufMut + ?Sized>(
         host: core::pin::Pin<&mut Self::ReceiverView<'v>>,
         cx: &mut core::task::Context<'_>,
         dst: &mut B,
-    ) -> core::task::Poll<Result<usize, Self::Error>>
+    ) -> core::task::Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'v,
     {
@@ -253,19 +276,22 @@ impl Read for Trickle<'_> {
         }
         this.waiting = false;
         if !dst.has_remaining_mut() {
-            return Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(None));
         }
         let Some((&b, rest)) = this.rest.split_first() else {
-            return Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(None));
         };
         this.rest = rest;
         dst.put_u8(b);
-        Poll::Ready(Ok(1))
+        Poll::Ready(Ok(Some(nitori_io::ReadSegment {
+            count: core::num::NonZeroUsize::MIN,
+            metadata: (),
+        })))
     }
 }
 
 #[call(sync)]
-async fn across_chunks<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A)
+async fn across_chunks<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(io: &mut A)
 where
     <F as Read>::Error: Debug,
 {
@@ -281,16 +307,26 @@ where
             panic!()
         };
         let mut first_six = decoded.compose(ReadLimit(6usize));
-        assert_eq!(first_six.read_array::<6>().await.unwrap(), *b"www.ex");
-        assert_eq!(first_six.read(&mut Vec::new()).await.unwrap(), 0);
+        assert_eq!(first_six.read_array::<6>().await.unwrap().value, *b"www.ex");
+        assert_eq!(
+            first_six
+                .read(&mut Vec::new())
+                .await
+                .unwrap()
+                .map_or(0, |segment| segment.count.get()),
+            0
+        );
         assert_eq!(first_six.into_state().0, 0);
-        assert_eq!(decoded.read_array::<9>().await.unwrap(), *b"ample.com");
+        assert_eq!(
+            decoded.read_array::<9>().await.unwrap().value,
+            *b"ample.com"
+        );
     }
     let mut value = name.finish().unwrap().open().await.unwrap();
     let LiteralSource::Raw(mut raw) = value.source() else {
         panic!()
     };
-    assert_eq!(raw.read_array::<1>().await.unwrap(), *b"x");
+    assert_eq!(raw.read_array::<1>().await.unwrap().value, *b"x");
     value.finish().unwrap();
     assert!(matches!(
         reader.next_instruction(1, 0).await.unwrap().unwrap(),
@@ -326,7 +362,7 @@ fn huffman_source_composes_and_resumes_after_each_encoded_octet() {
 }
 
 #[call(sync)]
-async fn raw_chunks<F: ReadChunk, A: ReceiverAccess<Family = F>>(
+async fn raw_chunks<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
 ) -> (<F as ReadChunk>::Chunk, <F as ReadChunk>::Chunk)
 where
@@ -344,12 +380,18 @@ where
     let LiteralSource::Raw(mut src) = value.source() else {
         panic!()
     };
-    let first = src.read_chunk(NonZeroUsize::MIN).await.unwrap().unwrap();
+    let first = src
+        .read_chunk(NonZeroUsize::MIN)
+        .await
+        .unwrap()
+        .unwrap()
+        .chunk;
     let rest = src
         .read_chunk(NonZeroUsize::new(8).unwrap())
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .chunk;
     value.finish().unwrap();
     (first, rest)
 }
@@ -367,7 +409,7 @@ fn bounded_raw_chunks_borrow_the_original_input() {
 use hatate_qpack::encoder_instruction::write::{HeaderError, LiteralError, Payload, Writer};
 
 #[call(sync)]
-async fn relay_raw<F: Read, G: Write>(
+async fn relay_raw<F: Read<Metadata = ()>, G: Write<Report = ()>>(
     input: &mut impl ReceiverAccess<Family = F>,
     output: &mut impl ReceiverAccess<Family = G>,
     wire: usize,
@@ -451,7 +493,7 @@ fn rejected_or_truncated_value_cannot_be_followed_by_an_opcode() {
 }
 
 #[call(sync)]
-async fn reference_output<F: Read + ExactLen, G: Write>(
+async fn reference_output<F: Read + ExactLen<LengthError = !>, G: Write<Report = ()>>(
     input: &mut impl ReceiverAccess<Family = F>,
     output: &mut impl ReceiverAccess<Family = G>,
 ) where
@@ -506,7 +548,11 @@ fn encoder_output_matches_appendix_b_and_keeps_an_abandoned_insertion_open() {
 }
 
 #[call(sync)]
-async fn coded_insert<N: Read + ExactLen, V: Read + ExactLen, O: Write>(
+async fn coded_insert<
+    N: Read + ExactLen<LengthError = !>,
+    V: Read + ExactLen<LengthError = !>,
+    O: Write<Report = ()>,
+>(
     name: &mut impl ReceiverAccess<Family = N>,
     value: &mut impl ReceiverAccess<Family = V>,
     out: &mut impl ReceiverAccess<Family = O>,
@@ -593,11 +639,15 @@ fn appendix_b3_insertion_round_trips_from_the_wire() {
 
 impl ExactLen for Trickle<'_> {
     type Length = usize;
-    fn remaining_len<'v>(view: core::pin::Pin<&mut Self::ReceiverView<'v>>) -> usize
+    type LengthError = !;
+    fn poll_remaining_len<'v>(
+        view: core::pin::Pin<&mut Self::ReceiverView<'v>>,
+        _: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Result<usize, !>>
     where
         Self: 'v,
     {
-        view.get_pin_mut().rest.len()
+        core::task::Poll::Ready(Ok(view.get_pin_mut().rest.len()))
     }
 }
 
@@ -609,11 +659,12 @@ struct PausingSink {
 nitori_call::family_receiver!(impl [] for PausingSink);
 impl Write for PausingSink {
     type Error = core::convert::Infallible;
+    type Report = ();
     fn poll_write<'v, B: Buf + ?Sized>(
         view: core::pin::Pin<&mut Self::ReceiverView<'v>>,
         cx: &mut core::task::Context<'_>,
         src: &mut B,
-    ) -> core::task::Poll<Result<usize, Self::Error>>
+    ) -> core::task::Poll<Result<Option<nitori_io::WriteSegment<()>>, Self::Error>>
     where
         Self: 'v,
     {
@@ -626,10 +677,13 @@ impl Write for PausingSink {
         }
         sink.waiting = false;
         if !src.has_remaining() {
-            return Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(None));
         }
         sink.wire.push(src.get_u8());
-        Poll::Ready(Ok(1))
+        Poll::Ready(Ok(Some(nitori_io::WriteSegment {
+            count: core::num::NonZeroUsize::MIN,
+            report: (),
+        })))
     }
 }
 
@@ -672,7 +726,7 @@ fn pending_on_both_sides_does_not_repeat_octets_or_restart_huffman_state() {
 }
 
 #[call(sync)]
-async fn zero_budget<F: Read>(io: &mut impl ReceiverAccess<Family = F>)
+async fn zero_budget<F: Read<Metadata = ()>>(io: &mut impl ReceiverAccess<Family = F>)
 where
     <F as Read>::Error: Debug,
 {
@@ -705,7 +759,7 @@ fn zero_budget_failure_interrupts_without_reading() {
 /// capacity the next instruction sets, or `None` if the stream was left
 /// interrupted.
 #[call(sync)]
-async fn dropped_start<F: Read>(
+async fn dropped_start<F: Read<Metadata = ()>>(
     io: &mut impl ReceiverAccess<Family = F>,
     polls: usize,
 ) -> Option<u64>
@@ -775,7 +829,7 @@ fn dropped_call_before_the_first_octet_leaves_the_stream_at_the_boundary() {
 
 /// What each of `count` successive instructions came to.
 #[call(sync)]
-async fn walk<F: Read, A: ReceiverAccess<Family = F>>(
+async fn walk<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     count: usize,
 ) -> Vec<&'static str> {
@@ -825,7 +879,9 @@ fn unfinished_failed_or_truncated_instruction_interrupts_the_stream() {
 }
 
 #[call(sync)]
-async fn handed_back<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> [&'static str; 4] {
+async fn handed_back<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+) -> [&'static str; 4] {
     let mut stream = EncoderStream::new(io);
     let first = match stream.next_instruction(64, 64).await {
         Ok(Some(Started::Duplicate(2))) => "duplicate",
@@ -861,7 +917,10 @@ fn into_io_gives_back_the_access_at_the_cursor() {
 }
 
 #[call(sync)]
-async fn short_insertion<F: Read>(io: &mut impl ReceiverAccess<Family = F>, limit: usize) -> u128 {
+async fn short_insertion<F: Read<Metadata = ()>>(
+    io: &mut impl ReceiverAccess<Family = F>,
+    limit: usize,
+) -> u128 {
     let mut reader = EncoderStream::new(io);
     match reader.next_instruction(limit, usize::MAX).await {
         Err(StartError::WireLimit { source }) => {

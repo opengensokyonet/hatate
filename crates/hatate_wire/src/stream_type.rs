@@ -9,7 +9,7 @@
 //! receiver discards or stops reading ([RFC 9114 §9]). Read the start of a
 //! stream with
 //! [`read_unidirectional_stream`](crate::stream::codec::read_unidirectional_stream);
-//! write the type with [`sakuya_var_int::call::write_var_int_field`].
+//! write the type with `io.encode(field)` of `nitori_codec`.
 //!
 //! [RFC 9114 §6.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2
 //! [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9

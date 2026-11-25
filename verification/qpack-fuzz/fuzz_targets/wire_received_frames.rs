@@ -76,11 +76,12 @@ nitori_call::family_receiver!(impl ['a] for Arrival<'a>);
 
 impl Read for Arrival<'_> {
     type Error = Infallible;
+    type Metadata = ();
     fn poll_read<'visit, B: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'visit>>,
         cx: &mut Context<'_>,
         dst: &mut B,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -92,7 +93,7 @@ impl Read for Arrival<'_> {
         let (head, tail) = this.input.split_at(count);
         dst.put_slice(head);
         this.input = tail;
-        Poll::Ready(Ok(count))
+        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| nitori_io::ReadSegment { count, metadata: () })))
     }
 }
 
@@ -189,7 +190,7 @@ fn next_failure<E: ErrorCodeOf<ErrorCode>>(error: &NextFrameError<E>) -> Failure
 }
 
 /// Reads at most `take` bytes from `io`, stopping at EOF.
-async fn read_some<A: ReceiverAccess<Family: Read>>(
+async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
     io: &mut A,
     take: usize,
 ) -> Result<Vec<u8>, <A::Family as Read>::Error> {
@@ -197,7 +198,10 @@ async fn read_some<A: ReceiverAccess<Family: Read>>(
     let mut buffer = [0; 7];
     while bytes.len() < take {
         let want = Ord::min(take - bytes.len(), buffer.len());
-        let count = io.read(&mut &mut buffer[..want]).await?;
+        let count = io
+            .read(&mut &mut buffer[..want])
+            .await?
+            .map_or(0, |segment| segment.count.get());
         if count == 0 {
             break;
         }
@@ -262,8 +266,8 @@ async fn frames_of<I, B>(
     known: bool,
 ) -> Outcome
 where
-    I: ReceiverAccess<Family: Skip<Count = usize> + Read<Error = Infallible>>,
-    B: ReceiverAccess<Family: Write<Error = Infallible>>,
+    I: ReceiverAccess<Family: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>>,
+    B: ReceiverAccess<Family: Write<Error = Infallible, Report = ()>>,
 {
     match kind & 3 {
         1 => walk!(io, ControlStreamKind, role, take, known, out),
@@ -274,7 +278,7 @@ where
 
 /// [`frames_of`] on a host that skips by itself.
 #[call(sync)]
-async fn native<F: Skip<Count = usize> + Read<Error = Infallible>, W: Write<Error = Infallible>>(
+async fn native<F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>, W: Write<Error = Infallible, Report = ()>>(
     io: &mut impl ReceiverAccess<Family = F>,
     out: &mut impl ReceiverAccess<Family = W>,
     kind: u8,
@@ -287,7 +291,7 @@ async fn native<F: Skip<Count = usize> + Read<Error = Infallible>, W: Write<Erro
 
 /// [`frames_of`] on a host that only reads, made to skip by [`ReadSkip`].
 #[call(sync)]
-async fn by_reading<F: Read<Error = Infallible>, W: Write<Error = Infallible>>(
+async fn by_reading<F: Read<Error = Infallible, Metadata = ()>, W: Write<Error = Infallible, Report = ()>>(
     io: &mut impl ReceiverAccess<Family = F>,
     out: &mut impl ReceiverAccess<Family = W>,
     kind: u8,

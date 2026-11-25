@@ -7,12 +7,13 @@ use crate::{
         codec::{WriteFrameHeadError, payload_integer_error_code, write_head},
     },
 };
-use core::{future::poll_fn, num::NonZeroU64, task::Poll};
+use core::num::NonZeroU64;
 use nitori_call::{ReceiverAccess, call};
+use nitori_codec::prelude::*;
 use nitori_io::{ExactLen, prelude::*};
 use sakuya_var_int::{
     VarInt, VarIntField,
-    call::{ReadVarIntError, ReadVarIntFieldExt as _, WriteVarIntError, WriteVarIntFieldExt as _},
+    stream::{ReadVarIntError, WriteVarIntError},
 };
 use snafu::{ResultExt, Snafu};
 
@@ -32,7 +33,10 @@ macro_rules! integer_frame_codec {
         ///
         /// [`ReadIntegerFrameError`].
         #[call(sync)]
-        pub async fn $read<F: Read + ExactLen, A: ReceiverAccess<Family = F>>(
+        pub async fn $read<
+            F: Read<Metadata = ()> + ExactLen<LengthError = !>,
+            A: ReceiverAccess<Family = F>,
+        >(
             io: &mut A,
             widths: FrameWidths,
         ) -> Result<$name, ReadIntegerFrameError<F::Error>>
@@ -50,7 +54,7 @@ macro_rules! integer_frame_codec {
         /// [`WriteIntegerFrameError`]; bytes accepted before the failure
         /// stay written.
         #[call(sync)]
-        pub async fn $write<F: Write, A: ReceiverAccess<Family = F>>(
+        pub async fn $write<F: Write<Report = ()>, A: ReceiverAccess<Family = F>>(
             io: &mut A,
             frame: $name,
         ) -> Result<(), WriteIntegerFrameError<F::Error>> {
@@ -82,7 +86,11 @@ integer_frame_codec!(
 );
 
 /// Reads the one integer of a payload and checks that nothing follows it.
-async fn read_integer<T, F: Read + ExactLen, A: ReceiverAccess<Family = F>>(
+async fn read_integer<
+    T,
+    F: Read<Metadata = ()> + ExactLen<LengthError = !>,
+    A: ReceiverAccess<Family = F>,
+>(
     io: &mut A,
 ) -> Result<VarIntField<T>, ReadIntegerFrameError<F::Error>>
 where
@@ -90,11 +98,10 @@ where
     <F as ExactLen>::Length: TryInto<u64>,
 {
     let field = io
-        .read_var_int_field::<T>()
+        .decode::<VarIntField<T>>()
         .await
         .context(read_integer_frame_error::FieldSnafu)?;
-    let remaining =
-        poll_fn(|cx| io.poll_access(cx, |mut view, _| Poll::Ready(view.remaining_len()))).await;
+    let Ok(remaining) = io.remaining_len().await;
     // A remaining length that does not fit a u64 is not zero either.
     match remaining.try_into().map(NonZeroU64::new) {
         Ok(None) => Ok(field),
@@ -105,7 +112,7 @@ where
     }
 }
 
-async fn write_integer<T, F: Write, A: ReceiverAccess<Family = F>>(
+async fn write_integer<T, F: Write<Report = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     kind: Http3FrameType,
     widths: FrameWidths,
@@ -126,7 +133,7 @@ where
     write_head(io, type_field, length)
         .await
         .context(write_integer_frame_error::HeadSnafu)?;
-    io.write_var_int_field(field)
+    io.encode(field)
         .await
         .context(write_integer_frame_error::FieldSnafu)
 }

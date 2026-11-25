@@ -47,11 +47,12 @@ nitori_call::family_receiver!(impl ['a] for Dribble<'a>);
 
 impl nitori_io::Read for Dribble<'_> {
     type Error = Infallible;
+    type Metadata = ();
     fn poll_read<'visit, B: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'visit>>,
         cx: &mut Context<'_>,
         dst: &mut B,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -66,7 +67,12 @@ impl nitori_io::Read for Dribble<'_> {
         let (head, tail) = this.input.split_at(count);
         dst.put_slice(head);
         this.input = tail;
-        Poll::Ready(Ok(count))
+        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| {
+            nitori_io::ReadSegment {
+                count,
+                metadata: (),
+            }
+        })))
     }
 }
 
@@ -129,11 +135,12 @@ nitori_call::family_receiver!(impl ['a] for Liar<'a>);
 
 impl nitori_io::Read for Liar<'_> {
     type Error = Infallible;
+    type Metadata = ();
     fn poll_read<'visit, B: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'visit>>,
         _cx: &mut Context<'_>,
         dst: &mut B,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -142,17 +149,26 @@ impl nitori_io::Read for Liar<'_> {
         let (head, tail) = this.data.split_at(count);
         dst.put_slice(head);
         this.data = tail;
-        Poll::Ready(Ok(count))
+        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| {
+            nitori_io::ReadSegment {
+                count,
+                metadata: (),
+            }
+        })))
     }
 }
 
 impl nitori_io::ExactLen for Liar<'_> {
     type Length = usize;
-    fn remaining_len<'visit>(host: Pin<&mut Self::ReceiverView<'visit>>) -> usize
+    type LengthError = !;
+    fn poll_remaining_len<'visit>(
+        host: Pin<&mut Self::ReceiverView<'visit>>,
+        _: &mut Context<'_>,
+    ) -> Poll<Result<usize, !>>
     where
         Self: 'visit,
     {
-        host.get_pin_mut().get_mut().claimed
+        Poll::Ready(Ok(host.get_pin_mut().get_mut().claimed))
     }
 }
 
@@ -173,11 +189,12 @@ nitori_call::family_receiver!(impl [] for Broken);
 
 impl nitori_io::Read for Broken {
     type Error = Boom;
+    type Metadata = ();
     fn poll_read<'visit, B: BufMut + ?Sized>(
         _host: Pin<&mut Self::ReceiverView<'visit>>,
         _cx: &mut Context<'_>,
         _dst: &mut B,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -191,7 +208,7 @@ impl nitori_io::ReadChunk for Broken {
         _host: Pin<&mut Self::ReceiverView<'visit>>,
         _cx: &mut Context<'_>,
         _maximum: core::num::NonZeroUsize,
-    ) -> Poll<Result<Option<bytes::Bytes>, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ChunkSegment<bytes::Bytes, ()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -252,11 +269,12 @@ nitori_call::family_receiver!(impl ['a] for ReadOnly<'a>);
 
 impl nitori_io::Read for ReadOnly<'_> {
     type Error = Infallible;
+    type Metadata = ();
     fn poll_read<'visit, B: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'visit>>,
         cx: &mut Context<'_>,
         dst: &mut B,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -268,7 +286,12 @@ impl nitori_io::Read for ReadOnly<'_> {
         let (head, tail) = this.input.split_at(count);
         dst.put_slice(head);
         this.input = tail;
-        Poll::Ready(Ok(count))
+        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| {
+            nitori_io::ReadSegment {
+                count,
+                metadata: (),
+            }
+        })))
     }
 }
 
@@ -278,7 +301,7 @@ impl nitori_io::ReadChunk for ReadOnly<'_> {
         host: Pin<&mut Self::ReceiverView<'visit>>,
         cx: &mut Context<'_>,
         maximum: core::num::NonZeroUsize,
-    ) -> Poll<Result<Option<bytes::Bytes>, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ChunkSegment<bytes::Bytes, ()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -292,7 +315,10 @@ impl nitori_io::ReadChunk for ReadOnly<'_> {
         let count = this.chunk.min(this.input.len()).min(maximum.get());
         let (head, tail) = this.input.split_at(count);
         this.input = tail;
-        Poll::Ready(Ok(Some(bytes::Bytes::copy_from_slice(head))))
+        Poll::Ready(Ok(Some(nitori_io::ChunkSegment {
+            chunk: bytes::Bytes::copy_from_slice(head),
+            metadata: (),
+        })))
     }
 }
 
@@ -303,15 +329,16 @@ nitori_call::family_receiver!(impl [] for Overskip);
 
 impl nitori_io::Read for Overskip {
     type Error = Infallible;
+    type Metadata = ();
     fn poll_read<'visit, B: BufMut + ?Sized>(
         _host: Pin<&mut Self::ReceiverView<'visit>>,
         _cx: &mut Context<'_>,
         _dst: &mut B,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'visit,
     {
-        Poll::Ready(Ok(0))
+        Poll::Ready(Ok(None))
     }
 }
 
@@ -351,7 +378,7 @@ pub const fn known(frame_type: Http3FrameType) -> Ty {
 }
 
 /// Reads at most `take` bytes from `io`, stopping at EOF.
-pub async fn read_some<A: ReceiverAccess<Family: Read>>(
+pub async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
     io: &mut A,
     take: usize,
 ) -> Result<Vec<u8>, <A::Family as Read>::Error> {
@@ -359,7 +386,10 @@ pub async fn read_some<A: ReceiverAccess<Family: Read>>(
     let mut buffer = [0; 7];
     while bytes.len() < take {
         let want = (take - bytes.len()).min(buffer.len());
-        let count = io.read(&mut &mut buffer[..want]).await?;
+        let count = io
+            .read(&mut &mut buffer[..want])
+            .await?
+            .map_or(0, |segment| segment.count.get());
         if count == 0 {
             break;
         }

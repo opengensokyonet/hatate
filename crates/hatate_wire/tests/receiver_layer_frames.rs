@@ -62,7 +62,7 @@ async fn walk_in_call<K: StreamKind, F, A: ReceiverAccess<Family = F>>(
     stop: usize,
 ) -> Outcome
 where
-    F: Skip<Count = usize> + Read<Error = Infallible>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
     Parts: FrameSetOn<K>,
 {
     let (log, back) = walk_log!(&mut *io, aw, K, role, take, known, stop);
@@ -81,7 +81,7 @@ fn walk_on_receiver<K: StreamKind, F, I: ReceiverAccess<Family = F>>(
     stop: usize,
 ) -> (Vec<String>, Option<I>)
 where
-    F: Skip<Count = usize> + Read<Error = Infallible>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
     Parts: FrameSetOn<K>,
 {
     walk_log!(io, ru, K, role, take, known, stop)
@@ -259,7 +259,7 @@ macro_rules! dropped_log {
 #[call(sync)]
 async fn dropped_in_call<F, A: ReceiverAccess<Family = F>>(io: &mut A, drops: Vec<usize>) -> Outcome
 where
-    F: Skip<Count = usize> + Read<Error = Infallible>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
 {
     let (log, back) = dropped_log!(&mut *io, aw, drops);
     let mut back = back.unwrap();
@@ -271,7 +271,7 @@ fn dropped_on_receiver<F, I: ReceiverAccess<Family = F>>(
     drops: Vec<usize>,
 ) -> (Vec<String>, Option<I>)
 where
-    F: Skip<Count = usize> + Read<Error = Infallible>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
 {
     dropped_log!(io, ru, drops)
 }

@@ -36,11 +36,9 @@ use hatate_wire_qpack::{
     stream::{CriticalStream, CriticalStreamError, QpackDecoderStream, QpackEncoderStream},
 };
 use nitori_call::{Composed, ReceiverAccess};
+use nitori_codec::prelude::*;
 use nitori_io::{Infinite, Min, Read, Skip};
-use sakuya_var_int::{
-    VarInt, VarIntField,
-    call::{ReadVarIntError, ReadVarIntFieldExt as _},
-};
+use sakuya_var_int::{VarInt, VarIntField, stream::ReadVarIntError};
 use snafu::{ResultExt, Snafu};
 
 /// A unidirectional stream of the HTTP/3 part, one of its four types. The
@@ -369,7 +367,7 @@ fn is_settings<C: ClaimedValue>(frame_type: FrameType<C>) -> bool {
 
 impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess> ControlStream<L, I>
 where
-    Composed<I, CriticalStream>: ReceiverAccess<Family: Read>,
+    Composed<I, CriticalStream>: ReceiverAccess<Family: Read<Metadata = ()>>,
 {
     /// The current frame, as [`FrameStream::frame`] gives it. The first one
     /// is SETTINGS ([RFC 9114 §6.2.1]): the stream is read only if it is.
@@ -383,7 +381,7 @@ where
 impl<L: FrameSetOn<ControlStreamKind>, I: ReceiverAccess> ControlStream<L, I>
 where
     Composed<I, CriticalStream>:
-        ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>>>,
+        ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>, Metadata = ()>>,
     u64: Min<
             <<Composed<I, CriticalStream> as ReceiverAccess>::Family as Skip>::Count,
             Output = <<Composed<I, CriticalStream> as ReceiverAccess>::Family as Skip>::Count,
@@ -563,7 +561,7 @@ async fn read_unidirectional<L, I>(
 >
 where
     L: FrameSetOn<ControlStreamKind> + FrameSetOn<PushStreamKind>,
-    I: ReceiverAccess<Family: Read>,
+    I: ReceiverAccess<Family: Read<Metadata = ()>>,
 {
     use http3_unidirectional_stream_error::{
         ControlSnafu, MissingSettingsSnafu, PushIdSnafu, PushSnafu,
@@ -589,7 +587,7 @@ where
         }
         Http3StreamType::Push => {
             let push_id = io
-                .read_var_int_field::<PushId>()
+                .decode::<VarIntField<PushId>>()
                 .await
                 .context(PushIdSnafu)?;
             Http3UnidirectionalStream::Push(PushStream {
@@ -671,7 +669,7 @@ macro_rules! unidirectional_part {
                 Http3StreamType::of(value).map_or(StreamVerdict::NotClaimed, judge)
             }
 
-            async fn read<I: ReceiverAccess<Family: Read>>(
+            async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
                 claimed: Http3StreamType,
                 _field: VarIntField<VarInt>,
                 io: I,
@@ -727,7 +725,7 @@ impl<L: FrameSetOn<RequestStreamKind>> StreamPart<ClientInitiatedBidirectional, 
         }
     }
 
-    async fn read<I: ReceiverAccess<Family: Read>>(
+    async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
         (): (),
         field: VarIntField<VarInt>,
         io: I,
@@ -756,7 +754,7 @@ impl<L> StreamPart<ServerInitiatedBidirectional, L> for Part {
         StreamVerdict::ErrorUnlessClaimed(ServerBidirectionalStreamError)
     }
 
-    async fn read<I: ReceiverAccess<Family: Read>>(
+    async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
         claimed: CNil,
         _field: VarIntField<VarInt>,
         _io: I,

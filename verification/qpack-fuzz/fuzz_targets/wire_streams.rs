@@ -80,11 +80,12 @@ nitori_call::family_receiver!(impl ['a] for Arrival<'a>);
 
 impl Read for Arrival<'_> {
     type Error = Infallible;
+    type Metadata = ();
     fn poll_read<'visit, B: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'visit>>,
         cx: &mut Context<'_>,
         dst: &mut B,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -96,7 +97,7 @@ impl Read for Arrival<'_> {
         let (head, tail) = this.input.split_at(count);
         dst.put_slice(head);
         this.input = tail;
-        Poll::Ready(Ok(count))
+        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| nitori_io::ReadSegment { count, metadata: () })))
     }
 }
 
@@ -256,7 +257,7 @@ macro_rules! unidirectional {
     ($name:ident, $class:ty) => {
         #[call(sync)]
         async fn $name<
-            F: Read<Error = Infallible> + Skip<Count = usize>,
+            F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
             A: ReceiverAccess<Family = F>,
         >(
             io: &mut A,
@@ -305,7 +306,7 @@ macro_rules! bidirectional {
     ($name:ident, $class:ty, |$known:ident| $request:expr) => {
         #[call(sync)]
         async fn $name<
-            F: Read<Error = Infallible> + Skip<Count = usize>,
+            F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
             A: ReceiverAccess<Family = F>,
         >(
             io: &mut A,

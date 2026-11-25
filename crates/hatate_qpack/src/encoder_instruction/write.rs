@@ -4,7 +4,7 @@
 use super::{NameReference, codec::DecodedLengthError};
 use crate::huffman::{DecodeError, SymbolDecoder};
 use crate::instruction::{EncodedInteger, WireBudget, WireLimitError};
-use core::{future::poll_fn, num::NonZeroU64, task::Poll};
+use core::num::NonZeroU64;
 use nitori_call::ReceiverAccess;
 use nitori_io::{calls::WriteAllError, prelude::*};
 use snafu::{ResultExt, Snafu};
@@ -93,7 +93,7 @@ pub enum LiteralError<R, W> {
 
 impl<A: ReceiverAccess> Writer<A>
 where
-    A::Family: Write,
+    A::Family: Write<Report = ()>,
 {
     /// Start at an instruction boundary using an owned or borrowed access.
     pub fn new(io: A) -> Self {
@@ -178,7 +178,7 @@ where
     }
 
     /// Transfer a literal name before asking the caller for its value.
-    pub async fn literal_name<F: Read + ExactLen>(
+    pub async fn literal_name<F: Read + ExactLen<LengthError = !>>(
         &mut self,
         name: Payload<&mut impl ReceiverAccess<Family = F>>,
         max_wire_len: usize,
@@ -208,9 +208,9 @@ pub struct PendingValue<'a, A> {
 
 impl<A: ReceiverAccess> PendingValue<'_, A>
 where
-    A::Family: Write,
+    A::Family: Write<Report = ()>,
 {
-    async fn transfer<const N: u8, F: Read + ExactLen>(
+    async fn transfer<const N: u8, F: Read + ExactLen<LengthError = !>>(
         &mut self,
         payload: Payload<&mut impl ReceiverAccess<Family = F>>,
         prefix: u8,
@@ -227,9 +227,7 @@ where
                 Some(SymbolDecoder::new(self.decoded_left)),
             ),
         };
-        let declared =
-            poll_fn(|cx| src.poll_access(cx, |mut view, _| Poll::Ready(view.remaining_len())))
-                .await;
+        let Ok(declared) = src.remaining_len().await;
         let length = declared
             .try_into()
             .map_err(|_| LiteralError::LengthOutOfRange)?;
@@ -250,13 +248,14 @@ where
         let mut buf = [0; 1024];
         while let Some(missing) = NonZeroU64::new(remaining) {
             let request = remaining.min(buf.len() as u64) as usize;
-            let count = src
+            let segment = src
                 .read(&mut &mut buf[..request])
                 .await
                 .context(literal_error::ReadSnafu)?;
-            if count == 0 {
+            let Some(segment) = segment else {
                 return Err(LiteralError::ShortSource { missing });
-            }
+            };
+            let count = segment.count.get();
             remaining -= count as u64;
             if let Some(decoder) = &mut decoder {
                 for &octet in &buf[..count] {
@@ -281,7 +280,7 @@ where
 
     /// Transfer a literal value, consuming this state. Success restores the
     /// instruction boundary. A failure leaves the writer inside the insertion.
-    pub async fn value<F: Read + ExactLen>(
+    pub async fn value<F: Read + ExactLen<LengthError = !>>(
         mut self,
         value: Payload<&mut impl ReceiverAccess<Family = F>>,
     ) -> Result<(), LiteralError<F::Error, <A::Family as Write>::Error>>

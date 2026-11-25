@@ -67,7 +67,7 @@ macro_rules! parts {
                 }
             }
 
-            async fn read<I: ReceiverAccess<Family: Read>>(
+            async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
                 _claimed: (),
                 _field: VarIntField<VarInt>,
                 _io: I,
@@ -86,7 +86,7 @@ macro_rules! parts {
                 StreamVerdict::NotClaimed
             }
 
-            async fn read<I: ReceiverAccess<Family: Read>>(
+            async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
                 _claimed: (),
                 _field: VarIntField<VarInt>,
                 _io: I,
@@ -129,7 +129,7 @@ macro_rules! start {
     ($name:ident, $list:ty, |$known:ident| $whose:expr) => {
         #[call(sync)]
         async fn $name<
-            F: Read<Error = Infallible> + Skip<Count = usize>,
+            F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
             A: ReceiverAccess<Family = F>,
         >(
             io: &mut A,

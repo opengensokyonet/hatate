@@ -82,11 +82,12 @@ nitori_call::family_receiver!(impl ['a] for Arrival<'a>);
 
 impl Read for Arrival<'_> {
     type Error = Infallible;
+    type Metadata = ();
     fn poll_read<'visit, B: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'visit>>,
         cx: &mut Context<'_>,
         dst: &mut B,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -98,7 +99,7 @@ impl Read for Arrival<'_> {
         let (head, tail) = this.input.split_at(count);
         dst.put_slice(head);
         this.input = tail;
-        Poll::Ready(Ok(count))
+        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| nitori_io::ReadSegment { count, metadata: () })))
     }
 }
 
@@ -137,13 +138,13 @@ fn complete<T>(future: impl Future<Output = T>) -> T {
 }
 
 /// The rest of `payload`, read to its end; `None` if reading failed.
-async fn collect<A: ReceiverAccess<Family: Read>>(payload: &mut A) -> Option<Vec<u8>> {
+async fn collect<A: ReceiverAccess<Family: Read<Metadata = ()>>>(payload: &mut A) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     loop {
         let mut buffer = [0; 64];
         match payload.read(&mut &mut buffer[..]).await {
-            Ok(0) => return Some(bytes),
-            Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+            Ok(None) => return Some(bytes),
+            Ok(Some(segment)) => bytes.extend_from_slice(&buffer[..segment.count.get()]),
             Err(_) => return None,
         }
     }
@@ -152,7 +153,7 @@ async fn collect<A: ReceiverAccess<Family: Read>>(payload: &mut A) -> Option<Vec
 /// Writes the frame of this Type and Length whose payload is the second
 /// receiver of the host.
 #[call(sync)]
-async fn write_payload<R: Read + ExactLen, F: Write>(
+async fn write_payload<R: Read<Metadata = ()> + ExactLen<LengthError = !>, F: Write<Report = ()>>(
     out: &mut impl ReceiverAccess<Family = F>,
     payload: &mut impl ReceiverAccess<Family = R>,
     r#type: VarIntField<VarInt>,
@@ -286,9 +287,9 @@ macro_rules! walk {
 /// `expected`.
 #[call(sync)]
 async fn walk<
-    F: Read<Error = Infallible> + Skip<Count = usize>,
+    F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
-    W: Write<Error = Infallible>,
+    W: Write<Error = Infallible, Report = ()>,
     B: ReceiverAccess<Family = W>,
 >(
     io: &mut A,

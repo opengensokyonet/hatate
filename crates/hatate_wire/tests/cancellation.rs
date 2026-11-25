@@ -65,7 +65,10 @@ fn poll_then_drop_frame<T, E>(
 }
 
 /// The unread bytes of the payload of the current frame.
-fn remaining<K: hatate_wire::stream::kind::StreamKind, I: ReceiverAccess<Family: Read>>(
+fn remaining<
+    K: hatate_wire::stream::kind::StreamKind,
+    I: ReceiverAccess<Family: Read<Metadata = ()>>,
+>(
     stream: &mut FrameStream<Parts, K, I>,
 ) -> u64
 where
@@ -85,7 +88,10 @@ enum Again {
 /// Reads the first frame of a control stream, a GOAWAY, and drops a read of
 /// its integer after `polls` polls: if `again`, reads it again.
 #[call(sync)]
-async fn goaway_dropped<F: Read<Error = Infallible>, A: ReceiverAccess<Family = F>>(
+async fn goaway_dropped<
+    F: Read<Error = Infallible, Metadata = ()>,
+    A: ReceiverAccess<Family = F>,
+>(
     io: &mut A,
     polls: usize,
     again: bool,
@@ -172,7 +178,10 @@ fn a_goaway_dropped_in_the_middle_keeps_the_count_exact() {
 }
 
 /// Reads one setting from the payload of the current frame.
-async fn one_setting<S: ReceiverAccess<Family = F>, F: Read + ExactLen>(
+async fn one_setting<
+    S: ReceiverAccess<Family = F>,
+    F: Read<Metadata = ()> + ExactLen<LengthError = !>,
+>(
     source: &mut S,
     settings: &mut Settings<<Parts as SettingsOf>::Settings>,
 ) -> String
@@ -196,7 +205,10 @@ where
 /// read of one setting after `polls` polls; if `again`, reads settings to
 /// the end of the payload.
 #[call(sync)]
-async fn setting_dropped<F: Read<Error = Infallible>, A: ReceiverAccess<Family = F>>(
+async fn setting_dropped<
+    F: Read<Error = Infallible, Metadata = ()>,
+    A: ReceiverAccess<Family = F>,
+>(
     io: &mut A,
     polls: usize,
     again: bool,
@@ -309,7 +321,7 @@ struct Dropped {
 
 #[call(sync)]
 async fn drop_next<
-    F: Skip<Count = usize> + Read<Error = Infallible>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -504,7 +516,7 @@ fn a_next_frame_dropped_at_the_boundary_gives_what_one_never_dropped_gives() {
 /// after `polls` polls, and again if `again`.
 #[call(sync)]
 async fn skip_dropped<
-    F: Skip<Count = usize> + Read<Error = Infallible>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -545,7 +557,7 @@ fn a_payload_skipped_in_part_and_dropped_keeps_the_count_exact() {
 /// polls.
 #[call(sync)]
 async fn first_frame_dropped<
-    F: Skip<Count = usize> + Read<Error = Infallible>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -577,7 +589,7 @@ fn the_first_frame_dropped_while_read_consumes_only_what_it_reached() {
 /// A frame head that was rejected, and then another call.
 #[call(sync)]
 async fn after_a_rejected_head<
-    F: Skip<Count = usize> + Read<Error = Infallible>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,

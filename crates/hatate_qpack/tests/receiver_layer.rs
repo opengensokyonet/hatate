@@ -42,11 +42,12 @@ nitori_call::family_receiver!(impl ['a] for Trickle<'a>);
 
 impl Read for Trickle<'_> {
     type Error = Infallible;
+    type Metadata = ();
     fn poll_read<'v, B: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         dst: &mut B,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'v,
     {
@@ -58,14 +59,17 @@ impl Read for Trickle<'_> {
         }
         this.waiting = false;
         if !dst.has_remaining_mut() {
-            return Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(None));
         }
         let Some((&byte, rest)) = this.rest.split_first() else {
-            return Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(None));
         };
         this.rest = rest;
         dst.put_u8(byte);
-        Poll::Ready(Ok(1))
+        Poll::Ready(Ok(Some(nitori_io::ReadSegment {
+            count: core::num::NonZeroUsize::MIN,
+            metadata: (),
+        })))
     }
 }
 
@@ -93,13 +97,13 @@ fn poll_then_drop<T>(future: impl Future<Output = T>, polls: usize) -> bool {
 }
 
 /// What is left in the access, a byte at a time.
-async fn rest_of<A: ReceiverAccess<Family: Read>>(io: &mut A) -> Vec<u8> {
+async fn rest_of<A: ReceiverAccess<Family: Read<Metadata = ()>>>(io: &mut A) -> Vec<u8> {
     let mut bytes = Vec::new();
     loop {
         let mut byte = [0u8; 1];
         match io.read(&mut &mut byte[..]).await {
-            Ok(0) | Err(_) => return bytes,
-            Ok(_) => bytes.push(byte[0]),
+            Ok(None) | Err(_) => return bytes,
+            Ok(Some(_)) => bytes.push(byte[0]),
         }
     }
 }
@@ -125,14 +129,14 @@ macro_rules! drain_literal {
         match $source {
             LiteralSource::Raw(mut source) => loop {
                 let mut byte = [0u8; 1];
-                if $w!(source.read(&mut &mut byte[..])).unwrap() == 0 {
+                if $w!(source.read(&mut &mut byte[..])).unwrap().is_none() {
                     break;
                 }
                 got.push(byte[0]);
             },
             LiteralSource::Huffman(mut source) => loop {
                 let mut byte = [0u8; 1];
-                if $w!(source.read(&mut &mut byte[..])).unwrap() == 0 {
+                if $w!(source.read(&mut &mut byte[..])).unwrap().is_none() {
                     break;
                 }
                 got.push(byte[0]);
@@ -204,7 +208,7 @@ macro_rules! encoder_log {
 }
 
 #[call(sync)]
-async fn encoder_in_call<F: Read, A: ReceiverAccess<Family = F>>(
+async fn encoder_in_call<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
 ) -> (Vec<String>, Vec<u8>)
 where
@@ -213,7 +217,9 @@ where
     encoder_log!(&mut *io, aw)
 }
 
-fn encoder_on_receiver<F: Read, A: ReceiverAccess<Family = F>>(io: A) -> (Vec<String>, Vec<u8>)
+fn encoder_on_receiver<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: A,
+) -> (Vec<String>, Vec<u8>)
 where
     <F as Read>::Error: Debug,
 {
@@ -235,7 +241,7 @@ macro_rules! abandon_log {
 }
 
 #[call(sync)]
-async fn abandon_in_call<F: Read, A: ReceiverAccess<Family = F>>(
+async fn abandon_in_call<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
 ) -> (Vec<String>, Vec<u8>)
 where
@@ -244,7 +250,9 @@ where
     abandon_log!(&mut *io, aw)
 }
 
-fn abandon_on_receiver<F: Read, A: ReceiverAccess<Family = F>>(io: A) -> (Vec<String>, Vec<u8>)
+fn abandon_on_receiver<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: A,
+) -> (Vec<String>, Vec<u8>)
 where
     <F as Read>::Error: Debug,
 {
@@ -265,7 +273,7 @@ macro_rules! dropped_log {
 }
 
 #[call(sync)]
-async fn dropped_in_call<F: Read, A: ReceiverAccess<Family = F>>(
+async fn dropped_in_call<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     polls: usize,
 ) -> (bool, String, Vec<u8>)
@@ -275,7 +283,7 @@ where
     dropped_log!(&mut *io, aw, polls)
 }
 
-fn dropped_on_receiver<F: Read, A: ReceiverAccess<Family = F>>(
+fn dropped_on_receiver<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: A,
     polls: usize,
 ) -> (bool, String, Vec<u8>)
@@ -339,8 +347,11 @@ fn encoder_instructions_on_a_borrowed_receiver_leave_what_they_did_not_read() {
             panic!("not raw");
         };
         // The literal is read in two separate runs.
-        assert_eq!(run(source.read_array::<4>()).0.unwrap(), *b"www.");
-        assert_eq!(run(source.read_array::<11>()).0.unwrap(), *b"example.com");
+        assert_eq!(run(source.read_array::<4>()).0.unwrap().value, *b"www.");
+        assert_eq!(
+            run(source.read_array::<11>()).0.unwrap().value,
+            *b"example.com"
+        );
         value.finish().unwrap();
         // The stream is at a boundary again.
         assert_eq!(
@@ -416,7 +427,7 @@ macro_rules! decoder_log {
 }
 
 #[call(sync)]
-async fn decoder_in_call<F: Read, A: ReceiverAccess<Family = F>>(
+async fn decoder_in_call<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     count: usize,
 ) -> (Vec<String>, Vec<u8>)
@@ -426,7 +437,7 @@ where
     decoder_log!(&mut *io, aw, count)
 }
 
-fn decoder_on_receiver<F: Read, A: ReceiverAccess<Family = F>>(
+fn decoder_on_receiver<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: A,
     count: usize,
 ) -> (Vec<String>, Vec<u8>)
@@ -437,7 +448,7 @@ where
 }
 
 #[call(sync)]
-async fn decoder_dropped_in_call<F: Read, A: ReceiverAccess<Family = F>>(
+async fn decoder_dropped_in_call<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     polls: usize,
 ) -> (bool, String, Vec<u8>)
@@ -451,7 +462,7 @@ where
     (done, again, rest_of(&mut io).await)
 }
 
-fn decoder_dropped_on_receiver<F: Read, A: ReceiverAccess<Family = F>>(
+fn decoder_dropped_on_receiver<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: A,
     polls: usize,
 ) -> (bool, String, Vec<u8>)

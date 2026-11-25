@@ -15,7 +15,7 @@ use core::{
     task::{Context, Poll, ready},
 };
 use nitori_call::{Compose, ReceiverFamily};
-use nitori_io::{ExactLen, Min, Read, ReadChunk, Skip};
+use nitori_io::{ChunkSegment, ExactLen, Min, Read, ReadChunk, ReadSegment, Skip};
 use snafu::Snafu;
 
 /// The part of a frame's payload not yet consumed, composed onto the stream
@@ -57,24 +57,25 @@ impl FramePayload {
         parent: Pin<&mut F::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         destination: &mut O,
-    ) -> Poll<Result<usize, PayloadError<F::Error>>> {
+    ) -> PayloadPoll<F> {
         if self.failed {
             return Poll::Ready(Err(PayloadError::Failed));
         }
         let Some(missing) = NonZeroU64::new(self.remaining) else {
-            return Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(None));
         };
         let empty = destination.remaining_mut() == 0;
         let allowed = usize::try_from(self.remaining).unwrap_or(usize::MAX);
         let result = ready!(F::poll_read(parent, cx, &mut destination.limit(allowed)));
         match result {
-            Ok(0) if !empty => {
+            Ok(None) if !empty => {
                 self.failed = true;
                 Poll::Ready(Err(PayloadError::Truncated { missing }))
             }
-            Ok(count) => {
-                self.consume(count);
-                Poll::Ready(Ok(count))
+            Ok(None) => Poll::Ready(Ok(None)),
+            Ok(Some(segment)) => {
+                self.consume(segment.count.get());
+                Poll::Ready(Ok(Some(segment)))
             }
             Err(source) => {
                 self.failed = true;
@@ -83,6 +84,9 @@ impl FramePayload {
         }
     }
 }
+
+type PayloadPoll<F> =
+    Poll<Result<Option<ReadSegment<<F as Read>::Metadata>>, PayloadError<<F as Read>::Error>>>;
 
 /// Failures reading a payload through [`FramePayload`].
 #[derive(Debug, Snafu)]
@@ -165,21 +169,26 @@ impl<F: ReceiverFamily> Compose<F> for FramePayload {
 // when the rest of the payload has been read, even on a live stream.
 impl<F: ReceiverFamily> ExactLen for PayloadSource<F> {
     type Length = u64;
-    fn remaining_len<'v>(view: Pin<&mut Self::ReceiverView<'v>>) -> u64
+    type LengthError = !;
+    fn poll_remaining_len<'v>(
+        view: Pin<&mut Self::ReceiverView<'v>>,
+        _: &mut Context<'_>,
+    ) -> Poll<Result<u64, !>>
     where
         Self: 'v,
     {
-        view.project().state.remaining
+        Poll::Ready(Ok(view.project().state.remaining))
     }
 }
 
 impl<F: Read> Read for PayloadSource<F> {
     type Error = PayloadError<F::Error>;
+    type Metadata = F::Metadata;
     fn poll_read<'v, O: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         destination: &mut O,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<ReadSegment<F::Metadata>>, Self::Error>>
     where
         Self: 'v,
     {
@@ -194,7 +203,7 @@ impl<F: ReadChunk> ReadChunk for PayloadSource<F> {
         host: Pin<&mut Self::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         maximum: NonZeroUsize,
-    ) -> Poll<Result<Option<F::Chunk>, Self::Error>>
+    ) -> Poll<Result<Option<ChunkSegment<F::Chunk, <F as Read>::Metadata>>, Self::Error>>
     where
         Self: 'v,
     {
@@ -213,7 +222,7 @@ impl<F: ReadChunk> ReadChunk for PayloadSource<F> {
         let result = ready!(F::poll_read_chunk(view.parent, cx, allowed));
         match result {
             Ok(Some(chunk)) => {
-                state.consume(chunk.remaining());
+                state.consume(chunk.chunk.remaining());
                 Poll::Ready(Ok(Some(chunk)))
             }
             Ok(None) => {

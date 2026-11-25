@@ -62,7 +62,7 @@ pub(crate) enum StreamState {
 
 impl<A: ReceiverAccess> EncoderStream<A>
 where
-    A::Family: Read,
+    A::Family: Read<Metadata = ()>,
 {
     /// The stream on `io`, an access or an exclusive borrow of one, at an
     /// instruction boundary. Nothing is read.
@@ -200,7 +200,7 @@ pub struct ValueStart<'s, A> {
 
 impl<'s, A: ReceiverAccess> ValueStart<'s, A>
 where
-    A::Family: Read,
+    A::Family: Read<Metadata = ()>,
 {
     /// Consume the value header and lend out its bounded payload source.
     pub async fn open(

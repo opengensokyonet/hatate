@@ -20,7 +20,10 @@ type Parts = HList![hatate_wire::Part];
 hatate_wire::assert_claims_valid!(Parts);
 
 #[call(sync)]
-async fn settings_then_goaway<F: Skip<Count = usize>, A: ReceiverAccess<Family = F>>(
+async fn settings_then_goaway<
+    F: Skip<Count = usize, Metadata = ()>,
+    A: ReceiverAccess<Family = F>,
+>(
     io: &mut A,
 ) -> (usize, u64)
 where

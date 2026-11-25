@@ -25,7 +25,7 @@ macro_rules! frame_reader {
     ($name:ident, $frame:ty, $kind:expr, $method:ident) => {
         /// Reads one whole frame of the kind from the stream.
         #[call(sync)]
-        async fn $name<F: Read, A: ReceiverAccess<Family = F>>(
+        async fn $name<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
             io: &mut A,
         ) -> Result<$frame, ReadIntegerFrameError<PayloadError<F::Error>>> {
             // A server receives every frame of a control stream.
@@ -290,7 +290,7 @@ fn a_pending_between_every_byte_changes_nothing() {
 
 /// Reads the integer of a GOAWAY from a payload of the stream.
 #[call(sync)]
-async fn goaway_of<F: Read, A: ReceiverAccess<Family = F>>(
+async fn goaway_of<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     payload: &mut hatate_wire::frame::payload::FramePayload,
 ) -> Result<GoawayFrame, ReadIntegerFrameError<PayloadError<F::Error>>> {

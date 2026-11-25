@@ -25,7 +25,7 @@ use hatate_qpack::{
     encoder_instruction::{EncoderStream, Started, codec::StartError},
 };
 use nitori_call::{Compose, Composed, ReceiverAccess, ReceiverFamily};
-use nitori_io::{Min, Read, ReadChunk, Skip};
+use nitori_io::{ChunkSegment, Min, Read, ReadChunk, ReadSegment, Skip};
 use snafu::Snafu;
 
 /// Composition state for a critical stream: the end of the stream is a
@@ -94,19 +94,20 @@ impl<F: ReceiverFamily> Compose<F> for CriticalStream {
 
 impl<F: Read> Read for CriticalSource<F> {
     type Error = CriticalStreamError<F::Error>;
+    type Metadata = F::Metadata;
     fn poll_read<'v, O: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         destination: &mut O,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<ReadSegment<F::Metadata>>, Self::Error>>
     where
         Self: 'v,
     {
         let empty = destination.remaining_mut() == 0;
         Poll::Ready(
             match ready!(F::poll_read(host.project().parent, cx, destination)) {
-                Ok(0) if !empty => Err(CriticalStreamError::Closed),
-                Ok(count) => Ok(count),
+                Ok(None) if !empty => Err(CriticalStreamError::Closed),
+                Ok(segment) => Ok(segment),
                 Err(source) => Err(CriticalStreamError::Host { source }),
             },
         )
@@ -119,7 +120,7 @@ impl<F: ReadChunk> ReadChunk for CriticalSource<F> {
         host: Pin<&mut Self::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         maximum: NonZeroUsize,
-    ) -> Poll<Result<Option<F::Chunk>, Self::Error>>
+    ) -> Poll<Result<Option<ChunkSegment<F::Chunk, <F as Read>::Metadata>>, Self::Error>>
     where
         Self: 'v,
     {
@@ -162,7 +163,7 @@ pub struct QpackEncoderStream<A> {
 
 impl<A: ReceiverAccess> QpackEncoderStream<A>
 where
-    Composed<A, CriticalStream>: ReceiverAccess<Family: Read>,
+    Composed<A, CriticalStream>: ReceiverAccess<Family: Read<Metadata = ()>>,
 {
     /// The stream on `io`, right after its type. Nothing is read.
     pub fn new(io: A) -> Self {
@@ -214,7 +215,7 @@ pub struct QpackDecoderStream<A> {
 
 impl<A: ReceiverAccess> QpackDecoderStream<A>
 where
-    Composed<A, CriticalStream>: ReceiverAccess<Family: Read>,
+    Composed<A, CriticalStream>: ReceiverAccess<Family: Read<Metadata = ()>>,
 {
     /// The stream on `io`, right after its type. Nothing is read.
     pub fn new(io: A) -> Self {

@@ -15,12 +15,13 @@ use crate::{
     parts::PartsError,
 };
 use alloc::vec::Vec;
-use core::{fmt, future::poll_fn, task::Poll};
+use core::fmt;
 use nitori_call::{ReceiverAccess, call};
+use nitori_codec::prelude::*;
 use nitori_io::{ExactLen, prelude::*};
 use sakuya_var_int::{
     VarInt, VarIntField,
-    call::{ReadVarIntError, ReadVarIntFieldExt as _, WriteVarIntError, WriteVarIntFieldExt as _},
+    stream::{ReadVarIntError, WriteVarIntError},
 };
 use snafu::{ResultExt, Snafu};
 
@@ -65,20 +66,23 @@ impl DuplicateSettingError {
 /// [`ReadSettingError`]; its [`ErrorCodeOf::error_code`] gives the
 /// connection error it calls for.
 #[call(sync)]
-pub async fn read_setting<L: SettingList, F: Read + ExactLen, A: ReceiverAccess<Family = F>>(
+pub async fn read_setting<
+    L: SettingList,
+    F: Read<Metadata = ()> + ExactLen<LengthError = !>,
+    A: ReceiverAccess<Family = F>,
+>(
     io: &mut A,
     settings: &mut Settings<L>,
 ) -> Result<Option<Setting<L::Setting>>, ReadSettingError<F::Error, L::ValueErrors>>
 where
     <F as ExactLen>::Length: TryInto<u64>,
 {
-    let remaining =
-        poll_fn(|cx| io.poll_access(cx, |mut view, _| Poll::Ready(view.remaining_len()))).await;
+    let Ok(remaining) = io.remaining_len().await;
     if matches!(remaining.try_into(), Ok(0u64)) {
         return Ok(None);
     }
     let identifier = io
-        .read_var_int_field::<VarInt>()
+        .decode::<VarIntField<VarInt>>()
         .await
         .context(read_setting_error::IdentifierSnafu)?;
     if let Some(identifier) = Http2SettingIdentifier::of(identifier.get()) {
@@ -87,7 +91,7 @@ where
         });
     }
     let value = io
-        .read_var_int_field::<VarInt>()
+        .decode::<VarIntField<VarInt>>()
         .await
         .context(read_setting_error::ValueSnafu)?;
     let Some(setting) = L::setting_of(identifier, value) else {
@@ -313,7 +317,11 @@ pub enum SettingsFrameError {
 /// [`WriteSettingsFrameError`]; bytes accepted before the failure stay
 /// written.
 #[call(sync)]
-pub async fn write_settings_frame<L: SettingList, F: Write, A: ReceiverAccess<Family = F>>(
+pub async fn write_settings_frame<
+    L: SettingList,
+    F: Write<Report = ()>,
+    A: ReceiverAccess<Family = F>,
+>(
     io: &mut A,
     frame: &SettingsFrame<L>,
 ) -> Result<(), WriteSettingsFrameError<F::Error>> {
@@ -324,10 +332,10 @@ pub async fn write_settings_frame<L: SettingList, F: Write, A: ReceiverAccess<Fa
         .context(write_settings_frame_error::HeadSnafu)?;
     for (index, setting) in frame.settings.iter().enumerate() {
         let (identifier, value) = fields::<L>(setting);
-        io.write_var_int_field(identifier)
+        io.encode(identifier)
             .await
             .context(write_settings_frame_error::IdentifierSnafu { index })?;
-        io.write_var_int_field(value)
+        io.encode(value)
             .await
             .context(write_settings_frame_error::ValueSnafu { index })?;
     }

@@ -16,7 +16,7 @@ use nitori_io::Read;
 /// One instruction from a fresh stream; after a failure the same stream must
 /// report the interruption.
 #[call(sync)]
-async fn read_one<F: Read, A: ReceiverAccess<Family = F>>(
+async fn read_one<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     max_wire_len: usize,
 ) -> Result<Option<D>, ()> {

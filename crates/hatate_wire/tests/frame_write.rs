@@ -24,7 +24,7 @@ use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 /// Writes a frame with this Type and Length whose payload comes from the
 /// second receiver of the host, the output being the first.
 #[call(sync)]
-async fn write_payload<R: Read + ExactLen, F: Write>(
+async fn write_payload<R: Read<Metadata = ()> + ExactLen<LengthError = !>, F: Write<Report = ()>>(
     out: &mut impl ReceiverAccess<Family = F>,
     payload: &mut impl ReceiverAccess<Family = R>,
     r#type: VarIntField<VarInt>,
@@ -39,7 +39,7 @@ where
 /// The Type, Length, widths and unread payload of the frame at the start of
 /// `input`.
 #[call(sync)]
-async fn read_head<F: Read>(
+async fn read_head<F: Read<Metadata = ()>>(
     io: &mut impl ReceiverAccess<Family = F>,
 ) -> (VarIntField<VarInt>, VarIntField<VarInt>, FrameWidths, u64)
 where

@@ -4,7 +4,7 @@ mod common;
 
 use bytes::{Buf, Bytes};
 use common::{Boom, Broken, Dribble, Overskip, run};
-use core::{future::poll_fn, num::NonZeroUsize, task::Poll};
+use core::num::NonZeroUsize;
 use hatate_wire::{
     error_code::{ErrorCode, ErrorCodeOf as _},
     frame::payload::{FramePayload, PayloadError},
@@ -14,21 +14,24 @@ use nitori_io::{Read, ReadChunk, Skip, prelude::*};
 
 /// One read of at most `size` bytes from the payload.
 #[call(sync)]
-async fn read_some<F: Read, A: ReceiverAccess<Family = F>>(
+async fn read_some<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     payload: &mut FramePayload,
     size: usize,
 ) -> Result<Vec<u8>, PayloadError<F::Error>> {
     let mut source = io.compose(payload);
     let mut buffer = vec![0; size];
-    let count = source.read(&mut &mut buffer[..]).await?;
+    let count = source
+        .read(&mut &mut buffer[..])
+        .await?
+        .map_or(0, |segment| segment.count.get());
     buffer.truncate(count);
     Ok(buffer)
 }
 
 /// Reads the payload to its end, three bytes at a time.
 #[call(sync)]
-async fn read_all<F: Read, A: ReceiverAccess<Family = F>>(
+async fn read_all<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     payload: &mut FramePayload,
 ) -> Result<Vec<u8>, PayloadError<F::Error>> {
@@ -36,7 +39,10 @@ async fn read_all<F: Read, A: ReceiverAccess<Family = F>>(
     let mut all = Vec::new();
     loop {
         let mut buffer = [0; 3];
-        let count = source.read(&mut &mut buffer[..]).await?;
+        let count = source
+            .read(&mut &mut buffer[..])
+            .await?
+            .map_or(0, |segment| segment.count.get());
         if count == 0 {
             return Ok(all);
         }
@@ -46,7 +52,7 @@ async fn read_all<F: Read, A: ReceiverAccess<Family = F>>(
 
 /// Reads the payload to its end in chunks of at most `maximum` bytes.
 #[call(sync)]
-async fn read_chunks_all<F: ReadChunk, A: ReceiverAccess<Family = F>>(
+async fn read_chunks_all<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     payload: &mut FramePayload,
     maximum: usize,
@@ -57,14 +63,14 @@ async fn read_chunks_all<F: ReadChunk, A: ReceiverAccess<Family = F>>(
         .read_chunk(NonZeroUsize::new(maximum).unwrap())
         .await?
     {
-        chunks.push(chunk.copy_to_bytes(chunk.remaining()).to_vec());
+        chunks.push(chunk.chunk.copy_to_bytes(chunk.chunk.remaining()).to_vec());
     }
     Ok(chunks)
 }
 
 /// The remaining length before reading, after two bytes, and at the end.
 #[call(sync)]
-async fn lengths<F: Read, A: ReceiverAccess<Family = F>>(
+async fn lengths<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     payload: &mut FramePayload,
 ) -> Vec<u64> {
@@ -73,17 +79,15 @@ async fn lengths<F: Read, A: ReceiverAccess<Family = F>>(
     for size in [0, 2, 100] {
         let mut buffer = vec![0; size];
         let _ = source.read(&mut &mut buffer[..]).await;
-        lengths.push(
-            poll_fn(|cx| source.poll_access(cx, |mut view, _| Poll::Ready(view.remaining_len())))
-                .await,
-        );
+        let Ok(length) = source.remaining_len().await;
+        lengths.push(length);
     }
     lengths
 }
 
 /// Skips the rest of the payload.
 #[call(sync)]
-async fn skip_payload<F: Skip<Count = usize>, A: ReceiverAccess<Family = F>>(
+async fn skip_payload<F: Skip<Count = usize, Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     payload: &mut FramePayload,
 ) -> Result<(), PayloadError<F::Error>> {

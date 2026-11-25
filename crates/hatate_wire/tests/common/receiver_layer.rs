@@ -33,11 +33,12 @@ nitori_call::family_receiver!(impl ['a] for Fixed<'a>);
 
 impl Read for Fixed<'_> {
     type Error = Infallible;
+    type Metadata = ();
     fn poll_read<'visit, B: bytes::BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'visit>>,
         _cx: &mut Context<'_>,
         dst: &mut B,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -47,7 +48,12 @@ impl Read for Fixed<'_> {
         let (head, tail) = this.input.split_at(count);
         dst.put_slice(head);
         this.input = tail;
-        Poll::Ready(Ok(count))
+        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| {
+            nitori_io::ReadSegment {
+                count,
+                metadata: (),
+            }
+        })))
     }
 }
 

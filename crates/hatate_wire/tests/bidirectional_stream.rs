@@ -85,7 +85,7 @@ macro_rules! probe_part {
                 }
             }
 
-            async fn read<I: ReceiverAccess<Family: Read>>(
+            async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
                 skipped: bool,
                 _field: VarIntField<VarInt>,
                 _io: I,
@@ -217,7 +217,7 @@ fn failed<
 }
 
 /// Reads at most `take` bytes from `io`, stopping at the end.
-async fn read_some<A: ReceiverAccess<Family: Read>>(
+async fn read_some<A: ReceiverAccess<Family: Read<Metadata = ()>>>(
     io: &mut A,
     take: usize,
 ) -> Result<Vec<u8>, <A::Family as Read>::Error> {
@@ -225,7 +225,10 @@ async fn read_some<A: ReceiverAccess<Family: Read>>(
     let mut buffer = [0; 7];
     while bytes.len() < take {
         let want = (take - bytes.len()).min(buffer.len());
-        let count = io.read(&mut &mut buffer[..want]).await?;
+        let count = io
+            .read(&mut &mut buffer[..want])
+            .await?
+            .map_or(0, |segment| segment.count.get());
         if count == 0 {
             break;
         }
@@ -239,7 +242,9 @@ async fn read_some<A: ReceiverAccess<Family: Read>>(
 async fn request_frames<L, I>(mut request: FrameStream<L, RequestStreamKind, I>) -> Started
 where
     L: hatate_wire::frame::set::FrameSetOn<RequestStreamKind>,
-    I: ReceiverAccess<Family: Skip<Count = usize> + Read<Error = Infallible>>,
+    I: ReceiverAccess<
+        Family: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
+    >,
 {
     let mut frames = Vec::new();
     let mut frame = request.frame();
@@ -285,7 +290,7 @@ macro_rules! start {
     ($name:ident, $list:ty, $class:ty, |$stream:ident| $known:expr) => {
         #[call(sync)]
         async fn $name<
-            F: Read<Error = Infallible> + Skip<Count = usize>,
+            F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
             A: ReceiverAccess<Family = F>,
         >(
             io: &mut A,
@@ -577,9 +582,9 @@ fn values_no_part_claims_are_unknown_streams_that_are_discarded_to_the_end() {
 /// second, as the frames are read.
 #[call(sync)]
 async fn rewrite<
-    R: Read<Error = Infallible> + Skip<Count = usize>,
+    R: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = R>,
-    W: Write,
+    W: Write<Report = ()>,
     B: ReceiverAccess<Family = W>,
 >(
     io: &mut A,

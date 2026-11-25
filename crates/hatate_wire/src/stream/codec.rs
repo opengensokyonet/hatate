@@ -15,11 +15,9 @@ use crate::{
     stream_type::StreamTypeSet,
 };
 use nitori_call::{Composed, ReceiverAccess};
+use nitori_codec::prelude::*;
 use nitori_io::{Infinite, Min, Read, Skip, prelude::*};
-use sakuya_var_int::{
-    VarInt,
-    call::{ReadVarIntError, ReadVarIntFieldExt as _},
-};
+use sakuya_var_int::{VarInt, VarIntField, stream::ReadVarIntError};
 use snafu::{ResultExt, Snafu};
 
 /// The stream that [`read_unidirectional_stream`] gives.
@@ -63,7 +61,7 @@ pub async fn read_unidirectional_stream<L, C, I>(
 where
     C: UnidirectionalClass,
     L: StreamSet<C, L> + StreamTypeSet,
-    I: ReceiverAccess<Family: Read>,
+    I: ReceiverAccess<Family: Read<Metadata = ()>>,
 {
     const {
         assert!(
@@ -71,7 +69,7 @@ where
             "the parts claim overlapping or reserved stream types"
         );
     }
-    let field = match io.read_var_int_field::<VarInt>().await {
+    let field = match io.decode::<VarIntField<VarInt>>().await {
         Ok(field) => field,
         Err(error) if error.is_incomplete() && error.completed() == 0 => return Ok(None),
         Err(source) => return Err(ReadUnidirectionalStreamError::Type { source }),
@@ -178,7 +176,7 @@ pub async fn read_bidirectional_stream<L, C, I>(
 where
     C: BidirectionalClass,
     L: StreamSet<C, L>,
-    I: ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>>>,
+    I: ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>, Metadata = ()>>,
     u64: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
     Infinite: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
 {

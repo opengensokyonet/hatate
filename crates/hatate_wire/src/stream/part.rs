@@ -75,7 +75,7 @@ pub trait StreamPart<C: StreamClass, L> {
     /// Reads what follows the value `claimed`, read as `field`, from `io`,
     /// and gives the stream of this part.
     #[allow(clippy::type_complexity)] // The part's stream and failure on `I`.
-    fn read<I: ReceiverAccess<Family: Read>>(
+    fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
         claimed: Self::Claimed,
         field: VarIntField<VarInt>,
         io: I,
@@ -106,7 +106,7 @@ pub trait StreamSet<C: StreamClass, L> {
 
     /// Reads what follows `claimed`, as the part that claims it does.
     #[allow(clippy::type_complexity)] // The part's stream and failure on `I`.
-    fn read<I: ReceiverAccess<Family: Read>>(
+    fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
         claimed: Self::Claimed,
         field: VarIntField<VarInt>,
         io: I,
@@ -123,7 +123,7 @@ impl<C: StreamClass, L> StreamSet<C, L> for HNil {
         StreamVerdict::NotClaimed
     }
 
-    async fn read<I: ReceiverAccess<Family: Read>>(
+    async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
         claimed: CNil,
         _field: VarIntField<VarInt>,
         _io: I,
@@ -151,7 +151,7 @@ impl<C: StreamClass, L, P: StreamPart<C, L>, Ps: StreamSet<C, L>> StreamSet<C, L
         }
     }
 
-    async fn read<I: ReceiverAccess<Family: Read>>(
+    async fn read<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
         claimed: Self::Claimed,
         field: VarIntField<VarInt>,
         io: I,

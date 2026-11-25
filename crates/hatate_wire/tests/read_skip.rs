@@ -35,7 +35,7 @@ async fn walk<K: StreamKind, F>(
     take: usize,
 ) -> Vec<Seen>
 where
-    F: Skip<Count = usize> + Read<Error = Infallible>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
     Parts: FrameSetOn<K>,
 {
     let mut seen = Vec::new();
@@ -57,7 +57,7 @@ where
 
 /// `ReadSkip` below the frame stream.
 #[call(sync)]
-async fn below_read_skip<K: StreamKind, F: Read<Error = Infallible>>(
+async fn below_read_skip<K: StreamKind, F: Read<Error = Infallible, Metadata = ()>>(
     io: &mut impl ReceiverAccess<Family = F>,
     kind: K,
     take: usize,
@@ -71,7 +71,7 @@ where
 
 /// `ReadChunkSkip` below the frame stream.
 #[call(sync)]
-async fn below_read_chunk_skip<K: StreamKind, F: ReadChunk<Error = Infallible>>(
+async fn below_read_chunk_skip<K: StreamKind, F: ReadChunk<Error = Infallible, Metadata = ()>>(
     io: &mut impl ReceiverAccess<Family = F>,
     kind: K,
     take: usize,

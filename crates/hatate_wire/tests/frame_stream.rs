@@ -108,7 +108,7 @@ async fn walk<K: StreamKind, F>(
     take: usize,
 ) -> (Vec<Seen>, End)
 where
-    F: Skip<Count = usize> + Read<Error = Infallible>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
     Parts: FrameSetOn<K>,
 {
     let mut seen = Vec::new();
@@ -424,7 +424,7 @@ fn the_types_no_part_has_are_told_reserved_from_unknown() {
 #[call(sync)]
 async fn known_frames<F>(io: &mut impl ReceiverAccess<Family = F>) -> (Ty, Vec<Seen>, Seen, u64)
 where
-    F: Skip<Count = usize> + Read<Error = Infallible>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
 {
     let mut stream = FrameStream::<Parts, RequestStreamKind, _>::read(&mut *io, Role::Server)
         .await
@@ -516,7 +516,7 @@ fn next_known_frame_of_a_stream_of_one_known_frame_ends_at_it() {
 #[call(sync)]
 async fn past_the_end<F>(io: &mut impl ReceiverAccess<Family = F>) -> Vec<u8>
 where
-    F: Skip<Count = usize> + Read<Error = Infallible>,
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
 {
     let mut stream = FrameStream::<Parts, RequestStreamKind, _>::read(&mut *io, Role::Server)
         .await
@@ -557,7 +557,7 @@ fn after_the_end_a_stream_holds_the_last_frame_with_an_empty_payload() {
 /// The first frame's head is read when the stream is made, and the access
 /// comes back at the start of its payload.
 #[call(sync)]
-async fn io_after_the_first_head<F: Read<Error = Infallible>>(
+async fn io_after_the_first_head<F: Read<Error = Infallible, Metadata = ()>>(
     io: &mut impl ReceiverAccess<Family = F>,
 ) -> Vec<u8> {
     let stream = FrameStream::<Parts, RequestStreamKind, _>::read(&mut *io, Role::Server)
@@ -576,7 +576,9 @@ fn the_access_comes_back_at_the_payload_of_the_current_frame() {
 
 /// Reads the SETTINGS and GOAWAY of a control stream with their readers.
 #[call(sync)]
-async fn settings_and_goaway<F: Skip<Count = usize> + Read<Error = Infallible>>(
+async fn settings_and_goaway<
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
+>(
     io: &mut impl ReceiverAccess<Family = F>,
 ) -> (usize, u64) {
     let mut stream = FrameStream::<Parts, ControlStreamKind, _>::read(&mut *io, Role::Server)
@@ -621,7 +623,9 @@ fn the_frames_of_a_control_stream_read_with_their_readers() {
 /// Reads CANCEL_PUSH and MAX_PUSH_ID of a control stream with their
 /// readers, through the payload of the frame read from the stream.
 #[call(sync)]
-async fn cancel_push_and_max_push_id<F: Skip<Count = usize> + Read<Error = Infallible>>(
+async fn cancel_push_and_max_push_id<
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
+>(
     io: &mut impl ReceiverAccess<Family = F>,
 ) -> (u64, usize, u64, usize) {
     use hatate_wire::frame::control::codec::{
@@ -667,7 +671,9 @@ fn cancel_push_and_max_push_id_read_through_the_payload_of_the_current_frame() {
 /// payload of the frame read from the stream: the Push ID, the rest of the
 /// payload, and whether the stream ends after it.
 #[call(sync)]
-async fn push_promise<F: Skip<Count = usize> + Read<Error = Infallible>>(
+async fn push_promise<
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
+>(
     io: &mut impl ReceiverAccess<Family = F>,
 ) -> (u64, Vec<u8>, bool) {
     use hatate_wire::frame::codec::ReadPushPromisePushIdExt as _;
@@ -695,8 +701,8 @@ fn push_promise_reads_its_push_id_through_the_payload_of_the_current_frame() {
 #[call(sync)]
 async fn copy_frames<
     K: StreamKind,
-    R: Skip<Count = usize> + Read<Error = Infallible>,
-    W: Write<Error = Infallible>,
+    R: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
+    W: Write<Error = Infallible, Report = ()>,
 >(
     input: &mut impl ReceiverAccess<Family = R>,
     output: &mut impl ReceiverAccess<Family = W>,

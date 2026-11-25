@@ -35,7 +35,7 @@ type Error = ReadSettingError<PayloadError<Infallible>, <List as SettingList>::V
 /// Reads one whole SETTINGS frame into `settings`, and finishes its payload
 /// when every setting was read.
 #[call(sync)]
-async fn read_settings<L: SettingList, F: Read, A: ReceiverAccess<Family = F>>(
+async fn read_settings<L: SettingList, F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     settings: &mut Settings<L>,
 ) -> Result<Vec<Setting<L::Setting>>, ReadSettingError<PayloadError<F::Error>, L::ValueErrors>> {
@@ -60,7 +60,9 @@ async fn read_settings<L: SettingList, F: Read, A: ReceiverAccess<Family = F>>(
 
 /// The widths of Type and Length of the frame at the start of the stream.
 #[call(sync)]
-async fn head_widths<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> FrameWidths
+async fn head_widths<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+) -> FrameWidths
 where
     <F as Read>::Error: core::fmt::Debug,
 {

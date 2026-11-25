@@ -82,12 +82,16 @@ impl<E> OctetError<E> {
     }
 }
 
-pub(crate) async fn octet<F: Read>(
+pub(crate) async fn octet<F: Read<Metadata = ()>>(
     io: &mut impl ReceiverAccess<Family = F>,
     budget: &mut WireBudget,
 ) -> Result<u8, OctetError<F::Error>> {
     budget.take(1)?;
-    let [byte] = io.read_array::<1>().await.context(octet_error::ReadSnafu)?;
+    let [byte] = io
+        .read_array::<1>()
+        .await
+        .context(octet_error::ReadSnafu)?
+        .value;
     Ok(byte)
 }
 
@@ -109,7 +113,7 @@ pub enum NumberError<E> {
     },
 }
 
-pub(crate) async fn number<const N: u8, F: Read>(
+pub(crate) async fn number<const N: u8, F: Read<Metadata = ()>>(
     io: &mut impl ReceiverAccess<Family = F>,
     budget: &mut WireBudget,
     first: u8,
@@ -119,7 +123,7 @@ pub(crate) async fn number<const N: u8, F: Read>(
 
 // The containing representation can already imply a minimum size while the
 // integer still needs another digit. Run its check before requesting that digit.
-pub(crate) async fn checked_number<const N: u8, F: Read, E>(
+pub(crate) async fn checked_number<const N: u8, F: Read<Metadata = ()>, E>(
     io: &mut impl ReceiverAccess<Family = F>,
     budget: &mut WireBudget,
     first: u8,

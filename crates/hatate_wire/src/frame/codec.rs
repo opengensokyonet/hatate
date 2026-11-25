@@ -9,30 +9,31 @@ use crate::{
     error_code::{ErrorCode, ErrorCodeOf},
     stream::kind::StreamKind,
 };
-use core::{future::poll_fn, num::NonZeroU64, task::Poll};
+use core::num::NonZeroU64;
 use nitori_call::{ReceiverAccess, call};
+use nitori_codec::prelude::*;
 use nitori_io::{ExactLen, calls::WriteAllError, prelude::*};
 use sakuya_var_int::{
     VarInt, VarIntField, VarIntWidth, VarIntWidthError,
-    call::{ReadVarIntError, ReadVarIntFieldExt as _, WriteVarIntError, WriteVarIntFieldExt as _},
+    stream::{ReadVarIntError, WriteVarIntError},
 };
 use snafu::{ResultExt, Snafu};
 
 /// The Type of the next frame, or `None` at the end of the stream.
-pub(crate) async fn read_type<I: ReceiverAccess<Family: Read>>(
+pub(crate) async fn read_type<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
     io: &mut I,
 ) -> Result<Option<VarIntField<VarInt>>, ReadFrameError<<I::Family as Read>::Error>> {
-    match io.read_var_int_field::<VarInt>().await {
+    match io.decode::<VarIntField<VarInt>>().await {
         Ok(field) => Ok(Some(field)),
         Err(error) if error.is_incomplete() && error.completed() == 0 => Ok(None),
         Err(source) => Err(ReadFrameError::Type { source }),
     }
 }
 
-pub(crate) async fn read_length<I: ReceiverAccess<Family: Read>>(
+pub(crate) async fn read_length<I: ReceiverAccess<Family: Read<Metadata = ()>>>(
     io: &mut I,
 ) -> Result<VarIntField<VarInt>, ReadFrameError<<I::Family as Read>::Error>> {
-    io.read_var_int_field::<VarInt>()
+    io.decode::<VarIntField<VarInt>>()
         .await
         .context(read_frame_error::LengthSnafu)
 }
@@ -185,7 +186,7 @@ impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadFrameHeadError<E>
 /// Writes the Type and Length of a frame, each at its width: the step every
 /// writer of a frame takes before its payload, which must follow, of exactly
 /// `length` bytes. A type of HTTP/2 is reported before anything is written.
-pub(crate) async fn write_head<F: Write, A: ReceiverAccess<Family = F>>(
+pub(crate) async fn write_head<F: Write<Report = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     type_field: VarIntField<VarInt>,
     length: VarIntField<VarInt>,
@@ -195,10 +196,10 @@ pub(crate) async fn write_head<F: Write, A: ReceiverAccess<Family = F>>(
             source: Http2FrameTypeError::new(frame_type),
         });
     }
-    io.write_var_int_field(type_field)
+    io.encode(type_field)
         .await
         .context(write_frame_head_error::TypeSnafu)?;
-    io.write_var_int_field(length)
+    io.encode(length)
         .await
         .context(write_frame_head_error::LengthSnafu)
 }
@@ -246,9 +247,9 @@ pub enum WriteFrameHeadError<E> {
 #[call(sync)]
 pub async fn write_frame<
     T: Copy + Into<VarInt> + TryFrom<VarInt>,
-    R: Read + ExactLen,
+    R: Read + ExactLen<LengthError = !>,
     P: ReceiverAccess<Family = R>,
-    F: Write,
+    F: Write<Report = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -262,9 +263,7 @@ where
     let r#type = VarIntField::new(frame.r#type.to_var_int(), frame.r#type.width())
         .expect("a field's width holds its value");
     let mut payload = frame.payload;
-    let remaining =
-        poll_fn(|cx| payload.poll_access(cx, |mut view, _| Poll::Ready(view.remaining_len())))
-            .await;
+    let Ok(remaining) = payload.remaining_len().await;
     // A length that does not fit a u64 is not the Length either.
     let payload_length = remaining.try_into().ok();
     let declared = length.get().get();
@@ -340,9 +339,9 @@ impl FrameLengthMismatchError {
 /// stream inside the frame.
 #[call(sync)]
 pub async fn write_push_promise_frame<
-    R: Read + ExactLen,
+    R: Read + ExactLen<LengthError = !>,
     P: ReceiverAccess<Family = R>,
-    F: Write,
+    F: Write<Report = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -367,7 +366,7 @@ where
     write_head(io, type_field, length_field)
         .await
         .context(write_push_promise_frame_error::HeadSnafu)?;
-    io.write_var_int_field(push_id)
+    io.encode(push_id)
         .await
         .context(write_push_promise_frame_error::PushIdSnafu)?;
     copy_payload(io, section, section_length)
@@ -445,14 +444,13 @@ pub enum CopyPayloadError<R, W> {
 }
 
 /// The exact remaining length of `source`.
-async fn exact_length<R: Read + ExactLen, P: ReceiverAccess<Family = R>>(
+async fn exact_length<R: Read + ExactLen<LengthError = !>, P: ReceiverAccess<Family = R>>(
     source: &mut P,
 ) -> Result<u64, FrameLengthError>
 where
     <R as ExactLen>::Length: TryInto<u64>,
 {
-    let length =
-        poll_fn(|cx| source.poll_access(cx, |mut view, _| Poll::Ready(view.remaining_len()))).await;
+    let Ok(length) = source.remaining_len().await;
     // A length that does not fit a u64 exceeds 2^62 - 1 too.
     length.try_into().map_err(|_| FrameLengthError::OutOfRange)
 }
@@ -475,7 +473,7 @@ pub(crate) fn length_field(
 async fn copy_payload<
     R: Read,
     P: ReceiverAccess<Family = R>,
-    F: Write,
+    F: Write<Report = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -486,13 +484,14 @@ async fn copy_payload<
     let mut buffer = [0; 1024];
     while let Some(missing) = NonZeroU64::new(remaining) {
         let request = Ord::min(remaining, buffer.len() as u64) as usize;
-        let count = source
+        let Some(segment) = source
             .read(&mut &mut buffer[..request])
             .await
-            .context(copy_payload_error::ReadSnafu)?;
-        if count == 0 {
+            .context(copy_payload_error::ReadSnafu)?
+        else {
             return Err(CopyPayloadError::ShortSource { missing });
-        }
+        };
+        let count = segment.count.get();
         // invariant: a read into a slice of `request` bytes fills at most
         // `request`, which is at most `remaining`.
         remaining = u64::try_from(count)
@@ -525,10 +524,10 @@ async fn copy_payload<
 ///
 /// [RFC 9114 §7.2.5]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.5
 #[call(sync)]
-pub async fn read_push_promise_push_id<F: Read, A: ReceiverAccess<Family = F>>(
+pub async fn read_push_promise_push_id<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
 ) -> Result<VarIntField<PushId>, ReadPushPromisePushIdError<F::Error>> {
-    io.read_var_int_field::<PushId>()
+    io.decode::<VarIntField<PushId>>()
         .await
         .context(ReadPushPromisePushIdSnafu)
 }

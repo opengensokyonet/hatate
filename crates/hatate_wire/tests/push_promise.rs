@@ -37,7 +37,7 @@ struct Promise {
 /// Reads a whole PUSH_PROMISE frame: its Push ID, then the rest of the
 /// payload.
 #[call(sync)]
-async fn read_promise<F: Read, A: ReceiverAccess<Family = F>>(
+async fn read_promise<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
 ) -> Result<Promise, ReadPushPromisePushIdError<PayloadError<F::Error>>>
 where
@@ -60,7 +60,12 @@ where
     let mut frame = stream.frame();
     loop {
         let mut buffer = [0; 3];
-        let count = frame.payload().read(&mut &mut buffer[..]).await.unwrap();
+        let count = frame
+            .payload()
+            .read(&mut &mut buffer[..])
+            .await
+            .unwrap()
+            .map_or(0, |segment| segment.count.get());
         if count == 0 {
             break;
         }

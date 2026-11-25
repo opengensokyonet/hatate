@@ -59,7 +59,7 @@ type Http3List = <Http3Only as SettingsOf>::Settings;
 #[call(sync)]
 async fn read_settings<
     L: SettingList,
-    F: Read + Skip<Count = usize>,
+    F: Read + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -111,7 +111,10 @@ macro_rules! streams {
     ($request:ident, $unidirectional:ident, $list:ty, |$known:ident| $http3:expr) => {
         /// A client-initiated bidirectional stream.
         #[call(sync)]
-        async fn $request<F: Read + Skip<Count = usize>, A: ReceiverAccess<Family = F>>(
+        async fn $request<
+            F: Read + Skip<Count = usize, Metadata = ()>,
+            A: ReceiverAccess<Family = F>,
+        >(
             io: &mut A,
         ) -> Started
         where
@@ -136,7 +139,10 @@ macro_rules! streams {
         /// A unidirectional stream that the peer opened; `server` tells whether
         /// the server opened it.
         #[call(sync)]
-        async fn $unidirectional<F: Read + Skip<Count = usize>, A: ReceiverAccess<Family = F>>(
+        async fn $unidirectional<
+            F: Read + Skip<Count = usize, Metadata = ()>,
+            A: ReceiverAccess<Family = F>,
+        >(
             io: &mut A,
             server: bool,
         ) -> Started

@@ -14,7 +14,10 @@ use snafu::{ResultExt, Snafu};
 /// takes after the first octet. `budget` has already counted the first
 /// octet. EOF inside a number is attributed to that instruction's field.
 #[call(sync)]
-pub(crate) async fn read_decoder_instruction<F: Read, A: ReceiverAccess<Family = F>>(
+pub(crate) async fn read_decoder_instruction<
+    F: Read<Metadata = ()>,
+    A: ReceiverAccess<Family = F>,
+>(
     io: &mut A,
     mut budget: WireBudget,
     first: u8,
@@ -75,7 +78,7 @@ pub enum ReadError<E> {
 /// Resume the same future across waits. If cancelled after accepting a prefix,
 /// abandon the output stream: the integer may be incomplete.
 #[call(sync)]
-pub async fn write_decoder_instruction<F: Write, A: ReceiverAccess<Family = F>>(
+pub async fn write_decoder_instruction<F: Write<Report = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     instruction: DecoderInstruction,
     max_wire_len: usize,

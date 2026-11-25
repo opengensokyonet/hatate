@@ -58,11 +58,12 @@ nitori_call::family_receiver!(impl [] for Failing);
 
 impl Read for Failing {
     type Error = Coded;
+    type Metadata = ();
     fn poll_read<'visit, B: BufMut + ?Sized>(
         _host: Pin<&mut Self::ReceiverView<'visit>>,
         _cx: &mut Context<'_>,
         _dst: &mut B,
-    ) -> Poll<Result<usize, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -76,7 +77,7 @@ impl ReadChunk for Failing {
         _host: Pin<&mut Self::ReceiverView<'visit>>,
         _cx: &mut Context<'_>,
         _maximum: NonZeroUsize,
-    ) -> Poll<Result<Option<Bytes>, Self::Error>>
+    ) -> Poll<Result<Option<nitori_io::ChunkSegment<Bytes, ()>>, Self::Error>>
     where
         Self: 'visit,
     {
@@ -100,7 +101,7 @@ impl Skip for Failing {
 
 /// Reads by bytes until the failure: what came, and the failure.
 #[call(sync)]
-async fn read_to_failure<F: Read, A: ReceiverAccess<Family = F>>(
+async fn read_to_failure<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
 ) -> (Vec<u8>, CriticalStreamError<F::Error>) {
     let mut critical = io.compose(CriticalStream);
@@ -108,7 +109,9 @@ async fn read_to_failure<F: Read, A: ReceiverAccess<Family = F>>(
     loop {
         let mut buffer = [0; 4];
         match critical.read(&mut &mut buffer[..]).await {
-            Ok(count) => got.extend_from_slice(&buffer[..count]),
+            Ok(segment) => {
+                got.extend_from_slice(&buffer[..segment.map_or(0, |segment| segment.count.get())])
+            }
             Err(error) => return (got, error),
         }
     }
@@ -116,7 +119,7 @@ async fn read_to_failure<F: Read, A: ReceiverAccess<Family = F>>(
 
 /// Reads by chunks until the failure.
 #[call(sync)]
-async fn read_chunks_to_failure<F: ReadChunk, A: ReceiverAccess<Family = F>>(
+async fn read_chunks_to_failure<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
 ) -> (Vec<u8>, CriticalStreamError<F::Error>)
 where
@@ -126,7 +129,7 @@ where
     let mut got = Vec::new();
     loop {
         match critical.read_chunk(NonZeroUsize::new(3).unwrap()).await {
-            Ok(Some(chunk)) => got.extend_from_slice(chunk.as_ref()),
+            Ok(Some(chunk)) => got.extend_from_slice(chunk.chunk.as_ref()),
             Ok(None) => panic!("a critical stream ended without a failure"),
             Err(error) => return (got, error),
         }
@@ -135,7 +138,7 @@ where
 
 /// Skips until the failure: how many bytes were skipped, and the failure.
 #[call(sync)]
-async fn skip_to_failure<F: Skip<Count = usize>, A: ReceiverAccess<Family = F>>(
+async fn skip_to_failure<F: Skip<Count = usize, Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
 ) -> (usize, CriticalStreamError<F::Error>) {
     let mut critical = io.compose(CriticalStream);
@@ -187,23 +190,33 @@ fn a_critical_stream_that_ends_is_closed_on_every_path() {
 /// Reads a little by each path, none of it to the end.
 #[call(sync)]
 async fn read_before_the_end<
-    F: ReadChunk<Chunk = &'static [u8], Error = Infallible> + Skip<Count = usize>,
+    F: ReadChunk<Chunk = &'static [u8], Error = Infallible, Metadata = ()>
+        + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
 ) -> (usize, Vec<u8>, usize, usize) {
     let mut critical = io.compose(CriticalStream);
     let mut buffer = [0; 3];
-    let first = critical.read(&mut &mut buffer[..]).await.unwrap();
+    let first = critical
+        .read(&mut &mut buffer[..])
+        .await
+        .unwrap()
+        .map_or(0, |segment| segment.count.get());
     assert_eq!(buffer, [1, 2, 3]);
     let chunk = critical
         .read_chunk(NonZeroUsize::new(2).unwrap())
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .chunk;
     let skipped = critical.skip(1usize).await.unwrap().unwrap();
     let mut rest = [0; 5];
-    let last = critical.read(&mut &mut rest[..]).await.unwrap();
+    let last = critical
+        .read(&mut &mut rest[..])
+        .await
+        .unwrap()
+        .map_or(0, |segment| segment.count.get());
     assert_eq!(rest[..last], [7]);
     (first, chunk.to_vec(), skipped, last)
 }
@@ -220,9 +233,15 @@ fn a_critical_stream_that_has_not_ended_reads_as_it_is() {
 
 /// An empty destination reads nothing and is not the end.
 #[call(sync)]
-async fn read_nothing<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> Option<usize> {
+async fn read_nothing<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+) -> Option<usize> {
     let mut critical = io.compose(CriticalStream);
-    critical.read(&mut &mut [0u8; 0][..]).await.ok()
+    critical
+        .read(&mut &mut [0u8; 0][..])
+        .await
+        .ok()
+        .map(|segment| segment.map_or(0, |segment| segment.count.get()))
 }
 
 #[test]
@@ -278,7 +297,7 @@ enum Then {
 /// frame cannot be read, else of the failure of `then`.
 #[call(sync)]
 async fn control_failure<
-    F: Read<Error = Infallible> + Skip<Count = usize>,
+    F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -446,7 +465,7 @@ macro_rules! drain {
 
 #[call(sync)]
 async fn encoder_failure<
-    F: Read<Error = Infallible> + Skip<Count = usize>,
+    F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -566,7 +585,7 @@ fn the_encoder_stream_ending_in_a_value_is_closed() {
 /// Reads the decoder stream's instructions until one fails.
 #[call(sync)]
 async fn decoder_failure<
-    F: Read<Error = Infallible> + Skip<Count = usize>,
+    F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -614,7 +633,7 @@ fn the_decoder_stream_ending_is_closed_at_a_boundary_and_inside_a_number() {
 /// `count` frames, or the code of the failure.
 #[call(sync)]
 async fn request_ends<
-    F: Read<Error = Infallible> + Skip<Count = usize>,
+    F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -637,7 +656,7 @@ async fn request_ends<
 
 #[call(sync)]
 async fn push_ends<
-    F: Read<Error = Infallible> + Skip<Count = usize>,
+    F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,

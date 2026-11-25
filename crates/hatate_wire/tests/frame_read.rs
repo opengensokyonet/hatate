@@ -52,7 +52,7 @@ type ReceivedResult<E> = Result<Option<Received>, ReadFrameHeadError<E>>;
 /// Reads the first frame of a stream of kind `K`, with the parts `L`, at an
 /// endpoint of this role, and reports its head.
 #[call(sync)]
-async fn read_on<K: StreamKind, L, F: Read, A: ReceiverAccess<Family = F>>(
+async fn read_on<K: StreamKind, L, F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     _kind: K,
     _parts: core::marker::PhantomData<L>,
@@ -217,7 +217,9 @@ fn a_known_type_in_a_wider_encoding_is_still_known() {
 /// Whether the first frame of a control stream is a GOAWAY of the kind of the
 /// control stream.
 #[call(sync)]
-async fn first_is_goaway<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> bool {
+async fn first_is_goaway<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+) -> bool {
     let Ok(Some(mut stream)) =
         FrameStream::<Parts, ControlStreamKind, _>::read(&mut *io, Role::Client).await
     else {
@@ -230,7 +232,7 @@ async fn first_is_goaway<F: Read, A: ReceiverAccess<Family = F>>(io: &mut A) -> 
 }
 
 #[call(sync)]
-async fn first_is_headers<K: StreamKind, F: Read, A: ReceiverAccess<Family = F>>(
+async fn first_is_headers<K: StreamKind, F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     _kind: K,
 ) -> (bool, bool)

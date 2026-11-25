@@ -97,7 +97,11 @@ type Head<L, K> = (
 
 /// Reads the Length of the frame whose Type `r#type` was read, after
 /// checking the type, or `None` at the end of the stream.
-async fn read_after_type<L: FrameSetOn<K>, K: StreamKind, I: ReceiverAccess<Family: Read>>(
+async fn read_after_type<
+    L: FrameSetOn<K>,
+    K: StreamKind,
+    I: ReceiverAccess<Family: Read<Metadata = ()>>,
+>(
     io: &mut I,
     role: Role,
     r#type: VarIntField<VarInt>,
@@ -114,7 +118,11 @@ async fn read_after_type<L: FrameSetOn<K>, K: StreamKind, I: ReceiverAccess<Fami
 
 /// Reads and checks the head of the next frame, or `None` at the end of the
 /// stream.
-async fn read_head<L: FrameSetOn<K>, K: StreamKind, I: ReceiverAccess<Family: Read>>(
+async fn read_head<
+    L: FrameSetOn<K>,
+    K: StreamKind,
+    I: ReceiverAccess<Family: Read<Metadata = ()>>,
+>(
     io: &mut I,
     role: Role,
 ) -> Result<Option<Head<L, K>>, ReadFrameHeadError<<I::Family as Read>::Error>> {
@@ -127,7 +135,9 @@ async fn read_head<L: FrameSetOn<K>, K: StreamKind, I: ReceiverAccess<Family: Re
     read_after_type::<L, K, I>(io, role, r#type).await.map(Some)
 }
 
-impl<L: FrameSetOn<K>, K: StreamKind, I: ReceiverAccess<Family: Read>> FrameStream<L, K, I> {
+impl<L: FrameSetOn<K>, K: StreamKind, I: ReceiverAccess<Family: Read<Metadata = ()>>>
+    FrameStream<L, K, I>
+{
     /// Reads the first frame of the stream `io` at an endpoint of role
     /// `role`, which receives the frames, and gives the stream at it.
     ///
@@ -201,7 +211,7 @@ impl<L: FrameSetOn<K>, K: StreamKind, I> FrameStream<L, K, I> {
 
 impl<L: FrameSetOn<K>, K: StreamKind, I> FrameStream<L, K, I>
 where
-    I: ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>>>,
+    I: ReceiverAccess<Family: Skip<Count: Clone + Min<u64, Output = u64>, Metadata = ()>>,
     u64: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
     Infinite: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
 {
@@ -419,7 +429,7 @@ impl<I> UnknownStream<I> {
     }
 }
 
-impl<I: ReceiverAccess<Family: Skip>> UnknownStream<I>
+impl<I: ReceiverAccess<Family: Skip<Metadata = ()>>> UnknownStream<I>
 where
     Infinite: Min<<I::Family as Skip>::Count, Output = <I::Family as Skip>::Count>,
 {
