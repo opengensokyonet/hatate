@@ -1,26 +1,41 @@
 //! Read and write one QPACK field line representation.
+//!
+//! Every integer and literal keeps the details of its encoding, so a line
+//! read with [`read_field_line`] and written with [`write_field_line`] yields
+//! the octets it was read from.
 
 use bytes::{Buf, Bytes};
 use nitori_io::SplitTo;
 use snafu::{ResultExt, Snafu};
 
+use crate::integer::{self, PrefixedField};
 use crate::static_table::Index;
 use crate::string_literal::StringLiteral;
-use crate::{integer, static_table, string_literal};
+use crate::{static_table, string_literal};
 
 mod write;
-pub(crate) use write::{Prepared, transfer};
+pub(crate) use write::{Part, Prepared, transfer};
 pub use write::{WriteError, write_field_line};
 
 /// A field line's reference, relative to its field section where applicable.
+/// Each index keeps the padding of its encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableIndex {
     /// An entry from the fixed QPACK table.
-    Static(Index),
+    Static {
+        /// The static table index.
+        index: PrefixedField<Index>,
+    },
     /// Dynamic entry at absolute index Base − 1 − this value.
-    Relative(u64),
+    Relative {
+        /// The relative index.
+        index: PrefixedField,
+    },
     /// Dynamic entry at absolute index Base + this value.
-    PostBase(u64),
+    PostBase {
+        /// The post-Base index.
+        index: PrefixedField,
+    },
 }
 
 /// The five wire formats group by whether they index an entire field, its
@@ -29,7 +44,10 @@ pub enum TableIndex {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FieldLine<S = Bytes, H = Bytes> {
     /// Both name and value come from this entry.
-    Indexed(TableIndex),
+    Indexed {
+        /// The table entry supplying the field.
+        index: TableIndex,
+    },
     /// A name from a table and a literal value.
     LiteralWithNameReference {
         /// The N bit.
@@ -98,14 +116,17 @@ pub enum ReadError {
 }
 
 /// Read a single field line. The limit applies separately to the decoded
-/// length of each literal name and value, in octets. Bytes already read on
-/// failure stay consumed. Dynamic references are returned in wire coordinates.
-pub fn read_field_line<S: Buf + SplitTo>(
+/// length of each literal name and value, in octets. A raw literal is split
+/// from `src` without copying; a Huffman literal is decoded into `H`, which
+/// must also be a [`Buf`], such as `BytesMut`, for the line to be written
+/// back. Bytes already read on failure stay consumed. Dynamic references are
+/// returned in wire coordinates.
+pub fn read_field_line<S: Buf + SplitTo, H: Default + Extend<u8>>(
     src: &mut S,
     max_literal_len: usize,
-) -> Result<FieldLine<S>, ReadError> {
+) -> Result<FieldLine<S, H>, ReadError> {
     match read_head(src)? {
-        Head::Indexed(index) => Ok(FieldLine::Indexed(index)),
+        Head::Indexed(index) => Ok(FieldLine::Indexed { index }),
         Head::NameReference { never_index, name } => Ok(FieldLine::LiteralWithNameReference {
             never_index,
             name,
@@ -127,24 +148,32 @@ pub(crate) enum Head {
     LiteralName { never_index: bool, first: u8 },
 }
 
+fn static_index(field: PrefixedField) -> Result<PrefixedField<Index>, static_table::IndexError> {
+    field.try_map(Index::try_from)
+}
+
 pub(crate) fn read_head(src: &mut impl Buf) -> Result<Head, ReadError> {
     let first = src.try_get_u8().map_err(|_| ReadError::MissingPrefix)?;
     match first {
         0x80..=0xff => {
             let index = integer::read::<6>(first, src).context(FieldIndexSnafu)?;
             let index = if first & 0x40 != 0 {
-                TableIndex::Static(Index::try_from(index).context(StaticFieldSnafu)?)
+                TableIndex::Static {
+                    index: static_index(index).context(StaticFieldSnafu)?,
+                }
             } else {
-                TableIndex::Relative(index)
+                TableIndex::Relative { index }
             };
             Ok(Head::Indexed(index))
         }
         0x40..=0x7f => {
             let index = integer::read::<4>(first, src).context(NameIndexSnafu)?;
             let name = if first & 0x10 != 0 {
-                TableIndex::Static(Index::try_from(index).context(StaticNameSnafu)?)
+                TableIndex::Static {
+                    index: static_index(index).context(StaticNameSnafu)?,
+                }
             } else {
-                TableIndex::Relative(index)
+                TableIndex::Relative { index }
             };
             Ok(Head::NameReference {
                 never_index: first & 0x20 != 0,
@@ -157,34 +186,34 @@ pub(crate) fn read_head(src: &mut impl Buf) -> Result<Head, ReadError> {
         }),
         0x10..=0x1f => {
             let index = integer::read::<4>(first, src).context(FieldIndexSnafu)?;
-            Ok(Head::Indexed(TableIndex::PostBase(index)))
+            Ok(Head::Indexed(TableIndex::PostBase { index }))
         }
         0x00..=0x0f => {
             let index = integer::read::<3>(first, src).context(NameIndexSnafu)?;
             Ok(Head::NameReference {
                 never_index: first & 0x08 != 0,
-                name: TableIndex::PostBase(index),
+                name: TableIndex::PostBase { index },
             })
         }
     }
 }
 
-pub(crate) fn read_name<S: Buf + SplitTo>(
+pub(crate) fn read_name<S: Buf + SplitTo, H: Default + Extend<u8>>(
     first: u8,
     src: &mut S,
     limit: usize,
-) -> Result<StringLiteral<S>, ReadError> {
-    string_literal::read::<3, _>(first, src, limit).context(NameSnafu)
+) -> Result<StringLiteral<S, H>, ReadError> {
+    string_literal::read::<3, _, _>(first, src, limit).context(NameSnafu)
 }
 
-pub(crate) fn read_value<S: Buf + SplitTo>(
+pub(crate) fn read_value<S: Buf + SplitTo, H: Default + Extend<u8>>(
     src: &mut S,
     limit: usize,
-) -> Result<StringLiteral<S>, ReadError> {
+) -> Result<StringLiteral<S, H>, ReadError> {
     let first = src
         .try_get_u8()
         .map_err(|_| ReadError::MissingValueLength)?;
-    string_literal::read::<7, _>(first, src, limit).context(ValueSnafu)
+    string_literal::read::<7, _, _>(first, src, limit).context(ValueSnafu)
 }
 
 #[cfg(test)]

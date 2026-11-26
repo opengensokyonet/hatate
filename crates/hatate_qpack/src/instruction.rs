@@ -160,7 +160,8 @@ impl EncodedInteger {
     pub(crate) fn new<const N: u8>(prefix: u8, value: u64) -> Self {
         let mut bytes = [0; integer::MAX_ENCODED_LEN];
         let mut rest = &mut bytes[..];
-        integer::write::<N>(&mut rest, prefix, value).expect("buffer fits every encoded u64");
+        let value = integer::PrefixedField::shortest(integer::PrefixedInt::from(value));
+        integer::write::<N, _>(&mut rest, prefix, value).expect("buffer fits every encoded u64");
         let len = integer::MAX_ENCODED_LEN - rest.len();
         Self { bytes, len }
     }

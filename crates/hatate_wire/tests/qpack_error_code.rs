@@ -373,9 +373,23 @@ fn an_abandoned_encoder_stream_has_no_code() {
 #[test]
 fn an_instruction_that_cannot_be_interpreted_is_a_decoder_stream_error() {
     let mut acknowledgment = Vec::new();
-    hatate_qpack::integer::write::<7>(&mut acknowledgment, 0x80, 1 << 62).unwrap();
+    hatate_qpack::integer::write::<7, _>(
+        &mut acknowledgment,
+        0x80,
+        hatate_qpack::integer::PrefixedField::shortest(hatate_qpack::integer::PrefixedInt::from(
+            1u64 << 62,
+        )),
+    )
+    .unwrap();
     let mut cancellation = Vec::new();
-    hatate_qpack::integer::write::<6>(&mut cancellation, 0x40, 1 << 62).unwrap();
+    hatate_qpack::integer::write::<6, _>(
+        &mut cancellation,
+        0x40,
+        hatate_qpack::integer::PrefixedField::shortest(hatate_qpack::integer::PrefixedInt::from(
+            1u64 << 62,
+        )),
+    )
+    .unwrap();
     let cases: [(&str, Vec<u8>); 6] = [
         // Insert Count Increment of zero.
         ("zero increment", vec![0x00]),

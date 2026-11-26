@@ -114,9 +114,23 @@ fn zero_increment_and_unrepresentable_stream_ids_are_distinct() {
     for acknowledgment in [true, false] {
         let mut wire = Vec::new();
         if acknowledgment {
-            hatate_qpack::integer::write::<7>(&mut wire, 0x80, 1 << 62).unwrap();
+            hatate_qpack::integer::write::<7, _>(
+                &mut wire,
+                0x80,
+                hatate_qpack::integer::PrefixedField::shortest(
+                    hatate_qpack::integer::PrefixedInt::from(1u64 << 62),
+                ),
+            )
+            .unwrap();
         } else {
-            hatate_qpack::integer::write::<6>(&mut wire, 0x40, 1 << 62).unwrap();
+            hatate_qpack::integer::write::<6, _>(
+                &mut wire,
+                0x40,
+                hatate_qpack::integer::PrefixedField::shortest(
+                    hatate_qpack::integer::PrefixedInt::from(1u64 << 62),
+                ),
+            )
+            .unwrap();
         }
         let result = wire.as_slice().sync_one_unpin(wire.len());
         assert!(matches!(

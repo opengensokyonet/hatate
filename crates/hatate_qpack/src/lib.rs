@@ -3,19 +3,22 @@
 //! [`integer`] and [`huffman`] also expose their codecs independently.
 //! Decode fields from a complete field section payload after its prefix. Each call
 //! consumes one representation and leaves dynamic references relative to its
-//! Base. Literal names and values retain their exact decoded octets.
+//! Base. Literal names and values retain their exact decoded octets, and every
+//! integer and literal keeps the details of its encoding: a line written back
+//! yields the octets it was read from.
 //!
 //! ```
+//! use bytes::BytesMut;
 //! use hatate_qpack::field_line::{read_field_line, write_field_line, FieldLine, TableIndex};
 //!
 //! let mut input = &[0xd1, 0x10][..];
-//! let line = read_field_line(&mut input, 4096)?;
+//! let line: FieldLine<&[u8], BytesMut> = read_field_line(&mut input, 4096)?;
 //! assert_eq!(input, &[0x10]);
-//! if let FieldLine::Indexed(TableIndex::Static(index)) = &line {
-//!     assert_eq!(index.entry(), (&b":method"[..], &b"GET"[..]));
+//! if let FieldLine::Indexed { index: TableIndex::Static { index } } = &line {
+//!     assert_eq!(index.value().entry(), (&b":method"[..], &b"GET"[..]));
 //! }
 //! let mut output = Vec::new();
-//! write_field_line(&mut output, &line)?;
+//! write_field_line(&mut output, line)?;
 //! assert_eq!(output, [0xd1]);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -35,6 +38,8 @@ pub mod integer;
 pub mod static_section;
 pub mod static_table;
 pub mod string_literal;
+#[cfg(test)]
+mod test_support;
 
 /// An encoded value cannot fit in the supplied destination.
 #[derive(Debug, PartialEq, Eq, snafu::Snafu)]

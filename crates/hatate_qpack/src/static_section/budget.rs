@@ -1,7 +1,6 @@
 //! Decoded section size accounting (RFC 9114 §4.2.2).
 use crate::string_literal::StringLiteral;
 use crate::{field_line, huffman, string_literal};
-use bytes::Buf;
 
 pub(super) struct Budget {
     remaining: usize,
@@ -30,10 +29,10 @@ impl Budget {
         self.charge(32)
     }
 
-    pub(super) fn literal<S: Buf>(
+    pub(super) fn literal<S, H>(
         &mut self,
-        read: impl FnOnce(usize) -> Result<StringLiteral<S>, field_line::ReadError>,
-    ) -> Result<StringLiteral<S>, Error> {
+        read: impl FnOnce(usize) -> Result<StringLiteral<S, H>, field_line::ReadError>,
+    ) -> Result<StringLiteral<S, H>, Error> {
         let limit = self.max_literal_len.min(self.remaining);
         let value = read(limit).map_err(|err| {
             if self.remaining < self.max_literal_len && literal_limit_exceeded(&err) {
@@ -42,11 +41,8 @@ impl Budget {
                 Error::Line { source: err }
             }
         })?;
-        let size = match &value {
-            StringLiteral::Raw(data) => data.remaining(),
-            StringLiteral::Huffman(data) => data.len(),
-        };
-        self.charge(size)?;
+        // The read limit bounds the decoded length by a usize.
+        self.charge(value.decoded_len() as usize)?;
         Ok(value)
     }
 }
@@ -69,6 +65,9 @@ fn literal_limit_exceeded(error: &field_line::ReadError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
+
+    type Literal<'a> = StringLiteral<&'a [u8], Vec<u8>>;
 
     #[test]
     fn name_consumes_value_allowance_before_value_decoding() {
@@ -77,12 +76,14 @@ mod tests {
         let mut name = &b"abc"[..];
         assert!(
             budget
-                .literal(|limit| field_line::read_name(0x23, &mut name, limit))
+                .literal(|limit| field_line::read_name::<_, Vec<u8>>(0x23, &mut name, limit))
                 .is_ok()
         );
         let mut value = &b"\x05value"[..];
         assert!(matches!(
-            budget.literal(|limit| field_line::read_value(&mut value, limit)),
+            budget.literal(|limit| -> Result<Literal<'static>, _> {
+                field_line::read_value(&mut value, limit)
+            }),
             Err(Error::SectionTooLarge)
         ));
         assert_eq!(value, b"value");
@@ -94,7 +95,9 @@ mod tests {
         assert!(budget.start_line().is_ok());
         let mut value = &b"\x81\xff"[..];
         assert!(matches!(
-            budget.literal(|limit| field_line::read_value(&mut value, limit)),
+            budget.literal(|limit| -> Result<Literal<'static>, _> {
+                field_line::read_value(&mut value, limit)
+            }),
             Err(Error::Line {
                 source: field_line::ReadError::Value {
                     source: string_literal::ReadError::Huffman {
@@ -111,7 +114,9 @@ mod tests {
         assert!(budget.start_line().is_ok());
         let mut value = &[0x85, 0, 0, 0, 0, 0][..];
         assert!(matches!(
-            budget.literal(|limit| field_line::read_value(&mut value, limit)),
+            budget.literal(|limit| -> Result<Literal<'static>, _> {
+                field_line::read_value(&mut value, limit)
+            }),
             Err(Error::Line {
                 source: field_line::ReadError::Value {
                     source: string_literal::ReadError::Huffman {

@@ -98,7 +98,7 @@ impl<E> QpackFailureOf<E> for HuffmanReadError<E> {
                     DecodeError::EndOfString | DecodeError::ExcessPadding | DecodeError::InvalidPadding,
             } => QpackFailure::Malformed,
             Self::Coding {
-                source: DecodeError::ReserveOutput { .. } | DecodeError::OutputTooLong { .. },
+                source: DecodeError::OutputTooLong { .. },
             }
             | Self::Failed => QpackFailure::Other,
         }
@@ -168,7 +168,7 @@ impl ErrorCodeOf<ErrorCode> for FinishError {
                     DecodeError::EndOfString | DecodeError::ExcessPadding | DecodeError::InvalidPadding,
             } => Some(QpackErrorCode::EncoderStreamError.into()),
             Self::Coding {
-                source: DecodeError::ReserveOutput { .. } | DecodeError::OutputTooLong { .. },
+                source: DecodeError::OutputTooLong { .. },
             }
             | Self::Unread
             | Self::Failed => None,

@@ -1,13 +1,22 @@
 //! Complete QPACK field sections when the negotiated maximum table capacity
 //! is zero (RFC 9204 §4.5). HTTP field syntax is checked by the caller.
 //!
+//! Reading a section yields its prefix and each line's representation along
+//! with the resolved name and value; writing the prefix and the lines back
+//! yields the octets that were read.
+//!
 //! ```
-//! use hatate_qpack::static_section::read_static_section;
+//! use bytes::BytesMut;
+//! use hatate_qpack::static_section::{read_static_section, write_static_section};
 //!
 //! let payload = &[0, 0, 0xd1, 0xd7][..];
-//! let fields = read_static_section(payload, 0, 86)?.collect::<Result<Vec<_>, _>>()?;
+//! let (prefix, fields) = read_static_section::<_, BytesMut>(payload, 0, 86)?;
+//! let fields = fields.collect::<Result<Vec<_>, _>>()?;
 //! assert_eq!(fields[0].value.as_ref(), b"GET");
 //! assert_eq!(fields[1].value.as_ref(), b"https");
+//! let mut output = Vec::new();
+//! write_static_section(&mut output, &prefix, fields.into_iter().map(|field| field.line))?;
+//! assert_eq!(output, payload);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -15,29 +24,30 @@ mod budget;
 mod prefix;
 mod write;
 
-use crate::field_line::{self, Head, TableIndex};
-use crate::string_literal::StringLiteral;
+use crate::field_line::{self, FieldLine, Head, TableIndex};
+use crate::string_literal::{LiteralBytes, StringLiteral};
 use budget::Budget;
-use bytes::{Buf, Bytes};
+use bytes::Buf;
 use core::iter::FusedIterator;
+use core::marker::PhantomData;
 use nitori_io::SplitTo;
 use snafu::{ResultExt, Snafu};
 
-pub use prefix::PrefixError;
+pub use prefix::{PrefixError, SectionPrefix};
 pub use write::{WriteError, write_static_section};
 
 /// Decoded name or value octets and their backing storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FieldBytes<S> {
+pub enum FieldBytes<S, H> {
     /// Bytes from a static table entry.
     Static(&'static [u8]),
     /// A literal split directly from the original input.
     Input(S),
     /// Bytes produced by the Huffman decoder.
-    Huffman(Bytes),
+    Huffman(H),
 }
 
-impl<S: AsRef<[u8]>> AsRef<[u8]> for FieldBytes<S> {
+impl<S: AsRef<[u8]>, H: AsRef<[u8]>> AsRef<[u8]> for FieldBytes<S, H> {
     fn as_ref(&self) -> &[u8] {
         match self {
             Self::Static(bytes) => bytes,
@@ -47,24 +57,26 @@ impl<S: AsRef<[u8]>> AsRef<[u8]> for FieldBytes<S> {
     }
 }
 
-impl<S> From<StringLiteral<S>> for FieldBytes<S> {
-    fn from(literal: StringLiteral<S>) -> Self {
-        match literal {
-            StringLiteral::Raw(data) => Self::Input(data),
-            StringLiteral::Huffman(data) => Self::Huffman(data),
+impl<S: Clone, H: Clone> From<&StringLiteral<S, H>> for FieldBytes<S, H> {
+    fn from(literal: &StringLiteral<S, H>) -> Self {
+        match literal.bytes() {
+            LiteralBytes::Raw(bytes) => Self::Input(bytes.clone()),
+            LiteralBytes::Huffman(decoded) => Self::Huffman(decoded.clone()),
         }
     }
 }
 
-/// One resolved field. Duplicate names and wire order are preserved.
+/// One field: its representation on the wire and its resolved name and
+/// value. Duplicate names and wire order are preserved. The N bit is in
+/// `line`; an indexed field has none.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Field<S> {
+pub struct Field<S, H> {
+    /// The representation as read, which writes back to the same octets.
+    pub line: FieldLine<S, H>,
     /// Decoded field name, including any leading colon.
-    pub name: FieldBytes<S>,
+    pub name: FieldBytes<S, H>,
     /// Decoded field value.
-    pub value: FieldBytes<S>,
-    /// The N bit from a literal representation; false for indexed fields.
-    pub never_index: bool,
+    pub value: FieldBytes<S, H>,
 }
 
 /// A dynamic reference in a section with zero maximum table capacity.
@@ -104,26 +116,40 @@ pub enum ReadError {
 /// field (RFC 9114 §4.2.2). When the two bounds tie, a literal overrun is
 /// reported as a literal error. Accept the section only after successful
 /// exhaustion: dropping the iterator skips validation of the unread suffix.
-pub fn read_static_section<S: Buf + SplitTo>(
+///
+/// Raw literals are split from `src`, Huffman literals decoded into `H`. A
+/// [`Field`] holds each literal both in its line and as its name or value,
+/// so the iterator clones them: cheaply for `Bytes` or a slice, by copying
+/// for a `Vec<u8>` or `BytesMut`.
+pub fn read_static_section<S: Buf + SplitTo, H>(
     mut src: S,
     max_literal_len: usize,
     max_section_size: usize,
-) -> Result<Fields<S>, PrefixError> {
-    prefix::read(&mut src)?;
-    Ok(Fields {
-        src: Some(src),
-        budget: Budget::new(max_literal_len, max_section_size),
-    })
+) -> Result<(SectionPrefix, Fields<S, H>), PrefixError> {
+    let prefix = prefix::read(&mut src)?;
+    Ok((
+        prefix,
+        Fields {
+            src: Some(src),
+            budget: Budget::new(max_literal_len, max_section_size),
+            huffman: PhantomData,
+        },
+    ))
 }
 
 /// An ordered sequence of decoded fields. The first error ends iteration.
-pub struct Fields<S> {
+pub struct Fields<S, H> {
     src: Option<S>,
     budget: Budget,
+    huffman: PhantomData<fn() -> H>,
 }
 
-impl<S: Buf + SplitTo> Iterator for Fields<S> {
-    type Item = Result<Field<S>, ReadError>;
+impl<S, H> Iterator for Fields<S, H>
+where
+    S: Buf + SplitTo + Clone,
+    H: Default + Extend<u8> + Clone,
+{
+    type Item = Result<Field<S, H>, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let src = self.src.as_mut()?;
@@ -139,53 +165,66 @@ impl<S: Buf + SplitTo> Iterator for Fields<S> {
     }
 }
 
-impl<S: Buf + SplitTo> FusedIterator for Fields<S> {}
+impl<S, H> FusedIterator for Fields<S, H>
+where
+    S: Buf + SplitTo + Clone,
+    H: Default + Extend<u8> + Clone,
+{
+}
 
-fn read_one<S: Buf + SplitTo>(src: &mut S, budget: &mut Budget) -> Result<Field<S>, ReadError> {
+fn read_one<S, H>(src: &mut S, budget: &mut Budget) -> Result<Field<S, H>, ReadError>
+where
+    S: Buf + SplitTo + Clone,
+    H: Default + Extend<u8> + Clone,
+{
     budget.start_line()?;
     let head = field_line::read_head(src).context(LineSnafu)?;
-    let (name, never_index) = match head {
-        Head::Indexed(TableIndex::Static(index)) => {
-            let (name, value) = index.entry();
+    match head {
+        Head::Indexed(index @ TableIndex::Static { index: entry }) => {
+            let (name, value) = entry.value().entry();
             budget.charge(name.len())?;
             budget.charge(value.len())?;
-            return Ok(Field {
+            Ok(Field {
+                line: FieldLine::Indexed { index },
                 name: FieldBytes::Static(name),
                 value: FieldBytes::Static(value),
-                never_index: false,
-            });
+            })
         }
-        Head::Indexed(_) => {
-            return Err(ReadError::DynamicReference {
-                source: DynamicReferenceError::Field,
-            });
-        }
+        Head::Indexed(_) => Err(ReadError::DynamicReference {
+            source: DynamicReferenceError::Field,
+        }),
         Head::NameReference {
-            name: TableIndex::Static(index),
+            name: name @ TableIndex::Static { index },
             never_index,
         } => {
-            let (name, _) = index.entry();
-            budget.charge(name.len())?;
-            (FieldBytes::Static(name), never_index)
+            let (resolved, _) = index.value().entry();
+            budget.charge(resolved.len())?;
+            let value = budget.literal(|limit| field_line::read_value(src, limit))?;
+            Ok(Field {
+                name: FieldBytes::Static(resolved),
+                value: FieldBytes::from(&value),
+                line: FieldLine::LiteralWithNameReference {
+                    never_index,
+                    name,
+                    value,
+                },
+            })
         }
-        Head::NameReference { .. } => {
-            return Err(ReadError::DynamicReference {
-                source: DynamicReferenceError::Name,
-            });
+        Head::NameReference { .. } => Err(ReadError::DynamicReference {
+            source: DynamicReferenceError::Name,
+        }),
+        Head::LiteralName { first, never_index } => {
+            let name = budget.literal(|limit| field_line::read_name(first, src, limit))?;
+            let value = budget.literal(|limit| field_line::read_value(src, limit))?;
+            Ok(Field {
+                name: FieldBytes::from(&name),
+                value: FieldBytes::from(&value),
+                line: FieldLine::LiteralWithLiteralName {
+                    never_index,
+                    name,
+                    value,
+                },
+            })
         }
-        Head::LiteralName { first, never_index } => (
-            budget
-                .literal(|limit| field_line::read_name(first, src, limit))?
-                .into(),
-            never_index,
-        ),
-    };
-    let value = budget
-        .literal(|limit| field_line::read_value(src, limit))?
-        .into();
-    Ok(Field {
-        name,
-        value,
-        never_index,
-    })
+    }
 }

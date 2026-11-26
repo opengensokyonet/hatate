@@ -3,12 +3,11 @@
 mod codes;
 
 use crate::InsufficientCapacityError;
-use alloc::{collections::TryReserveError, vec::Vec};
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, BufMut};
 use codes::CODES;
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 
-/// A Huffman literal could not be decoded into the bounded output buffer.
+/// A Huffman literal could not be decoded within the length limit.
 #[derive(Debug, PartialEq, Eq, Snafu)]
 pub enum DecodeError {
     /// The reserved EOS symbol occurred in the input.
@@ -20,12 +19,6 @@ pub enum DecodeError {
     /// The trailing bits differ from the leading bits of EOS.
     #[snafu(display("Huffman padding differs from the EOS prefix"))]
     InvalidPadding,
-    /// The output buffer could not grow to receive another symbol.
-    #[snafu(display("could not grow Huffman output"))]
-    ReserveOutput {
-        /// Failure to reserve space for the decoded bytes.
-        source: TryReserveError,
-    },
     /// Another symbol would exceed the maximum decoded length.
     #[snafu(display("Huffman output exceeds {limit} bytes"))]
     OutputTooLong {
@@ -67,30 +60,42 @@ static TREE: [[u16; 2]; LEAF as usize] = {
     tree
 };
 
-/// Decode one complete Huffman payload into at most `limit` bytes.
-/// Checks the EOS and padding rules even for a partial final octet.
-/// A symbol beyond the limit yields [`DecodeError::OutputTooLong`]. If the
-/// decoded buffer needs to grow within the limit and reservation fails, the
-/// error is [`DecodeError::ReserveOutput`].
-pub fn decode(mut src: impl Buf, limit: usize) -> Result<Bytes, DecodeError> {
-    let mut output = Vec::new();
+/// Decode one complete Huffman payload into at most `limit` bytes, collected
+/// in `H` (for example `Vec<u8>` or `BytesMut`). Checks the EOS and padding
+/// rules even for a partial final octet. A symbol beyond the limit yields
+/// [`DecodeError::OutputTooLong`]; `H` never receives more than `limit`
+/// octets. `H` grows through [`Extend`], which does not report allocation
+/// failure.
+pub fn decode<H: Default + Extend<u8>>(src: impl Buf, limit: usize) -> Result<H, DecodeError> {
+    decode_counted(src, limit).map(|(output, _)| output)
+}
+
+/// [`decode`], also returning the number of decoded octets.
+pub(crate) fn decode_counted<H: Default + Extend<u8>>(
+    mut src: impl Buf,
+    limit: usize,
+) -> Result<(H, usize), DecodeError> {
+    let mut output = H::default();
     let mut decoder = SymbolDecoder::new(limit);
+    // Hand symbols over in batches rather than one `extend` call each.
+    let mut batch = [0; 64];
+    let mut filled = 0;
     while src.has_remaining() {
         let byte = src.get_u8();
         for shift in (0..8).rev() {
             if let Some(symbol) = decoder.bit((byte >> shift) & 1)? {
-                if output.len() == output.capacity() {
-                    let additional = 1;
-                    #[cfg(test)]
-                    let additional = tests::reservation_size(additional);
-                    output.try_reserve(additional).context(ReserveOutputSnafu)?;
+                batch[filled] = symbol;
+                filled += 1;
+                if filled == batch.len() {
+                    output.extend(batch.iter().copied());
+                    filled = 0;
                 }
-                output.push(symbol);
             }
         }
     }
-    decoder.finish()?;
-    Ok(Bytes::from(output))
+    let produced = decoder.finish()?;
+    output.extend(batch[..filled].iter().copied());
+    Ok((output, produced))
 }
 
 // Carries a partial code across encoded input octets and buffer boundaries.
@@ -156,63 +161,73 @@ impl SymbolDecoder {
     }
 }
 
-/// The encoded payload length, including its final padding. A slice on a
+/// The encoded payload length, including its final padding. A buffer on a
 /// 64-bit target can have more bits in its encoding than fit in a u64.
-pub(crate) fn encoded_len(input: &[u8]) -> u128 {
-    input
-        .iter()
-        .map(|&byte| u128::from(CODES[usize::from(byte)].1))
-        .sum::<u128>()
-        .div_ceil(8)
+pub(crate) fn encoded_len(mut src: impl Buf) -> u128 {
+    let mut bits = 0u128;
+    while src.has_remaining() {
+        let chunk = src.chunk();
+        bits += chunk
+            .iter()
+            .map(|&byte| u128::from(CODES[usize::from(byte)].1))
+            .sum::<u128>();
+        let count = chunk.len();
+        src.advance(count);
+    }
+    bits.div_ceil(8)
 }
 
-/// Encode octets with the RFC 7541 code and pad to an octet boundary.
-/// An undersized destination is left unchanged. The string length prefix
-/// and H bit belong to the enclosing format.
-pub fn encode(dst: &mut impl BufMut, input: &[u8]) -> Result<(), InsufficientCapacityError> {
+/// Encode the octets of `src` with the RFC 7541 code and pad to an octet
+/// boundary. An undersized destination is left unchanged. The string length
+/// prefix and H bit belong to the enclosing format.
+pub fn encode(dst: &mut impl BufMut, src: impl Buf) -> Result<(), InsufficientCapacityError> {
     // Every symbol takes at most 30 bits. A growing sink generally satisfies
     // this bound without a separate pass to count the exact encoded length.
     let available = dst.remaining_mut();
-    if (input.len() as u128 * 30).div_ceil(8) > available as u128 {
-        InsufficientCapacityError::check(encoded_len(input), available)?;
+    if (src.remaining() as u128 * 30).div_ceil(8) <= available as u128 {
+        let mut octets = Encoder::new(src);
+        while let Some(octet) = octets.next_octet() {
+            dst.put_u8(octet);
+        }
+        return Ok(());
     }
-    for byte in EncodedOctets::new(input) {
-        dst.put_u8(byte);
-    }
+    // Measuring consumes the input, so take it as shared bytes first:
+    // without a copy if it already is `Bytes`.
+    let mut src = src;
+    let src = src.copy_to_bytes(src.remaining());
+    let length = encoded_len(src.clone());
+    InsufficientCapacityError::check(length, available)?;
+    dst.put(EncodedBuf::new(src, length as u64));
     Ok(())
 }
 
-/// The code stream including the final EOS-prefix padding. Used both for
-/// standalone encoding and for transferring a complete measured section.
-pub(crate) struct EncodedOctets<'a> {
-    input: core::slice::Iter<'a, u8>,
+/// The code stream of a buffer, including the final EOS-prefix padding.
+struct Encoder<B> {
+    src: B,
     pending: u64,
     bits: u8,
 }
 
-impl<'a> EncodedOctets<'a> {
-    pub(crate) fn new(input: &'a [u8]) -> Self {
+impl<B: Buf> Encoder<B> {
+    fn new(src: B) -> Self {
         Self {
-            input: input.iter(),
+            src,
             pending: 0,
             bits: 0,
         }
     }
-}
 
-impl Iterator for EncodedOctets<'_> {
-    type Item = u8;
-    fn next(&mut self) -> Option<u8> {
+    fn next_octet(&mut self) -> Option<u8> {
         while self.bits < 8 {
-            let Some(&byte) = self.input.next() else {
+            if !self.src.has_remaining() {
                 if self.bits == 0 {
                     return None;
                 }
                 let padding = 8 - self.bits;
                 self.bits = 0;
                 return Some((self.pending as u8) << padding | ((1 << padding) - 1));
-            };
-            let (code, width) = CODES[usize::from(byte)];
+            }
+            let (code, width) = CODES[usize::from(self.src.get_u8())];
             self.pending = (self.pending << width) | u64::from(code);
             self.bits += width;
         }
@@ -221,62 +236,77 @@ impl Iterator for EncodedOctets<'_> {
     }
 }
 
+/// The encoding of a buffer whose encoded length was measured beforehand,
+/// as a [`Buf`] for one transfer into a destination.
+///
+/// It yields exactly the measured number of octets. A buffer whose octets
+/// changed since it was measured yields different content, but neither more
+/// nor fewer octets: excess output is dropped, and missing output is filled
+/// with all-ones octets.
+pub(crate) struct EncodedBuf<B> {
+    encoder: Encoder<B>,
+    out: [u8; 64],
+    start: u8,
+    end: u8,
+    left: u64,
+}
+
+impl<B: Buf> EncodedBuf<B> {
+    pub(crate) fn new(src: B, encoded_len: u64) -> Self {
+        let mut buf = Self {
+            encoder: Encoder::new(src),
+            out: [0; 64],
+            start: 0,
+            end: 0,
+            left: encoded_len,
+        };
+        buf.refill();
+        buf
+    }
+
+    fn refill(&mut self) {
+        self.start = 0;
+        self.end = 0;
+        while self.left > 0 && usize::from(self.end) < self.out.len() {
+            self.out[usize::from(self.end)] = self.encoder.next_octet().unwrap_or(0xff);
+            self.end += 1;
+            self.left -= 1;
+        }
+    }
+}
+
+impl<B: Buf> Buf for EncodedBuf<B> {
+    fn remaining(&self) -> usize {
+        let buffered = u64::from(self.end - self.start);
+        usize::try_from(self.left + buffered).unwrap_or(usize::MAX)
+    }
+
+    fn chunk(&self) -> &[u8] {
+        &self.out[usize::from(self.start)..usize::from(self.end)]
+    }
+
+    fn advance(&mut self, mut count: usize) {
+        while count > 0 {
+            let buffered = usize::from(self.end - self.start);
+            assert!(buffered > 0, "advance past the encoded octets");
+            let step = count.min(buffered);
+            self.start += step as u8;
+            count -= step;
+            if self.start == self.end {
+                self.refill();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    extern crate std;
-
     use super::*;
+    use alloc::vec::Vec;
     use bytes::BytesMut;
-    use core::cell::Cell;
 
-    // A capacity overflow in try_reserve is deterministic, even for empty
-    // vectors. Only the armed test thread changes the next growth request.
-    std::thread_local! {
-        static FAIL_NEXT_GROWTH: Cell<bool> = const { Cell::new(false) };
-    }
-
-    pub(super) fn reservation_size(additional: usize) -> usize {
-        if FAIL_NEXT_GROWTH.replace(false) {
-            usize::MAX
-        } else {
-            additional
-        }
-    }
-
-    #[test]
-    fn failed_growth_reaches_the_independent_name_and_value_readers() {
-        use crate::{field_line, string_literal};
-        use core::error::Error;
-
-        FAIL_NEXT_GROWTH.set(true);
-        let direct = decode(&[0x1f][..], 1).unwrap_err();
-        assert!(matches!(direct, DecodeError::ReserveOutput { .. }));
-        assert!(direct.source().unwrap().is::<TryReserveError>());
-
-        for (wire, is_name) in [
-            (&[0x29, 0x1f, 0][..], true),
-            (&[0x40, 0x81, 0x1f][..], false),
-        ] {
-            FAIL_NEXT_GROWTH.set(true);
-            let err = field_line::read_field_line(&mut &*wire, 1).unwrap_err();
-            let source = match (is_name, err) {
-                (true, field_line::ReadError::Name { source })
-                | (false, field_line::ReadError::Value { source }) => source,
-                (_, other) => panic!("unexpected error: {other}"),
-            };
-            assert!(matches!(
-                source,
-                string_literal::ReadError::Huffman {
-                    source: DecodeError::ReserveOutput { .. }
-                }
-            ));
-        }
-        FAIL_NEXT_GROWTH.set(true);
-        assert_eq!(
-            decode(&[0x1f][..], 0),
-            Err(DecodeError::OutputTooLong { limit: 0 })
-        );
-        assert!(FAIL_NEXT_GROWTH.replace(false));
+    fn decode_vec(src: impl Buf, limit: usize) -> Result<Vec<u8>, DecodeError> {
+        decode(src, limit)
     }
 
     #[test]
@@ -303,7 +333,7 @@ mod tests {
             let mut output = BytesMut::new();
             encode(&mut output, plain).unwrap();
             assert_eq!(&output[..], encoded);
-            assert_eq!(&decode(encoded, plain.len()).unwrap()[..], plain);
+            assert_eq!(decode_vec(encoded, plain.len()).unwrap(), plain);
         }
     }
 
@@ -313,29 +343,59 @@ mod tests {
         for byte in 0..=255u8 {
             alphabet[usize::from(byte)] = byte;
             let mut encoded = BytesMut::new();
-            encode(&mut encoded, &[byte]).unwrap();
-            assert_eq!(&decode(encoded.freeze(), usize::MAX).unwrap()[..], &[byte]);
+            encode(&mut encoded, &[byte][..]).unwrap();
+            assert_eq!(decode_vec(encoded.freeze(), usize::MAX).unwrap(), [byte]);
         }
         let mut encoded = BytesMut::new();
-        encode(&mut encoded, &alphabet).unwrap();
+        encode(&mut encoded, &alphabet[..]).unwrap();
+        assert_eq!(decode_vec(encoded.freeze(), usize::MAX).unwrap(), alphabet);
+    }
+
+    #[test]
+    fn measured_encoding_yields_exactly_its_length() {
+        let plain = &b"www.example.com"[..];
+        let mut whole = Vec::new();
+        encode(&mut whole, plain).unwrap();
+        let collect = |mut buf: EncodedBuf<&[u8]>| {
+            let mut out = Vec::new();
+            while buf.has_remaining() {
+                let chunk = buf.chunk();
+                assert!(!chunk.is_empty());
+                out.extend_from_slice(chunk);
+                let count = chunk.len();
+                buf.advance(count);
+            }
+            out
+        };
+        assert_eq!(collect(EncodedBuf::new(plain, 12)), whole);
+        // Longer than one internal chunk.
+        let long = [b'a'; 1000];
+        let mut expected = Vec::new();
+        encode(&mut expected, &long[..]).unwrap();
+        let buf = EncodedBuf::new(&long[..], expected.len() as u64);
+        assert_eq!(buf.remaining(), expected.len());
+        assert_eq!(collect(buf), expected);
+        // A source that changed after measuring keeps the measured length.
+        assert_eq!(collect(EncodedBuf::new(plain, 10)), whole[..10]);
+        let padded = collect(EncodedBuf::new(plain, 14));
         assert_eq!(
-            &decode(encoded.freeze(), usize::MAX).unwrap()[..],
-            &alphabet
+            (&padded[..12], &padded[12..]),
+            (&whole[..], &[0xff, 0xff][..])
         );
     }
 
     #[test]
     fn rejects_eos_and_invalid_or_excess_fill() {
         assert_eq!(
-            decode(&[0xff; 4][..], usize::MAX),
+            decode_vec(&[0xff; 4][..], usize::MAX),
             Err(DecodeError::EndOfString)
         );
         assert_eq!(
-            decode(&[0xff][..], usize::MAX),
+            decode_vec(&[0xff][..], usize::MAX),
             Err(DecodeError::ExcessPadding)
         );
         assert_eq!(
-            decode(&[0x18][..], usize::MAX),
+            decode_vec(&[0x18][..], usize::MAX),
             Err(DecodeError::InvalidPadding)
         );
     }

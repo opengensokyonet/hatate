@@ -91,7 +91,7 @@ fn every_one_and_two_octet_payload_matches_the_canonical_codebook() {
     let book = Codebook::new();
     let check = |wire: &[u8]| {
         let expected = book.decode(wire);
-        let decoded = huffman::decode(wire, usize::MAX);
+        let decoded = huffman::decode::<Vec<u8>>(wire, usize::MAX);
         assert_eq!(decoded.ok().as_deref(), expected.as_deref(), "{wire:02x?}");
     };
     for byte in 0..=u8::MAX {
@@ -113,18 +113,16 @@ fn every_symbol_starts_at_every_bit_offset() {
             plain.push(byte);
             let expected = book.wire(plain.iter().copied().map(u16::from));
             let mut actual = Vec::new();
-            huffman::encode(&mut actual, &plain).unwrap();
+            huffman::encode(&mut actual, &plain[..]).unwrap();
             assert_eq!(actual, expected);
             assert_eq!(
-                huffman::decode(&expected[..], plain.len())
-                    .unwrap()
-                    .as_ref(),
+                huffman::decode::<Vec<u8>>(&expected[..], plain.len()).unwrap(),
                 plain
             );
         }
         let eos = book.wire(core::iter::repeat_n(u16::from(b'0'), count).chain([256]));
         assert_eq!(
-            huffman::decode(eos.as_slice(), usize::MAX),
+            huffman::decode::<Vec<u8>>(eos.as_slice(), usize::MAX),
             Err(huffman::DecodeError::EndOfString)
         );
     }

@@ -1,6 +1,8 @@
 //! Name/value pairs in QPACK static index order.
 //! Table from RFC 9204, Appendix A. See LICENSE-RFC9204.
 
+use crate::integer::PrefixedInt;
+
 /// The 99 name/value pairs in RFC 9204 Appendix A, in index order.
 pub static ENTRIES: [(&[u8], &[u8]); 99] = [
     (b":authority", b""),                                    // 0
@@ -138,6 +140,20 @@ impl TryFrom<u64> for Index {
         } else {
             Err(IndexError { index })
         }
+    }
+}
+
+impl TryFrom<PrefixedInt> for Index {
+    type Error = IndexError;
+
+    fn try_from(index: PrefixedInt) -> Result<Self, Self::Error> {
+        Self::try_from(index.get())
+    }
+}
+
+impl From<Index> for PrefixedInt {
+    fn from(index: Index) -> Self {
+        Self::from(index.0)
     }
 }
 

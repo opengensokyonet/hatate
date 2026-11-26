@@ -1,11 +1,14 @@
-use super::{FieldLine, StringLiteral, TableIndex};
-use crate::{InsufficientCapacityError, huffman, integer};
+use super::{FieldLine, TableIndex};
+use crate::InsufficientCapacityError;
+use crate::huffman::EncodedBuf;
+use crate::integer::{self, Encoded, PaddingError, PrefixedField, PrefixedInt};
+use crate::string_literal::{self, LiteralBytes, StringLiteral};
+use bytes::buf::Chain;
 use bytes::{Buf, BufMut};
-use core::num::TryFromIntError;
 use snafu::{ResultExt, Snafu};
 
 /// A field line cannot be written to the given destination.
-#[derive(Debug, Snafu)]
+#[derive(Debug, PartialEq, Eq, Snafu)]
 pub enum WriteError {
     /// The exact wire size exceeds the available capacity.
     #[snafu(transparent)]
@@ -13,253 +16,274 @@ pub enum WriteError {
         /// Exact required and available capacities in octets.
         source: InsufficientCapacityError,
     },
-    /// The encoded literal name length exceeds u64::MAX.
-    #[snafu(display("encoded field name length exceeds the supported prefixed integer range"))]
-    NameLengthOverflow {
-        /// Failure to represent the encoded length as a u64.
-        source: TryFromIntError,
+    /// The table index's padding has no encoding at the prefix width of
+    /// this representation.
+    #[snafu(display("invalid index padding"))]
+    Index {
+        /// The index and the prefix width.
+        source: PaddingError,
     },
-    /// The encoded literal value length exceeds u64::MAX.
-    #[snafu(display("encoded field value length exceeds the supported prefixed integer range"))]
-    ValueLengthOverflow {
-        /// Failure to represent the encoded length as a u64.
-        source: TryFromIntError,
+    /// The literal field name cannot be written.
+    #[snafu(display("invalid literal field name"))]
+    Name {
+        /// The literal failure.
+        source: string_literal::WriteError,
+    },
+    /// The literal field value cannot be written.
+    #[snafu(display("invalid literal field value"))]
+    Value {
+        /// The literal failure.
+        source: string_literal::WriteError,
     },
 }
 
-// Each representation is either a single prefixed integer or two prefixed
-// integers with their associated payloads. Measuring their wire sizes lets
-// a bounded sink reject the whole line before writing its first byte.
-struct Part<'a> {
-    prefix: [u8; integer::MAX_ENCODED_LEN],
-    prefix_len: usize,
-    payload: StringLiteral<&'a [u8], &'a [u8]>,
-    payload_len: u64,
+/// Write one field line with the encodings it carries: the padding of each
+/// integer and length prefix, and each literal's H bit. Raw literals are
+/// copied from their buffers, Huffman literals encoded from theirs. The
+/// whole line is validated and measured before the first write, so errors
+/// leave the destination unchanged, including when a fixed-size buffer is
+/// too small.
+pub fn write_field_line<S: Buf, H: Buf>(
+    dst: &mut impl BufMut,
+    line: FieldLine<S, H>,
+) -> Result<(), WriteError> {
+    let prepared = Prepared::new(line)?;
+    transfer(dst, prepared.len, core::iter::once(prepared.buf))?;
+    Ok(())
 }
 
-impl<'a> Part<'a> {
-    fn integer<const N: u8>(flags: u8, value: u64) -> Self {
-        let mut prefix = [0; integer::MAX_ENCODED_LEN];
-        let mut rest = &mut prefix[..];
-        integer::write::<N>(&mut rest, flags, value)
-            .expect("the prefix buffer fits every encoded u64");
-        let prefix_len = integer::MAX_ENCODED_LEN - rest.len();
-        Self {
-            prefix,
-            prefix_len,
-            payload: StringLiteral::Raw(&[]),
-            payload_len: 0,
-        }
-    }
+/// One prefixed integer and, for a literal, the payload that follows it.
+pub(crate) struct Part<S, H> {
+    prefix: Encoded,
+    at: u8,
+    payload: Payload<S, H>,
+    len: u128,
+}
 
-    fn literal<const N: u8, S: AsRef<[u8]>, H: AsRef<[u8]>>(
+enum Payload<S, H> {
+    None,
+    Raw(S),
+    Huffman(EncodedBuf<H>),
+}
+
+impl<S: Buf, H: Buf> Part<S, H> {
+    pub(crate) fn integer<const N: u8, T: Copy + Into<PrefixedInt>>(
         flags: u8,
-        literal: &'a StringLiteral<S, H>,
-        encoded_len: impl FnOnce(&[u8]) -> u128,
-    ) -> Result<Self, TryFromIntError> {
-        let (flags, payload, length) = match literal {
-            StringLiteral::Raw(data) => {
-                let data = data.as_ref();
-                (flags, StringLiteral::Raw(data), data.len() as u64)
-            }
-            StringLiteral::Huffman(data) => {
-                let data = data.as_ref();
-                let length = u64::try_from(encoded_len(data))?;
-                (flags | (1 << N), StringLiteral::Huffman(data), length)
-            }
-        };
+        field: PrefixedField<T>,
+    ) -> Result<Self, PaddingError> {
+        let prefix = integer::encode::<N, T>(flags, field)?;
         Ok(Self {
-            payload,
-            payload_len: length,
-            ..Self::integer::<N>(flags, length)
+            len: prefix.as_slice().len() as u128,
+            prefix,
+            at: 0,
+            payload: Payload::None,
         })
     }
 
-    fn len(&self) -> u128 {
-        self.prefix_len as u128 + u128::from(self.payload_len)
-    }
-
-    fn chunks(&self) -> impl Iterator<Item = WireChunk<'_>> {
-        let (raw, coded) = match self.payload {
-            StringLiteral::Raw(data) => (data, &[][..]),
-            StringLiteral::Huffman(data) => (&[][..], data),
+    fn literal<const N: u8>(
+        flags: u8,
+        literal: StringLiteral<S, H>,
+    ) -> Result<Self, string_literal::WriteError> {
+        let (huffman, length, bytes) = literal.into_wire::<N>()?;
+        let flags = if huffman { flags | 1 << N } else { flags };
+        let mut part = Self::integer::<N, _>(flags, length)
+            .expect("the literal checked its length prefix at this width");
+        part.len += u128::from(length.value().get());
+        part.payload = match bytes {
+            LiteralBytes::Raw(bytes) => Payload::Raw(bytes),
+            LiteralBytes::Huffman(decoded) => {
+                Payload::Huffman(EncodedBuf::new(decoded, length.value().get()))
+            }
         };
-        core::iter::once(WireChunk::Borrowed(&self.prefix[..self.prefix_len]))
-            .chain((!raw.is_empty()).then_some(WireChunk::Borrowed(raw)))
-            .chain(huffman_chunks(coded))
+        Ok(part)
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            prefix: Encoded::EMPTY,
+            at: 0,
+            payload: Payload::None,
+            len: 0,
+        }
+    }
+
+    fn prefix_rest(&self) -> &[u8] {
+        &self.prefix.as_slice()[usize::from(self.at)..]
     }
 }
 
-/// Write one field line using the given references, N bit and string coding.
-/// Integer encodings use the shortest representation. Errors leave the
-/// destination unchanged, including when a fixed-size buffer is too small.
-pub fn write_field_line<S: AsRef<[u8]>, H: AsRef<[u8]>>(
-    dst: &mut impl BufMut,
-    line: &FieldLine<S, H>,
-) -> Result<(), WriteError> {
-    let prepared = Prepared::new(line)?;
-    transfer(dst, prepared.len(), &[], core::iter::once(&prepared))?;
-    Ok(())
-}
-
-// Borrow the exact payloads used for measuring this representation. This
-// also lets a whole-section writer prepare each AsRef payload just once.
-pub(crate) struct Prepared<'a> {
-    head: Part<'a>,
-    value: Option<Part<'a>>,
-}
-
-impl<'a> Prepared<'a> {
-    pub(crate) fn new<S: AsRef<[u8]>, H: AsRef<[u8]>>(
-        line: &'a FieldLine<S, H>,
-    ) -> Result<Self, WriteError> {
-        let (head, value) = prepare(line, huffman::encoded_len)?;
-        Ok(Self { head, value })
+impl<S: Buf, H: Buf> Buf for Part<S, H> {
+    fn remaining(&self) -> usize {
+        let payload = match &self.payload {
+            Payload::None => 0,
+            Payload::Raw(bytes) => bytes.remaining(),
+            Payload::Huffman(encoded) => encoded.remaining(),
+        };
+        self.prefix_rest().len().saturating_add(payload)
     }
 
-    pub(crate) fn len(&self) -> u128 {
-        self.head.len() + self.value.as_ref().map_or(0, Part::len)
+    fn chunk(&self) -> &[u8] {
+        let prefix = self.prefix_rest();
+        if !prefix.is_empty() {
+            return prefix;
+        }
+        match &self.payload {
+            Payload::None => &[],
+            Payload::Raw(bytes) => bytes.chunk(),
+            Payload::Huffman(encoded) => encoded.chunk(),
+        }
     }
 
-    fn chunks(&self) -> impl Iterator<Item = WireChunk<'_>> {
-        self.head
-            .chunks()
-            .chain(self.value.iter().flat_map(Part::chunks))
-    }
-}
-
-// Prefixes and raw literals are contiguous and can be lent directly to the
-// destination. Only Huffman output needs an intermediate chunk.
-enum WireChunk<'a> {
-    Borrowed(&'a [u8]),
-    Huffman { bytes: [u8; 128], len: usize },
-}
-
-impl WireChunk<'_> {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Borrowed(data) => data,
-            Self::Huffman { bytes, len } => &bytes[..*len],
+    fn advance(&mut self, mut count: usize) {
+        let prefix = self.prefix_rest().len().min(count);
+        self.at += prefix as u8;
+        count -= prefix;
+        if count == 0 {
+            return;
+        }
+        match &mut self.payload {
+            Payload::None => panic!("advance past the end of an integer"),
+            Payload::Raw(bytes) => bytes.advance(count),
+            Payload::Huffman(encoded) => encoded.advance(count),
         }
     }
 }
 
-fn huffman_chunks(data: &[u8]) -> impl Iterator<Item = WireChunk<'_>> {
-    let mut octets = huffman::EncodedOctets::new(data);
-    core::iter::from_fn(move || {
-        let first = octets.next()?;
-        let mut bytes = [0; 128];
-        bytes[0] = first;
-        let mut len = 1;
-        for (out, byte) in bytes[1..].iter_mut().zip(&mut octets) {
-            *out = byte;
-            len += 1;
-        }
-        Some(WireChunk::Huffman { bytes, len })
-    })
+/// A representation's integer or literal head and its optional value literal.
+pub(crate) type LineBuf<S, H> = Chain<Part<S, H>, Part<S, H>>;
+
+// The validated octets of one representation and their exact count, so that
+// a whole-section writer can measure every line before writing any of them.
+pub(crate) struct Prepared<S, H> {
+    pub(crate) buf: LineBuf<S, H>,
+    pub(crate) len: u128,
 }
 
-/// Submit the entire measured source in one BufMut operation. A segmented
-/// destination may report a more conservative capacity after its cursor moves.
-pub(crate) fn transfer<'a>(
+impl<S: Buf, H: Buf> Prepared<S, H> {
+    pub(crate) fn from_parts(head: Part<S, H>, value: Part<S, H>) -> Self {
+        Self {
+            len: head.len + value.len,
+            buf: head.chain(value),
+        }
+    }
+
+    pub(crate) fn new(line: FieldLine<S, H>) -> Result<Self, WriteError> {
+        let (head, value) = match line {
+            FieldLine::Indexed { index } => {
+                let head = match index {
+                    TableIndex::Static { index } => Part::integer::<6, _>(0xc0, index),
+                    TableIndex::Relative { index } => Part::integer::<6, _>(0x80, index),
+                    TableIndex::PostBase { index } => Part::integer::<4, _>(0x10, index),
+                };
+                (head.context(IndexSnafu)?, Part::empty())
+            }
+            FieldLine::LiteralWithNameReference {
+                never_index,
+                name,
+                value,
+            } => {
+                let n = u8::from(never_index);
+                let head = match name {
+                    TableIndex::Static { index } => Part::integer::<4, _>(0x50 | n << 5, index),
+                    TableIndex::Relative { index } => Part::integer::<4, _>(0x40 | n << 5, index),
+                    TableIndex::PostBase { index } => Part::integer::<3, _>(n << 3, index),
+                };
+                (
+                    head.context(IndexSnafu)?,
+                    Part::literal::<7>(0, value).context(ValueSnafu)?,
+                )
+            }
+            FieldLine::LiteralWithLiteralName {
+                never_index,
+                name,
+                value,
+            } => {
+                let flags = 0x20 | u8::from(never_index) << 4;
+                (
+                    Part::literal::<3>(flags, name).context(NameSnafu)?,
+                    Part::literal::<7>(0, value).context(ValueSnafu)?,
+                )
+            }
+        };
+        Ok(Self::from_parts(head, value))
+    }
+}
+
+/// Submit all measured representations in one `BufMut` operation. A
+/// segmented destination may report a more conservative capacity after its
+/// cursor moves.
+pub(crate) fn transfer<B: Buf>(
     dst: &mut impl BufMut,
     required: u128,
-    prefix: &'a [u8],
-    lines: impl Iterator<Item = &'a Prepared<'a>>,
+    bufs: impl Iterator<Item = B>,
 ) -> Result<(), InsufficientCapacityError> {
     InsufficientCapacityError::check(required, dst.remaining_mut())?;
-    let mut chunks = (!prefix.is_empty())
-        .then_some(WireChunk::Borrowed(prefix))
-        .into_iter()
-        .chain(lines.flat_map(Prepared::chunks));
-    let current = chunks.next().unwrap_or(WireChunk::Borrowed(&[]));
-    dst.put(WireBuf {
-        chunks,
-        current,
-        start: 0,
-        remaining: required as usize,
-    });
+    // The check bounds the total by the destination's usize capacity.
+    dst.put(Sequence::new(bufs, required as usize));
     Ok(())
 }
 
-struct WireBuf<'a, I> {
-    chunks: I,
-    current: WireChunk<'a>,
-    start: usize,
+/// Consecutive buffers as one, with their total length known in advance.
+pub(crate) struct Sequence<I, B> {
+    current: Option<B>,
+    rest: I,
     remaining: usize,
 }
 
-impl<'a, I: Iterator<Item = WireChunk<'a>>> Buf for WireBuf<'a, I> {
-    fn remaining(&self) -> usize {
-        self.remaining
+impl<B: Buf, I: Iterator<Item = B>> Sequence<I, B> {
+    pub(crate) fn new(mut bufs: I, remaining: usize) -> Self {
+        let current = bufs.next();
+        let mut sequence = Self {
+            current,
+            rest: bufs,
+            remaining,
+        };
+        sequence.settle();
+        sequence
     }
-    fn chunk(&self) -> &[u8] {
-        &self.current.as_slice()[self.start..]
-    }
-    fn advance(&mut self, mut count: usize) {
-        assert!(count <= self.remaining);
-        self.remaining -= count;
-        while count > 0 {
-            let available = self.chunk().len();
-            if count < available {
-                self.start += count;
-                return;
-            }
-            count -= available;
-            self.current = self.chunks.next().unwrap_or(WireChunk::Borrowed(&[]));
-            self.start = 0;
+
+    // Keep a current buffer with octets left, so that `chunk` is nonempty
+    // while octets remain.
+    fn settle(&mut self) {
+        while self
+            .current
+            .as_ref()
+            .is_some_and(|buf| !buf.has_remaining())
+        {
+            self.current = self.rest.next();
         }
     }
 }
 
-fn prepare<S: AsRef<[u8]>, H: AsRef<[u8]>>(
-    line: &FieldLine<S, H>,
-    encoded_len: impl Fn(&[u8]) -> u128,
-) -> Result<(Part<'_>, Option<Part<'_>>), WriteError> {
-    Ok(match line {
-        FieldLine::Indexed(index) => {
-            let head = match index {
-                TableIndex::Static(i) => Part::integer::<6>(0xc0, u64::from(i.get())),
-                TableIndex::Relative(i) => Part::integer::<6>(0x80, *i),
-                TableIndex::PostBase(i) => Part::integer::<4>(0x10, *i),
-            };
-            (head, None)
+impl<B: Buf, I: Iterator<Item = B>> Buf for Sequence<I, B> {
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    fn chunk(&self) -> &[u8] {
+        match &self.current {
+            Some(current) => current.chunk(),
+            None => &[],
         }
-        FieldLine::LiteralWithNameReference {
-            never_index,
-            name,
-            value,
-        } => {
-            let n = u8::from(*never_index);
-            let head = match name {
-                TableIndex::Static(i) => Part::integer::<4>(0x50 | n << 5, u64::from(i.get())),
-                TableIndex::Relative(i) => Part::integer::<4>(0x40 | n << 5, *i),
-                TableIndex::PostBase(i) => Part::integer::<3>(n << 3, *i),
-            };
-            (
-                head,
-                Some(
-                    Part::literal::<7, _, _>(0, value, &encoded_len)
-                        .context(ValueLengthOverflowSnafu)?,
-                ),
-            )
+    }
+
+    fn advance(&mut self, mut count: usize) {
+        assert!(
+            count <= self.remaining,
+            "advance past the end of the sequence"
+        );
+        self.remaining -= count;
+        while count > 0 {
+            let current = self
+                .current
+                .as_mut()
+                .expect("the measured length covers every buffer");
+            let step = count.min(current.remaining());
+            current.advance(step);
+            count -= step;
+            self.settle();
         }
-        FieldLine::LiteralWithLiteralName {
-            never_index,
-            name,
-            value,
-        } => {
-            let flags = 0x20 | u8::from(*never_index) << 4;
-            (
-                Part::literal::<3, _, _>(flags, name, &encoded_len)
-                    .context(NameLengthOverflowSnafu)?,
-                Some(
-                    Part::literal::<7, _, _>(0, value, &encoded_len)
-                        .context(ValueLengthOverflowSnafu)?,
-                ),
-            )
-        }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -270,59 +294,22 @@ mod tests {
     fn raw_literals_reach_the_transfer_as_whole_borrowed_chunks() {
         let name = [b'n'; 1024];
         let value = [b'x'; 8192];
-        let line = FieldLine::<&[u8]>::LiteralWithLiteralName {
+        let line = FieldLine::<&[u8], &[u8]>::LiteralWithLiteralName {
             never_index: false,
-            name: StringLiteral::Raw(&name),
-            value: StringLiteral::Raw(&value),
+            name: crate::test_support::raw(&name),
+            value: crate::test_support::raw(&value),
         };
-        let prepared = Prepared::new(&line).unwrap();
-        let mut chunks = prepared.chunks();
-        let _name_prefix = chunks.next().unwrap();
-        let name_chunk = chunks.next().unwrap();
-        assert!(core::ptr::eq(name_chunk.as_slice(), name.as_slice()));
-        let _value_prefix = chunks.next().unwrap();
-        let value_chunk = chunks.next().unwrap();
-        assert!(core::ptr::eq(value_chunk.as_slice(), value.as_slice()));
-        assert!(chunks.next().is_none());
-    }
-
-    #[test]
-    fn encoded_length_overflow_identifies_the_field() {
-        let raw = StringLiteral::Raw(&b""[..]);
-        let coded = StringLiteral::Huffman(&b"x"[..]);
-        for (line, is_name) in [
-            (
-                FieldLine::LiteralWithNameReference {
-                    never_index: false,
-                    name: TableIndex::Relative(0),
-                    value: coded.clone(),
-                },
-                false,
-            ),
-            (
-                FieldLine::LiteralWithLiteralName {
-                    never_index: false,
-                    name: raw.clone(),
-                    value: coded.clone(),
-                },
-                false,
-            ),
-            (
-                FieldLine::LiteralWithLiteralName {
-                    never_index: false,
-                    name: coded,
-                    value: raw,
-                },
-                true,
-            ),
-        ] {
-            let max = u128::from(u64::MAX);
-            assert!(prepare(&line, |_| max).is_ok());
-            assert!(matches!(
-                (is_name, prepare(&line, |_| max + 1)),
-                (true, Err(WriteError::NameLengthOverflow { .. }))
-                    | (false, Err(WriteError::ValueLengthOverflow { .. }))
-            ));
+        let prepared = Prepared::new(line).unwrap();
+        let mut buf = prepared.buf;
+        let mut chunks = alloc::vec::Vec::new();
+        while buf.has_remaining() {
+            let chunk = buf.chunk();
+            chunks.push((chunk.as_ptr(), chunk.len()));
+            let count = chunk.len();
+            buf.advance(count);
         }
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[1], (name.as_ptr(), name.len()));
+        assert_eq!(chunks[3], (value.as_ptr(), value.len()));
     }
 }

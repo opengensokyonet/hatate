@@ -37,13 +37,13 @@ async fn read_one<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
 fn reference(first: u8, rest: &mut &[u8]) -> Option<D> {
     match first {
         0x80..=0xff => Some(D::SectionAcknowledgment(
-            StreamId::try_from(integer::read::<7>(first, rest).ok()?).ok()?,
+            StreamId::try_from(integer::read::<7>(first, rest).ok()?.value().get()).ok()?,
         )),
         0x40..=0x7f => Some(D::StreamCancellation(
-            StreamId::try_from(integer::read::<6>(first, rest).ok()?).ok()?,
+            StreamId::try_from(integer::read::<6>(first, rest).ok()?.value().get()).ok()?,
         )),
         _ => Some(D::InsertCountIncrement(NonZeroU64::new(
-            integer::read::<6>(first, rest).ok()?,
+            integer::read::<6>(first, rest).ok()?.value().get(),
         )?)),
     }
 }

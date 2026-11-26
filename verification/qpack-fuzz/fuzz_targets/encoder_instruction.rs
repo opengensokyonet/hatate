@@ -20,6 +20,10 @@ use nitori_call::{ReceiverAccess, call};
 use nitori_codec::DecodeFrom;
 use nitori_io::{calls::ReadValue, prelude::*};
 
+fn int(value: usize) -> integer::PrefixedField {
+    integer::PrefixedField::shortest(integer::PrefixedInt::from(value as u64))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Parsed {
     Capacity(u64),
@@ -29,11 +33,11 @@ enum Parsed {
 }
 
 fn string<const N: u8>(first: u8, src: &mut &[u8], remaining: &mut usize) -> Option<Vec<u8>> {
-    let n = usize::try_from(integer::read::<N>(first, src).ok()?).ok()?;
+    let n = usize::try_from(integer::read::<N>(first, src).ok()?.value().get()).ok()?;
     let (body, tail) = src.split_at_checked(n)?;
     *src = tail;
     let bytes = if first & (1 << N) != 0 {
-        huffman::decode(body, *remaining).ok()?.to_vec()
+        huffman::decode::<Vec<u8>>(body, *remaining).ok()?
     } else {
         if body.len() > *remaining {
             return None;
@@ -47,15 +51,15 @@ fn string<const N: u8>(first: u8, src: &mut &[u8], remaining: &mut usize) -> Opt
 fn reference(src: &mut &[u8], mut decoded: usize) -> Option<Parsed> {
     let first = src.try_get_u8().ok()?;
     Some(match first {
-        0..=0x1f => Parsed::Duplicate(integer::read::<5>(first, src).ok()?),
-        0x20..=0x3f => Parsed::Capacity(integer::read::<5>(first, src).ok()?),
+        0..=0x1f => Parsed::Duplicate(integer::read::<5>(first, src).ok()?.value().get()),
+        0x20..=0x3f => Parsed::Capacity(integer::read::<5>(first, src).ok()?.value().get()),
         0x40..=0x7f => {
             let name = string::<5>(first, src, &mut decoded)?;
             let head = src.try_get_u8().ok()?;
             Parsed::Literal(name, string::<7>(head, src, &mut decoded)?)
         }
         _ => {
-            let n = integer::read::<6>(first, src).ok()?;
+            let n = integer::read::<6>(first, src).ok()?.value().get();
             let name = if first & 0x40 != 0 {
                 NameReference::Static(Index::try_from(n).ok()?)
             } else {
@@ -210,12 +214,12 @@ where
 fn check_raw_writer(body: &[u8], split: usize, wire: usize, decoded: usize) {
     let (name, value) = body.split_at(split.min(body.len()));
     let mut expected = Vec::new();
-    integer::write::<5>(&mut expected, 0x40, name.len() as u64).unwrap();
+    integer::write::<5, _>(&mut expected, 0x40, int(name.len())).unwrap();
     let name_end = expected.len() + name.len();
     let name_fits = name_end < wire && name.len() <= decoded;
     if name_fits {
         expected.extend_from_slice(name);
-        integer::write::<7>(&mut expected, 0, value.len() as u64).unwrap();
+        integer::write::<7, _>(&mut expected, 0, int(value.len())).unwrap();
     }
     let fits = name_fits && expected.len() + value.len() <= wire && body.len() <= decoded;
     if fits {
@@ -237,9 +241,9 @@ fn check_coded_writer(body: &[u8], split: u8, wire: usize, decoded: usize) {
     let (name, value) = body.split_at(usize::from(split).min(body.len()));
     for flags in 1..=3 {
         let mut expected = Vec::new();
-        integer::write::<5>(&mut expected, 0x40 | ((flags & 1) << 5), name.len() as u64).unwrap();
+        integer::write::<5, _>(&mut expected, 0x40 | ((flags & 1) << 5), int(name.len())).unwrap();
         expected.extend_from_slice(name);
-        integer::write::<7>(&mut expected, (flags & 2) << 6, value.len() as u64).unwrap();
+        integer::write::<7, _>(&mut expected, (flags & 2) << 6, int(value.len())).unwrap();
         expected.extend_from_slice(value);
         let fits = expected.len() <= wire && reference(&mut expected.as_slice(), decoded).is_some();
         let mut hosts = (name, value, Vec::new());
