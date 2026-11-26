@@ -68,12 +68,17 @@ pub enum FieldLine<S = Bytes, H = Bytes> {
     },
 }
 
-impl<S: AsRef<[u8]>, H: AsRef<[u8]>> FieldLine<S, H> {
-    /// The line with the octets of its literals borrowed as slices.
-    pub(crate) fn as_slices(&self) -> FieldLine<&[u8], &[u8]> {
-        match self {
-            Self::Indexed { index } => FieldLine::Indexed { index: *index },
-            Self::LiteralWithNameReference {
+/// The line with the octets of its literals borrowed as slices, keeping
+/// every detail of their encoding: to write a line held in storage such as
+/// `BytesMut` without copying its octets
+/// ([`write_static_section`](crate::static_section::write_static_section)).
+impl<'a, S: AsRef<[u8]>, H: AsRef<[u8]>> From<&'a FieldLine<S, H>>
+    for FieldLine<&'a [u8], &'a [u8]>
+{
+    fn from(line: &'a FieldLine<S, H>) -> Self {
+        match line {
+            FieldLine::Indexed { index } => FieldLine::Indexed { index: *index },
+            FieldLine::LiteralWithNameReference {
                 never_index,
                 name,
                 value,
@@ -82,7 +87,7 @@ impl<S: AsRef<[u8]>, H: AsRef<[u8]>> FieldLine<S, H> {
                 name: *name,
                 value: value.as_slices(),
             },
-            Self::LiteralWithLiteralName {
+            FieldLine::LiteralWithLiteralName {
                 never_index,
                 name,
                 value,

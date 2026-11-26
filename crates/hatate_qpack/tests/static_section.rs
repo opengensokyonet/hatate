@@ -6,7 +6,7 @@ use hatate_qpack::{
     integer::{PrefixedField, PrefixedInt},
     static_section::{
         DynamicReferenceError, Field, FieldBytes, Fields, PrefixError, ReadError, SectionPrefix,
-        WriteError, read_static_section, write_static_section,
+        StaticSection, WriteError, read_static_section, write_static_section,
     },
     static_table::Index,
 };
@@ -17,7 +17,7 @@ fn read(
     max_literal_len: usize,
     max_section_size: usize,
 ) -> Result<Fields<&[u8], BytesMut>, PrefixError> {
-    read_static_section(wire, max_literal_len, max_section_size).map(|(_, fields)| fields)
+    read_static_section(wire, max_literal_len, max_section_size).map(|section| section.fields)
 }
 
 fn static_index(number: u64) -> TableIndex {
@@ -41,7 +41,8 @@ fn zero() -> SectionPrefix {
 #[test]
 fn appendix_b1_reads_and_writes_a_complete_section() {
     let wire = b"\x00\x00\x51\x0b/index.html";
-    let (prefix, mut fields) = read_static_section::<_, BytesMut>(&wire[..], 11, 48).unwrap();
+    let StaticSection { prefix, mut fields } =
+        read_static_section::<_, BytesMut>(&wire[..], 11, 48).unwrap();
     assert_eq!(prefix, SectionPrefix::default());
     let field = fields.next().unwrap().unwrap();
     assert_eq!(field.name, FieldBytes::Static(b":path"));
@@ -58,11 +59,11 @@ fn appendix_b1_reads_and_writes_a_complete_section() {
         value: raw(&b"/index.html"[..]),
     }];
     let mut out = Vec::new();
-    write_static_section(&mut out, &prefix, &lines).unwrap();
+    write_static_section(&mut out, &prefix, lines).unwrap();
     assert_eq!(out, wire);
     // The line that was read writes back the same octets.
     let mut again = Vec::new();
-    write_static_section(&mut again, &prefix, [&field.line]).unwrap();
+    write_static_section(&mut again, &prefix, [field.line]).unwrap();
     assert_eq!(again, wire);
 }
 
@@ -90,7 +91,7 @@ fn prefix_is_eager_and_section_errors_are_terminal() {
     assert!(matches!(fields.next(), Some(Err(ReadError::Line { .. }))));
     assert!(fields.next().is_none());
     let mut out = Vec::new();
-    write_static_section(&mut out, &zero(), &Vec::<FieldLine<Bytes, Bytes>>::new()).unwrap();
+    write_static_section(&mut out, &zero(), Vec::<FieldLine<Bytes, Bytes>>::new()).unwrap();
     assert_eq!(out, [0, 0]);
 }
 
@@ -101,12 +102,13 @@ fn padded_prefixes_read_back_and_write_their_original_octets() {
         &[0x00, 0x7f, 0x80, 0x00],
         &[0x00, 0x7f, 0x81, 0x80, 0x80, 0x00],
     ] {
-        let (prefix, mut fields) = read_static_section::<_, BytesMut>(wire, 0, 0).unwrap();
+        let StaticSection { prefix, mut fields } =
+            read_static_section::<_, BytesMut>(wire, 0, 0).unwrap();
         assert!(fields.next().is_none());
         assert!(!prefix.is_negative());
         assert_eq!(prefix.encoded_insert_count().value(), PrefixedInt::ZERO);
         let mut out = Vec::new();
-        write_static_section(&mut out, &prefix, &Vec::<FieldLine<Bytes, Bytes>>::new()).unwrap();
+        write_static_section(&mut out, &prefix, Vec::<FieldLine<Bytes, Bytes>>::new()).unwrap();
         assert_eq!(out, wire);
     }
     let padded = SectionPrefix::new(
@@ -116,7 +118,7 @@ fn padded_prefixes_read_back_and_write_their_original_octets() {
     )
     .unwrap();
     let mut out = Vec::new();
-    write_static_section(&mut out, &padded, &Vec::<FieldLine<Bytes, Bytes>>::new()).unwrap();
+    write_static_section(&mut out, &padded, Vec::<FieldLine<Bytes, Bytes>>::new()).unwrap();
     assert_eq!(out, [0x00, 0x7f, 0x81, 0x80, 0x80, 0x00]);
 }
 
@@ -132,7 +134,7 @@ fn prefixes_that_need_a_dynamic_table_are_not_written() {
             write_static_section(
                 &mut out,
                 &prefix.unwrap(),
-                &Vec::<FieldLine<Bytes, Bytes>>::new()
+                Vec::<FieldLine<Bytes, Bytes>>::new()
             ),
             Err(WriteError::DynamicPrefix)
         ));
@@ -176,7 +178,8 @@ fn resolved_sizes_and_per_literal_limits_are_independent() {
 #[test]
 fn repeated_names_keep_their_order_storage_and_never_index_bit() {
     let wire = Bytes::from_static(b"\x00\x00\x71\x01A\x51\x81\x1f\x31x\x01z");
-    let (prefix, fields) = read_static_section::<_, BytesMut>(wire.clone(), 1, 256).unwrap();
+    let StaticSection { prefix, fields } =
+        read_static_section::<_, BytesMut>(wire.clone(), 1, 256).unwrap();
     let fields = fields.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(fields.len(), 3);
     assert!(
@@ -191,7 +194,12 @@ fn repeated_names_keep_their_order_storage_and_never_index_bit() {
     assert!(never_index(&fields[2]));
     assert_eq!(fields[2].value.as_ref(), b"z");
     let mut out = Vec::new();
-    write_static_section(&mut out, &prefix, fields.iter().map(|field| &field.line)).unwrap();
+    write_static_section(
+        &mut out,
+        &prefix,
+        fields.iter().map(|field| FieldLine::from(&field.line)),
+    )
+    .unwrap();
     assert_eq!(out, wire);
 }
 
@@ -235,7 +243,7 @@ fn dynamic_references_fail_before_reading_an_associated_value() {
             bad,
         ];
         assert!(matches!(
-            write_static_section(&mut out, &zero(), &lines),
+            write_static_section(&mut out, &zero(), lines),
             Err(WriteError::DynamicReference { index: 1, source: error }) if error == source
         ));
         assert_eq!(out, b"unchanged");
@@ -261,7 +269,7 @@ fn all_short_destinations_are_untouched_and_exact_fit_preserves_choices() {
     for capacity in 0..expected.len() {
         let mut buf = [0xa5; 7];
         let mut dst = &mut buf[..capacity];
-        let error = write_static_section(&mut dst, &zero(), &rows()).unwrap_err();
+        let error = write_static_section(&mut dst, &zero(), rows()).unwrap_err();
         assert!(
             matches!(error, WriteError::InsufficientCapacity {source} if source.required()==7 && source.available()==capacity)
         );
@@ -269,10 +277,10 @@ fn all_short_destinations_are_untouched_and_exact_fit_preserves_choices() {
         assert_eq!(buf, [0xa5; 7]);
     }
     let mut buf = BytesMut::new();
-    write_static_section(&mut buf, &zero(), &rows()).unwrap();
+    write_static_section(&mut buf, &zero(), rows()).unwrap();
     assert_eq!(buf.as_ref(), expected);
     let mut exact = [0; 7];
-    write_static_section(&mut &mut exact[..], &zero(), &rows()).unwrap();
+    write_static_section(&mut &mut exact[..], &zero(), rows()).unwrap();
     assert_eq!(exact, expected);
 }
 
@@ -331,7 +339,7 @@ fn capacity_can_be_reported_conservatively_after_the_first_write() {
             advanced: false,
         },
         &zero(),
-        &[line()],
+        [line()],
     )
     .unwrap();
     assert_eq!(&section[..6], &[0, 0, 0x51, 0x82, 0x18, 0xff]);
@@ -351,7 +359,7 @@ fn segmented_destination_can_cross_several_encoded_chunks() {
         rest: &mut storage,
         advanced: false,
     };
-    write_static_section(&mut dst, &zero(), [&line]).unwrap();
+    write_static_section(&mut dst, &zero(), [line]).unwrap();
     let length = 1500 - dst.rest.len();
     let mut fields = read(&storage[..length], 670, 1372).unwrap();
     let field = fields.next().unwrap().unwrap();
@@ -379,7 +387,7 @@ fn literal(value: &'static [u8]) -> Line {
 /// The octets of a section of these lines, written as they stand.
 fn written(lines: &[Line]) -> Vec<u8> {
     let mut out = Vec::new();
-    write_static_section(&mut out, &zero(), lines.iter()).unwrap();
+    write_static_section(&mut out, &zero(), lines.iter().cloned()).unwrap();
     out
 }
 
@@ -406,10 +414,10 @@ impl<'a> Rewalked<'a> {
     }
 }
 
-impl<'a> Iterator for Rewalked<'a> {
-    type Item = &'a Line;
+impl Iterator for Rewalked<'_> {
+    type Item = Line;
 
-    fn next(&mut self) -> Option<&'a Line> {
+    fn next(&mut self) -> Option<Line> {
         let chosen = *self.chosen.get_or_insert_with(|| {
             let walk = self.walks.get();
             self.walks.set(walk + 1);
@@ -417,7 +425,7 @@ impl<'a> Iterator for Rewalked<'a> {
         });
         let line = chosen.get(self.position)?;
         self.position += 1;
-        Some(line)
+        Some(line.clone())
     }
 }
 
@@ -470,25 +478,25 @@ fn lines_that_change_between_the_walks_report_where() {
 }
 
 #[test]
-fn a_vec_of_lines_or_of_things_that_hold_lines_is_written_by_borrowing() {
+fn lines_cloned_borrowed_or_moved_write_the_same_section() {
     struct Entry {
         line: Line,
     }
     let lines = vec![indexed(17), literal(b"value"), indexed(25)];
     let mut by_iter = Vec::new();
-    write_static_section(&mut by_iter, &zero(), lines.iter()).unwrap();
+    write_static_section(&mut by_iter, &zero(), lines.iter().cloned()).unwrap();
     let entries: Vec<Entry> = lines.iter().cloned().map(|line| Entry { line }).collect();
     let mut by_field = Vec::new();
     write_static_section(
         &mut by_field,
         &zero(),
-        entries.iter().map(|entry| &entry.line),
+        entries.iter().map(|entry| FieldLine::from(&entry.line)),
     )
     .unwrap();
     assert_eq!(by_iter, by_field);
     assert_eq!(by_iter[..2], [0, 0]);
-    // Walking the lines to write them leaves them to be written again.
+    // Lines given by value are consumed by the walks.
     let mut again = Vec::new();
-    write_static_section(&mut again, &zero(), &lines).unwrap();
+    write_static_section(&mut again, &zero(), lines).unwrap();
     assert_eq!(again, by_iter);
 }

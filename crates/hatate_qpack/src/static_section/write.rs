@@ -49,25 +49,27 @@ pub enum WriteError {
 /// order, each with the encoding details it carries. Validation and sizing
 /// of the prefix and all fields take place before the first write: a clone
 /// of `lines` is walked to check and measure the lines, and then `lines`
-/// itself to write them, with the octets of their literals borrowed. On
-/// error the destination is unchanged, except after
-/// [`WriteError::LineChanged`].
-pub fn write_static_section<'l, S, H, I>(
+/// itself to write them. Each walk consumes the lines it yields, so the
+/// iterator chooses what a walk costs: `Bytes` lines cloned
+/// (`lines.iter().cloned()`), or lines whose literals are borrowed
+/// (`lines.iter().map(FieldLine::from)`, from `&FieldLine`). On error the destination is unchanged, except
+/// after [`WriteError::LineChanged`].
+pub fn write_static_section<S, H, I>(
     dst: &mut impl BufMut,
     prefix: &SectionPrefix,
     lines: I,
 ) -> Result<(), WriteError>
 where
-    S: AsRef<[u8]> + 'l,
-    H: AsRef<[u8]> + 'l,
-    I: IntoIterator<Item = &'l FieldLine<S, H>>,
+    S: Buf,
+    H: Buf,
+    I: IntoIterator<Item = FieldLine<S, H>>,
     I::IntoIter: Clone,
 {
     if prefix.encoded_insert_count().value().get() != 0 || prefix.is_negative() {
         return Err(WriteError::DynamicPrefix);
     }
     // The sign bit is clear here.
-    let head = Prepared::<&[u8], &[u8]>::from_parts(
+    let head = Prepared::<S, H>::from_parts(
         Part::integer::<8, _>(0, prefix.encoded_insert_count())
             .expect("the prefix checked its encoded insert count"),
         Part::integer::<7, _>(0, prefix.delta_base()).expect("the prefix checked its delta base"),
@@ -75,10 +77,10 @@ where
     let lines = lines.into_iter();
     let mut required = head.len;
     for (index, line) in lines.clone().enumerate() {
-        if let Some(source) = dynamic_reference(line) {
+        if let Some(source) = dynamic_reference(&line) {
             return Err(WriteError::DynamicReference { index, source });
         }
-        let field = Prepared::new(line.as_slices()).context(LineSnafu { index })?;
+        let field = Prepared::new(line).context(LineSnafu { index })?;
         // Each line's length is below 2^66 octets, and there can be fewer
         // than 2^64 lines, so the total fits a u128.
         required += field.len;
@@ -103,22 +105,17 @@ where
 /// of the length the first walk measured. A line that no longer passes the
 /// checks or fits what is left of that length, or an end of the lines before
 /// it, ends the buffer there and is recorded in `changed`.
-struct Rewalk<'l, I> {
+struct Rewalk<I, S, H> {
     lines: I,
     /// The position of the next line.
     index: usize,
-    current: Option<LineBuf<&'l [u8], &'l [u8]>>,
+    current: Option<LineBuf<S, H>>,
     remaining: usize,
     changed: Option<usize>,
 }
 
-impl<'l, I, S, H> Rewalk<'l, I>
-where
-    I: Iterator<Item = &'l FieldLine<S, H>>,
-    S: AsRef<[u8]> + 'l,
-    H: AsRef<[u8]> + 'l,
-{
-    fn new(head: LineBuf<&'l [u8], &'l [u8]>, lines: I, remaining: usize) -> Self {
+impl<I: Iterator<Item = FieldLine<S, H>>, S: Buf, H: Buf> Rewalk<I, S, H> {
+    fn new(head: LineBuf<S, H>, lines: I, remaining: usize) -> Self {
         let mut section = Self {
             lines,
             index: 0,
@@ -133,12 +130,12 @@ where
     // Keep a current buffer with octets left while octets remain.
     fn settle(&mut self) {
         while self.remaining > 0 && !self.current.as_ref().is_some_and(Buf::has_remaining) {
-            let next = self.lines.next();
-            let field = next.and_then(|line| {
-                Prepared::new(line.as_slices()).ok().filter(|field| {
-                    field.len <= self.remaining as u128 && dynamic_reference(line).is_none()
-                })
-            });
+            let field = self
+                .lines
+                .next()
+                .filter(|line| dynamic_reference(line).is_none())
+                .and_then(|line| Prepared::new(line).ok())
+                .filter(|field| field.len <= self.remaining as u128);
             match field {
                 Some(field) => {
                     self.current = Some(field.buf);
@@ -154,12 +151,7 @@ where
     }
 }
 
-impl<'l, I, S, H> Buf for Rewalk<'l, I>
-where
-    I: Iterator<Item = &'l FieldLine<S, H>>,
-    S: AsRef<[u8]> + 'l,
-    H: AsRef<[u8]> + 'l,
-{
+impl<I: Iterator<Item = FieldLine<S, H>>, S: Buf, H: Buf> Buf for Rewalk<I, S, H> {
     fn remaining(&self) -> usize {
         self.remaining
     }

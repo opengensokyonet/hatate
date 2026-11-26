@@ -6,7 +6,7 @@
 use bytes::BytesMut;
 use hatate_qpack::{
     field_line::{FieldLine, TableIndex, read_field_line},
-    static_section::{SectionPrefix, read_static_section, write_static_section},
+    static_section::{SectionPrefix, StaticSection, read_static_section, write_static_section},
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -56,7 +56,9 @@ fuzz_target!(|data: &[u8]| {
     let total = usize::from(u16::from_be_bytes([*high, *low]));
     // Also exercise arbitrary section prefixes and fused termination. A
     // section read completely writes back to its octets.
-    if let Ok((prefix, mut fields)) = read_static_section::<_, BytesMut>(body, literal, total) {
+    if let Ok(StaticSection { prefix, mut fields }) =
+        read_static_section::<_, BytesMut>(body, literal, total)
+    {
         let mut lines = Vec::new();
         let mut complete = true;
         for field in fields.by_ref() {
@@ -71,14 +73,14 @@ fuzz_target!(|data: &[u8]| {
         assert!(fields.next().is_none());
         if complete {
             let mut written = Vec::new();
-            write_static_section(&mut written, &prefix, &lines).unwrap();
+            write_static_section(&mut written, &prefix, lines).unwrap();
             assert_eq!(written, body);
         }
     }
 
     let mut wire = vec![0, 0];
     wire.extend_from_slice(body);
-    let (prefix, mut fields) =
+    let StaticSection { prefix, mut fields } =
         read_static_section::<_, BytesMut>(wire.as_slice(), literal, total).unwrap();
     assert_eq!(prefix, SectionPrefix::default());
     let mut rest = body;
@@ -93,7 +95,7 @@ fuzz_target!(|data: &[u8]| {
         let Some(expected) = resolve(&line) else {
             rows.push(line);
             let mut dst = vec![0x77];
-            assert!(write_static_section(&mut dst, &prefix, &rows).is_err());
+            assert!(write_static_section(&mut dst, &prefix, rows.clone()).is_err());
             assert_eq!(dst, [0x77]);
             assert!(fields.next().unwrap().is_err());
             break;
@@ -117,9 +119,16 @@ fuzz_target!(|data: &[u8]| {
     // The accepted rows came from the start of `body`.
     let reference = &wire[..2 + accepted];
     let mut dst = vec![0xaa; reference.len() - 1];
-    assert!(write_static_section(&mut dst.as_mut_slice(), &prefix, &rows).is_err());
+    assert!(
+        write_static_section(
+            &mut dst.as_mut_slice(),
+            &prefix,
+            rows.iter().map(FieldLine::from)
+        )
+        .is_err()
+    );
     assert!(dst.iter().all(|b| *b == 0xaa));
     let mut exact = vec![0; reference.len()];
-    write_static_section(&mut exact.as_mut_slice(), &prefix, &rows).unwrap();
+    write_static_section(&mut exact.as_mut_slice(), &prefix, rows).unwrap();
     assert_eq!(exact, reference);
 });

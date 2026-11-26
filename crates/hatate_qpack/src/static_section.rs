@@ -7,15 +7,19 @@
 //!
 //! ```
 //! use bytes::BytesMut;
-//! use hatate_qpack::static_section::{read_static_section, write_static_section};
+//! use hatate_qpack::{
+//!     field_line::FieldLine,
+//!     static_section::{read_static_section, write_static_section},
+//! };
 //!
 //! let payload = &[0, 0, 0xd1, 0xd7][..];
-//! let (prefix, fields) = read_static_section::<_, BytesMut>(payload, 0, 86)?;
-//! let fields = fields.collect::<Result<Vec<_>, _>>()?;
+//! let section = read_static_section::<_, BytesMut>(payload, 0, 86)?;
+//! let fields = section.fields.collect::<Result<Vec<_>, _>>()?;
 //! assert_eq!(fields[0].value.as_ref(), b"GET");
 //! assert_eq!(fields[1].value.as_ref(), b"https");
 //! let mut output = Vec::new();
-//! write_static_section(&mut output, &prefix, fields.iter().map(|field| &field.line))?;
+//! let lines = fields.iter().map(|field| FieldLine::from(&field.line));
+//! write_static_section(&mut output, &section.prefix, lines)?;
 //! assert_eq!(output, payload);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -125,16 +129,25 @@ pub fn read_static_section<S: Buf + SplitTo, H>(
     mut src: S,
     max_literal_len: usize,
     max_section_size: usize,
-) -> Result<(SectionPrefix, Fields<S, H>), PrefixError> {
+) -> Result<StaticSection<S, H>, PrefixError> {
     let prefix = prefix::read(&mut src)?;
-    Ok((
+    Ok(StaticSection {
         prefix,
-        Fields {
+        fields: Fields {
             src: Some(src),
             budget: Budget::new(max_literal_len, max_section_size),
             huffman: PhantomData,
         },
-    ))
+    })
+}
+
+/// A field section being read in static mode: its prefix, read whole, and
+/// its fields, read one per iteration ([`read_static_section`]).
+pub struct StaticSection<S, H> {
+    /// The section's prefix.
+    pub prefix: SectionPrefix,
+    /// The fields after the prefix.
+    pub fields: Fields<S, H>,
 }
 
 /// An ordered sequence of decoded fields. The first error ends iteration.
