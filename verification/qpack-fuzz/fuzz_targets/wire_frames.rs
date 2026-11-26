@@ -3,7 +3,9 @@
 //! PUSH_PROMISE (its Push ID, then the rest of the payload), and the payload
 //! of every other frame, which is collected. Every frame read whole is
 //! written back (its Type and Length at the widths they were read with, then
-//! its payload) and must equal its bytes.
+//! its payload) and must equal its bytes; a SETTINGS frame is rebuilt from
+//! its settings and written with the shortest Type and Length, and its
+//! payload must equal the bytes it was read from.
 //!
 //! The first byte sets how the stream arrives: its low four bits plus one are
 //! the bytes given per read, and its high four bits the period of a
@@ -23,10 +25,11 @@ use frunk_core::HList;
 use hatate_wire::{
     Role,
     frame::{
-        GoawayId, Http3FrameType, PushId, payload::FramePayload, push_promise::PushPromisePayload,
+        Frame, FrameWidths, GoawayId, Http3FrameType, PushId, SettingsFrameType,
+        payload::FramePayload, push_promise::PushPromisePayload,
     },
     settings::{
-        codec::{SettingParameter, SettingsFrame, SettingsFrameError, WriteSettingsFrameExt as _},
+        codec::{SettingParameter, SettingsPayload, SettingsPayloadError},
         set::{Settings, SettingsOf},
     },
     stream::{
@@ -158,7 +161,6 @@ macro_rules! walk {
         let mut start = 0usize;
         loop {
             let mut frame = stream.frame();
-            let widths = frame.widths();
             let type_field = VarIntField::new(frame.frame_type().into(), frame.r#type().width())
                 .expect("a field holds its value at its width");
             let length_field = frame.length();
@@ -182,16 +184,28 @@ macro_rules! walk {
                         };
                         settings.push(setting);
                     }
-                    match SettingsFrame::<<Parts as SettingsOf>::Settings>::new(settings, widths) {
-                        Ok(settings_frame) => {
-                            assert_eq!(settings_frame.payload_len(), length);
-                            let Ok(()) = $out.write_settings_frame(&settings_frame).await else {
+                    match SettingsPayload::<<Parts as SettingsOf>::Settings>::new(settings) {
+                        Ok(payload) => {
+                            // The frame is rebuilt with the shortest Type and
+                            // Length; its identifiers and values keep their
+                            // widths, so the payload is the bytes it was.
+                            let Ok(rebuilt) = Frame::new(SettingsFrameType, payload).await else {
+                                panic!("a SETTINGS frame that was read cannot be built");
+                            };
+                            assert_eq!(rebuilt.widths(), FrameWidths::SHORTEST);
+                            assert_eq!(rebuilt.length().get().get(), length);
+                            let head = 1 + rebuilt.length().encoded_len();
+                            let mut again = ConstructedAccess::new(Vec::<u8>::new());
+                            let Ok(_) = again.encode(rebuilt).await else {
                                 panic!("a SETTINGS frame was not written");
                             };
-                            whole = true;
+                            let again = again.into_inner();
+                            assert_eq!(again[0], Http3FrameType::Settings.value().get() as u8);
+                            let read_head = type_field.encoded_len() + length_field.encoded_len();
+                            assert_eq!(again[head..], wire[start + read_head..end]);
                         }
                         // Unknown identifiers may repeat on the wire; a frame may not.
-                        Err(SettingsFrameError::Duplicate { .. }) => {}
+                        Err(SettingsPayloadError::Duplicate { .. }) => {}
                         Err(error) => {
                             panic!("a SETTINGS frame that was read cannot be built: {error}")
                         }

@@ -21,7 +21,6 @@ use hatate_wire_qpack::{QpackBlockedStreams, QpackMaxTableCapacity};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth, VarIntWidthError};
 use snafu::Snafu;
 
-#[allow(missing_docs)] // The call macro also generates operation and extension trait items.
 pub mod codec;
 pub mod set;
 
@@ -140,7 +139,7 @@ impl UnknownSetting {
     ///
     /// Whether a list of setting types claims the identifier is checked
     /// where the setting is put in a frame
-    /// ([`SettingsFrame::new`](codec::SettingsFrame::new)).
+    /// ([`SettingsPayload::new`](codec::SettingsPayload::new)).
     ///
     /// # Errors
     ///

@@ -6,20 +6,14 @@ use super::{
 };
 use crate::{
     error_code::{ErrorCode, ErrorCodeOf},
-    frame::{
-        FrameWidths, Http3FrameType,
-        codec::{
-            FrameLengthError, WriteFrameHeadError, length_field, payload_integer_error_code,
-            write_head,
-        },
-    },
+    frame::{Frame, SettingsFrameType, codec::payload_integer_error_code},
     parts::PartsError,
 };
 use alloc::vec::Vec;
 use core::fmt;
-use nitori_call::{AsAccess, ReceiverAccess, call};
-use nitori_codec::{DecodeFrom, prelude::*};
-use nitori_io::{Combine, Read, calls::ReadValue, prelude::*};
+use nitori_call::AsAccess;
+use nitori_codec::{DecodeFrom, EncodeInto, EncodedLen};
+use nitori_io::{Combine, Read, Write, calls::ReadValue};
 use sakuya_var_int::{
     VarInt, VarIntField,
     stream::{ReadVarIntError, WriteVarIntError},
@@ -194,38 +188,38 @@ impl<V> ErrorCodeOf<ErrorCode> for InsertSettingError<V> {
     }
 }
 
-/// A SETTINGS frame to write for the list of setting types `L`: its
-/// settings in order, none repeating an identifier, and the widths of its
-/// Type and Length.
-pub struct SettingsFrame<L: SettingList> {
-    widths: FrameWidths,
-    length: VarIntField<VarInt>,
+/// A SETTINGS frame ([RFC 9114 §7.2.4]): the frame type SETTINGS with a
+/// [`SettingsPayload`]. Build it with [`Frame::new`], which gives the Type
+/// and Length their shortest widths, and write it with
+/// [`EncodeInto`].
+///
+/// [RFC 9114 §7.2.4]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4
+pub type SettingsFrame<L, M = ()> = Frame<SettingsFrameType, SettingsPayload<L>, M>;
+
+/// The payload of a SETTINGS frame to write for the list of setting types
+/// `L`: its settings in order, none repeating an identifier.
+pub struct SettingsPayload<L: SettingList> {
     settings: Vec<Setting<L::Setting>>,
 }
 
-impl<L: SettingList> SettingsFrame<L> {
-    /// The frame of `settings`, with `widths`.
+impl<L: SettingList> SettingsPayload<L> {
+    /// The payload of `settings`.
     ///
     /// # Errors
     ///
-    /// [`SettingsFrameError`] if an identifier occurs twice, an unknown
-    /// setting has an identifier that a type of `L` claims, or the Length
-    /// cannot be written at its width.
-    pub fn new(
-        settings: Vec<Setting<L::Setting>>,
-        widths: FrameWidths,
-    ) -> Result<Self, SettingsFrameError> {
+    /// [`SettingsPayloadError`] if an identifier occurs twice, or an unknown
+    /// setting has an identifier that a type of `L` claims.
+    pub fn new(settings: Vec<Setting<L::Setting>>) -> Result<Self, SettingsPayloadError> {
         const {
             assert!(
                 L::CLAIMS_VALID,
                 "two setting types of the list claim the same identifier, or one claims a reserved one"
             );
         }
-        let mut length = 0u64;
         for (index, setting) in settings.iter().enumerate() {
-            let (identifier, value) = fields::<L>(setting);
+            let (identifier, _) = fields::<L>(setting);
             if matches!(setting, Setting::Unknown(_)) && L::IDENTIFIERS.contains(identifier.get()) {
-                return Err(SettingsFrameError::ClaimedIdentifier {
+                return Err(SettingsPayloadError::ClaimedIdentifier {
                     identifier: identifier.get(),
                 });
             }
@@ -233,75 +227,52 @@ impl<L: SettingList> SettingsFrame<L> {
                 .iter()
                 .any(|earlier| fields::<L>(earlier).0.get() == identifier.get())
             {
-                return Err(SettingsFrameError::Duplicate {
+                return Err(SettingsPayloadError::Duplicate {
                     source: DuplicateSettingError::new(identifier.get()),
                 });
             }
-            length += (identifier.encoded_len() + value.encoded_len()) as u64;
         }
-        let length = length_field(length, 0, widths.length_width())
-            .context(settings_frame_error::LengthSnafu)?;
-        Ok(Self {
-            widths,
-            length,
-            settings,
-        })
+        Ok(Self { settings })
     }
 
     /// The settings, in order.
     pub fn settings(&self) -> &[Setting<L::Setting>] {
         &self.settings
     }
-
-    /// The widths of the Type and Length.
-    pub const fn widths(&self) -> FrameWidths {
-        self.widths
-    }
-
-    /// The length of the payload.
-    pub const fn payload_len(&self) -> u64 {
-        self.length.get().get()
-    }
 }
 
-impl<L: SettingList> Clone for SettingsFrame<L>
+impl<L: SettingList> Clone for SettingsPayload<L>
 where
     L::Setting: Clone,
 {
     fn clone(&self) -> Self {
         Self {
-            widths: self.widths,
-            length: self.length,
             settings: self.settings.clone(),
         }
     }
 }
 
-impl<L: SettingList> fmt::Debug for SettingsFrame<L>
+impl<L: SettingList> fmt::Debug for SettingsPayload<L>
 where
     L::Setting: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SettingsFrame")
-            .field("widths", &self.widths)
-            .field("length", &self.length)
+        f.debug_struct("SettingsPayload")
             .field("settings", &self.settings)
             .finish()
     }
 }
 
-impl<L: SettingList> PartialEq for SettingsFrame<L>
+impl<L: SettingList> PartialEq for SettingsPayload<L>
 where
     L::Setting: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.widths == other.widths
-            && self.length == other.length
-            && self.settings == other.settings
+        self.settings == other.settings
     }
 }
 
-impl<L: SettingList> Eq for SettingsFrame<L> where L::Setting: Eq {}
+impl<L: SettingList> Eq for SettingsPayload<L> where L::Setting: Eq {}
 
 fn fields<L: SettingList>(
     setting: &Setting<L::Setting>,
@@ -312,10 +283,10 @@ fn fields<L: SettingList>(
     }
 }
 
-/// A SETTINGS frame cannot be built.
+/// A [`SettingsPayload`] cannot be built.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-pub enum SettingsFrameError {
+pub enum SettingsPayloadError {
     /// An identifier occurs twice.
     #[snafu(transparent)]
     Duplicate {
@@ -329,66 +300,62 @@ pub enum SettingsFrameError {
         /// The identifier.
         identifier: VarInt,
     },
-    /// The Length cannot state the payload.
-    #[snafu(display("could not encode SETTINGS length"))]
-    Length {
-        /// Why the Length cannot be written.
-        source: FrameLengthError,
-    },
 }
 
-/// Writes `frame`, and gives the merged report of everything it wrote.
-///
-/// # Errors
-///
-/// [`WriteSettingsFrameError`]; bytes accepted before the failure stay
-/// written.
-#[call(sync)]
-pub async fn write_settings_frame<
-    L: SettingList,
-    F: Write<Report: Combine>,
-    A: ReceiverAccess<Family = F>,
->(
-    io: &mut A,
-    frame: &SettingsFrame<L>,
-) -> Result<<F as Write>::Report, WriteSettingsFrameError<F::Error>> {
-    let type_field = VarIntField::new(Http3FrameType::Settings.value(), frame.widths.type_width())
-        .expect("every width holds the frame type 0x04");
-    let mut report = write_head(io, type_field, frame.length)
-        .await
-        .context(write_settings_frame_error::HeadSnafu)?;
-    for (index, setting) in frame.settings.iter().enumerate() {
-        let (identifier, value) = fields::<L>(setting);
-        let identifier = io
-            .encode(identifier)
-            .await
-            .context(write_settings_frame_error::IdentifierSnafu { index })?;
-        let value = io
-            .encode(value)
-            .await
-            .context(write_settings_frame_error::ValueSnafu { index })?;
-        report = report.combine(identifier).combine(value);
+/// The length of the identifiers and values of the settings.
+impl<L: SettingList> EncodedLen for SettingsPayload<L> {
+    type LengthError = !;
+
+    async fn encoded_len(&mut self) -> Result<u64, !> {
+        let mut length = 0u64;
+        for setting in &self.settings {
+            let (identifier, value) = fields::<L>(setting);
+            length += (identifier.encoded_len() + value.encoded_len()) as u64;
+        }
+        Ok(length)
     }
-    Ok(report)
 }
 
-/// Failures of [`write_settings_frame`].
+/// Writes the identifier and then the value of each setting, in order, and
+/// gives the merged report of everything it wrote.
+impl<S, L> EncodeInto<S> for SettingsPayload<L>
+where
+    S: AsAccess<Family: Write<Report: Combine>>,
+    L: SettingList,
+{
+    type Output = <S::Family as Write>::Report;
+    type Error = EncodeSettingsError<<S::Family as Write>::Error>;
+
+    async fn encode_into(self, mut sink: S) -> Result<Self::Output, Self::Error> {
+        let mut report = <S::Family as Write>::Report::default();
+        for (index, setting) in self.settings.iter().enumerate() {
+            let (identifier, value) = fields::<L>(setting);
+            let identifier = identifier
+                .encode_into(sink.access())
+                .await
+                .context(encode_settings_error::IdentifierSnafu { index })?;
+            let value = value
+                .encode_into(sink.access())
+                .await
+                .context(encode_settings_error::ValueSnafu { index })?;
+            report = report.combine(identifier).combine(value);
+        }
+        Ok(report)
+    }
+}
+
+/// Failures of writing a [`SettingsPayload`] into a sink whose failures are
+/// `W`; bytes accepted before the failure stay written.
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-pub enum WriteSettingsFrameError<E> {
-    /// The head could not be written.
-    #[snafu(display("could not write SETTINGS head"))]
-    Head {
-        /// The failure of writing the head.
-        source: WriteFrameHeadError<E>,
-    },
+pub enum EncodeSettingsError<W> {
     /// The identifier of a setting could not be written.
     #[snafu(display("could not write the identifier of setting {index}"))]
     Identifier {
         /// The position of the setting in the frame.
         index: usize,
         /// The failure of writing the integer.
-        source: WriteVarIntError<E>,
+        source: WriteVarIntError<W>,
     },
     /// The value of a setting could not be written.
     #[snafu(display("could not write the value of setting {index}"))]
@@ -396,6 +363,6 @@ pub enum WriteSettingsFrameError<E> {
         /// The position of the setting in the frame.
         index: usize,
         /// The failure of writing the integer.
-        source: WriteVarIntError<E>,
+        source: WriteVarIntError<W>,
     },
 }

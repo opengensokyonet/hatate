@@ -2,8 +2,13 @@
 //! SETTINGS (RFC 9114 §7.2.4) with the parts of HTTP/3 alone.
 mod common;
 
-use common::{Dribble, run};
-use core::convert::Infallible;
+use bytes::Buf;
+use common::{Boom, Dribble, run};
+use core::{
+    convert::Infallible,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use frunk_core::{
     HList,
     coproduct::{CoprodInjector, CoproductSelector},
@@ -11,22 +16,27 @@ use frunk_core::{
 use hatate_wire::{
     Part, Role,
     error_code::{ErrorCode, ErrorCodeOf},
-    frame::{FrameWidths, Http3FrameType, payload::PayloadError},
+    frame::{
+        Frame, FrameWidths, Http3FrameType, SettingsFrameType, codec::EncodeFrameError,
+        payload::PayloadError,
+    },
     parts::PartsError,
     settings::{
         Http2SettingIdentifier, Http2SettingIdentifierError, Keyed, KeyedSetting,
         MaxFieldSectionSize, Setting, UnknownSetting,
         codec::{
-            DecodeSettingParameterError, DuplicateSettingError, InsertSettingError,
-            SettingParameter, SettingsFrame, SettingsFrameError, WriteSettingsFrameHostExt as _,
+            DecodeSettingParameterError, DuplicateSettingError, EncodeSettingsError,
+            InsertSettingError, SettingParameter, SettingsFrame, SettingsPayload,
+            SettingsPayloadError,
         },
         set::{SettingList, Settings, SettingsOf, SettingsPart},
     },
     stream::{FrameStream, kind::ControlStreamKind},
 };
 use hatate_wire_qpack::{QpackBlockedStreams, QpackMaxTableCapacity};
-use nitori_call::{ReceiverAccess, call};
-use nitori_io::Read;
+use nitori_call::{ReceiverAccess, call, family_receiver};
+use nitori_codec::prelude::*;
+use nitori_io::{Read, Write, WriteSegment};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth, stream::ReadVarIntError};
 
 type Parts = HList![Part];
@@ -107,22 +117,6 @@ async fn read_settings<L: SettingList, F: Read<Metadata = ()>, A: ReceiverAccess
         "the payload was read to its end"
     );
     Ok(read)
-}
-
-/// The widths of Type and Length of the frame at the start of the stream.
-#[call(sync)]
-async fn head_widths<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
-    io: &mut A,
-) -> FrameWidths
-where
-    <F as Read>::Error: core::fmt::Debug,
-{
-    FrameStream::<Parts, ControlStreamKind, _>::read(&mut *io, Role::Server)
-        .await
-        .unwrap()
-        .unwrap()
-        .frame()
-        .widths()
 }
 
 fn frame(payload: &[u8]) -> Vec<u8> {
@@ -384,21 +378,23 @@ fn an_empty_settings_frame_has_no_settings() {
     assert!(read(&[]).unwrap().is_empty());
 }
 
-fn built(
-    settings: Vec<Item>,
-    widths: FrameWidths,
-) -> Result<SettingsFrame<List>, SettingsFrameError> {
-    SettingsFrame::new(settings, widths)
+fn built(settings: Vec<Item>) -> Result<SettingsPayload<List>, SettingsPayloadError> {
+    SettingsPayload::new(settings)
 }
 
-fn write(frame: &SettingsFrame<List>) -> Vec<u8> {
+/// The SETTINGS frame of `payload`, whose Type and Length are the shortest.
+fn framed(payload: SettingsPayload<List>) -> SettingsFrame<List> {
+    nitori_call::__private::run_sync(Frame::new(SettingsFrameType, payload)).unwrap()
+}
+
+fn write(payload: SettingsPayload<List>) -> Vec<u8> {
     let mut out = Vec::new();
-    out.sync_write_settings_frame_unpin(frame).unwrap();
+    out.sync_encode_unpin(framed(payload)).unwrap();
     out
 }
 
 #[test]
-fn written_frames_read_back_with_the_same_bytes() {
+fn a_read_frame_is_written_back_with_its_shortest_head() {
     // Non-shortest widths everywhere: Type, Length, identifiers and values.
     let wire = vec![
         0x40, 0x04, 0x80, 0, 0, 0x13, // SETTINGS, Length 19 in four bytes
@@ -408,23 +404,18 @@ fn written_frames_read_back_with_the_same_bytes() {
         0x07, 0x05, // QPACK_BLOCKED_STREAMS = 5
     ];
     let mut input = &wire[..];
-    let head_widths = {
-        let mut peek = &wire[..];
-        peek.sync_head_widths_unpin()
-    };
-    assert_eq!(
-        head_widths,
-        FrameWidths::new(VarIntWidth::Two, VarIntWidth::Four)
-    );
     let read = input
         .sync_read_settings_unpin(&mut Settings::<List>::new())
         .unwrap();
     assert!(input.is_empty());
-    let frame = built(read, head_widths).unwrap();
-    assert_eq!(frame.payload_len(), 19);
-    assert_eq!(frame.widths(), head_widths);
-    assert_eq!(frame.settings().len(), 4);
-    assert_eq!(write(&frame), wire);
+    let payload = built(read).unwrap();
+    assert_eq!(payload.settings().len(), 4);
+    let frame = framed(payload.clone());
+    assert_eq!(frame.length().get().get(), 19);
+    assert_eq!(frame.widths(), FrameWidths::SHORTEST);
+    // The head is the shortest; the identifiers and values keep their widths.
+    let expected = [&[0x04, 0x13][..], &wire[6..]].concat();
+    assert_eq!(write(payload), expected);
 }
 
 #[test]
@@ -435,8 +426,7 @@ fn each_setting_of_http3_is_written_and_read_back() {
         (keyed(MaxFieldSectionSize::new(value)), 0x06),
         (keyed(QpackBlockedStreams::new(value)), 0x07),
     ] {
-        let frame = built(vec![setting], FrameWidths::SHORTEST).unwrap();
-        let wire = write(&frame);
+        let wire = write(built(vec![setting]).unwrap());
         assert_eq!(wire, [0x04, 9, identifier, 0xc0, 0, 0, 0, 0, 0, 0x12, 0x34]);
         let mut input = &wire[..];
         let read = input
@@ -467,8 +457,7 @@ fn a_frame_of_new_settings_is_written_in_order() {
             .unwrap(),
         )),
     ];
-    let frame = built(settings.clone(), FrameWidths::SHORTEST).unwrap();
-    let wire = write(&frame);
+    let wire = write(built(settings.clone()).unwrap());
     assert_eq!(
         wire,
         [
@@ -495,16 +484,13 @@ fn a_frame_refuses_a_repeated_identifier_even_if_unknown() {
             .unwrap(),
         )
     };
-    let error = built(
-        vec![
-            setting(0x21, VarIntWidth::One),
-            setting(0x21, VarIntWidth::Two),
-        ],
-        FrameWidths::SHORTEST,
-    )
+    let error = built(vec![
+        setting(0x21, VarIntWidth::One),
+        setting(0x21, VarIntWidth::Two),
+    ])
     .unwrap_err();
     assert!(
-        matches!(&error, SettingsFrameError::Duplicate { source } if source.identifier().get() == 0x21),
+        matches!(&error, SettingsPayloadError::Duplicate { source } if source.identifier().get() == 0x21),
         "{error:?}"
     );
     let max = || {
@@ -512,15 +498,15 @@ fn a_frame_refuses_a_repeated_identifier_even_if_unknown() {
             VarInt::ZERO,
         )))
     };
-    let error = built(vec![max(), max()], FrameWidths::SHORTEST).unwrap_err();
+    let error = built(vec![max(), max()]).unwrap_err();
     assert!(
-        matches!(error, SettingsFrameError::Duplicate { .. }),
+        matches!(error, SettingsPayloadError::Duplicate { .. }),
         "{error:?}"
     );
 }
 
 #[test]
-fn a_length_that_does_not_fit_its_width_is_refused() {
+fn the_length_of_a_frame_takes_the_width_it_needs() {
     // Each setting takes three bytes: 21 of them make 63, 22 make 66.
     let settings = |count: u32| -> Vec<Item> {
         (0..count)
@@ -536,18 +522,19 @@ fn a_length_that_does_not_fit_its_width_is_refused() {
             .collect()
     };
     // Identifiers 0x21 and 0x40 take one and two bytes: count the length.
-    let fits = built(settings(2), FrameWidths::SHORTEST).unwrap();
-    assert_eq!(fits.payload_len(), 2 + 3);
-    let many = settings(30);
-    let error = built(many.clone(), FrameWidths::SHORTEST).unwrap_err();
-    assert!(
-        matches!(error, SettingsFrameError::Length { .. }),
-        "{error:?}"
+    let fits = framed(built(settings(2)).unwrap());
+    assert_eq!(fits.length().get().get(), 2 + 3);
+    assert_eq!(fits.widths(), FrameWidths::SHORTEST);
+    let wide = framed(built(settings(30)).unwrap());
+    let length = wide.length().get().get();
+    assert!(length > 63);
+    assert_eq!(
+        wide.widths(),
+        FrameWidths::new(VarIntWidth::One, VarIntWidth::Two)
     );
-    let wide = built(many, FrameWidths::new(VarIntWidth::One, VarIntWidth::Two)).unwrap();
-    assert!(wide.payload_len() > 63);
-    let wire = write(&wide);
-    assert_eq!(wire.len() as u64, 1 + 2 + wide.payload_len());
+    let mut wire = Vec::new();
+    wire.sync_encode_unpin(wide).unwrap();
+    assert_eq!(wire.len() as u64, 1 + 2 + length);
 }
 
 #[test]
@@ -613,34 +600,28 @@ fn an_unknown_setting_cannot_take_an_identifier_a_type_claims() {
     // MAX_FIELD_SECTION_SIZE and the two settings of QPACK, in any width.
     for identifier in [0x01, 0x06, 0x07] {
         for width in [VarIntWidth::Two, VarIntWidth::Four, VarIntWidth::Eight] {
-            let error = built(vec![unknown(identifier, width)], FrameWidths::SHORTEST).unwrap_err();
+            let error = built(vec![unknown(identifier, width)]).unwrap_err();
             assert!(
-                matches!(&error, SettingsFrameError::ClaimedIdentifier { identifier: found }
+                matches!(&error, SettingsPayloadError::ClaimedIdentifier { identifier: found }
                     if found.get() == u64::from(identifier)),
                 "{error:?}"
             );
         }
     }
     // Where the claimed identifier comes second the first is fine.
-    let error = built(
-        vec![
-            unknown(0x22, VarIntWidth::One),
-            unknown(0x06, VarIntWidth::One),
-        ],
-        FrameWidths::SHORTEST,
-    )
+    let error = built(vec![
+        unknown(0x22, VarIntWidth::One),
+        unknown(0x06, VarIntWidth::One),
+    ])
     .unwrap_err();
     assert!(
-        matches!(error, SettingsFrameError::ClaimedIdentifier { .. }),
+        matches!(error, SettingsPayloadError::ClaimedIdentifier { .. }),
         "{error:?}"
     );
     // Identifiers that no type claims are accepted, reserved or not.
     for identifier in [0x00, 0x08, 0x0a, 0x21, 0x33, 0x40] {
-        let frame = built(
-            vec![unknown(identifier, VarIntWidth::Two)],
-            FrameWidths::SHORTEST,
-        )
-        .unwrap_or_else(|error| panic!("{identifier:#x}: {error:?}"));
+        let frame = built(vec![unknown(identifier, VarIntWidth::Two)])
+            .unwrap_or_else(|error| panic!("{identifier:#x}: {error:?}"));
         assert_eq!(frame.settings().len(), 1);
     }
 }
@@ -742,5 +723,73 @@ fn the_lists_of_the_parts_are_joined_in_order_and_checked_for_repeats() {
         assert!(!<HList![Probe<0x21>] as SettingList>::CLAIMS_VALID);
         assert!(!<HList![Probe<0x40>] as SettingList>::CLAIMS_VALID);
         assert!(<HList![Probe<0x22>] as SettingList>::CLAIMS_VALID);
+    }
+}
+
+/// A sink that accepts `room` bytes, one at a time, and then fails.
+struct Narrow {
+    room: usize,
+    bytes: Vec<u8>,
+}
+
+family_receiver!(impl [] for Narrow);
+
+impl Write for Narrow {
+    type Error = Boom;
+    type Report = ();
+    fn poll_write<'v, B: bytes::Buf + ?Sized>(
+        host: Pin<&mut Self::ReceiverView<'v>>,
+        _: &mut Context<'_>,
+        input: &mut B,
+    ) -> Poll<Result<Option<WriteSegment<()>>, Boom>>
+    where
+        Self: 'v,
+    {
+        let this = host.get_pin_mut().get_mut();
+        if !input.has_remaining() {
+            return Poll::Ready(Ok(None));
+        }
+        if this.room == 0 {
+            return Poll::Ready(Err(Boom));
+        }
+        this.room -= 1;
+        this.bytes.push(input.get_u8());
+        Poll::Ready(Ok(Some(WriteSegment {
+            count: core::num::NonZeroUsize::MIN,
+            report: (),
+        })))
+    }
+}
+
+#[test]
+fn a_sink_that_fails_inside_a_setting_names_the_setting() {
+    let setting = |identifier: u32| {
+        Setting::Unknown(
+            UnknownSetting::new(
+                value_field(identifier, VarIntWidth::One),
+                value_field(0, VarIntWidth::One),
+            )
+            .unwrap(),
+        )
+    };
+    let payload = built(vec![setting(0x21), setting(0x22), setting(0x23)]).unwrap();
+    // The head takes two bytes and each setting two more.
+    for (room, index, in_identifier) in [(2, 0, true), (3, 0, false), (4, 1, true), (7, 2, false)] {
+        let mut sink = Narrow {
+            room,
+            bytes: Vec::new(),
+        };
+        let error = sink.sync_encode_unpin(framed(payload.clone())).unwrap_err();
+        match error {
+            EncodeFrameError::Payload {
+                source: EncodeSettingsError::Identifier { index: found, .. },
+            } if in_identifier => assert_eq!(found, index),
+            EncodeFrameError::Payload {
+                source: EncodeSettingsError::Value { index: found, .. },
+            } if !in_identifier => assert_eq!(found, index),
+            error => panic!("room {room}: {error:?}"),
+        }
+        // What was accepted before the failure stays written.
+        assert_eq!(sink.bytes.len(), room);
     }
 }

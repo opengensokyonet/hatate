@@ -42,7 +42,6 @@
 //! [RFC 9114]: https://www.rfc-editor.org/rfc/rfc9114.html
 //! [RFC 9114 §9]: https://www.rfc-editor.org/rfc/rfc9114.html#section-9
 #![no_std]
-#![feature(impl_trait_in_assoc_type)]
 #![forbid(unsafe_code)]
 #![warn(
     missing_docs,

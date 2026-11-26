@@ -11,12 +11,12 @@ use frunk_core::{HList, coproduct::Coproduct};
 use hatate_wire::{
     Part, Role,
     frame::{
-        Frame, FrameWidths, GoawayFrameType, Http3FrameType, control::GoawayFrame,
+        Frame, GoawayFrameType, Http3FrameType, SettingsFrameType, control::GoawayFrame,
         payload::FramePayload,
     },
     settings::{
         Setting, UnknownSetting,
-        codec::{SettingParameter, SettingsFrame, WriteSettingsFrameHostExt as _},
+        codec::{SettingParameter, SettingsPayload},
         set::{Settings, SettingsOf},
     },
     stream::{
@@ -26,7 +26,7 @@ use hatate_wire::{
     },
 };
 use nitori_call::{AsAccess, ConstructedAccess, family_receiver};
-use nitori_codec::DecodeFrom as _;
+use nitori_codec::{DecodeFrom as _, host::EncodeHostExt as _};
 use nitori_io::{Combine, Min, Read, ReadSegment, Skip, Write, WriteSegment, prelude::*};
 use sakuya_var_int::{VarInt, VarIntField};
 
@@ -319,11 +319,14 @@ fn a_written_settings_frame_reports_what_all_of_it_took() {
         )
         .unwrap(),
     );
-    let frame =
-        SettingsFrame::<<Parts as SettingsOf>::Settings>::new(vec![setting], FrameWidths::SHORTEST)
-            .unwrap();
+    let frame = nitori_call::__private::run_sync(Frame::new(
+        SettingsFrameType,
+        SettingsPayload::<<Parts as SettingsOf>::Settings>::new(vec![setting]).unwrap(),
+    ))
+    .unwrap();
     let mut sink = Tally::default();
-    let report = sink.sync_write_settings_frame_unpin(&frame).unwrap();
+    let output = sink.sync_encode_unpin(frame).unwrap();
+    let report = output.head.combine(output.payload);
     // Type, Length, identifier and value: four bytes, a write each.
     assert_eq!(sink.bytes, [0x04, 0x02, 0x21, 0x01]);
     assert_eq!(report, Writes(4));

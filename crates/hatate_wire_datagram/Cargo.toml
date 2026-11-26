@@ -19,4 +19,5 @@ snafu.workspace = true
 hatate_wire_extended_connect.workspace = true
 hatate_wire_qpack.workspace = true
 nitori_call.workspace = true
+nitori_codec.workspace = true
 nitori_io = { workspace = true, features = ["std"] }

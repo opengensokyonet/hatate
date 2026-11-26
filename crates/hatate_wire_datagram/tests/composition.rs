@@ -9,13 +9,13 @@ use frunk_core::{
 use hatate_wire::{
     Role,
     error_code::{ErrorCode, ErrorCodeOf},
-    frame::{FrameWidths, payload::PayloadError, set::FramePartOn},
+    frame::{Frame, SettingsFrameType, payload::PayloadError, set::FramePartOn},
     parts::PartsError,
     settings::{
         Http2SettingIdentifierError, Keyed, KeyedSetting, MaxFieldSectionSize, Setting,
         codec::{
             DecodeSettingParameterError, DuplicateSettingError, InsertSettingError,
-            SettingParameter, SettingsFrame, WriteSettingsFrameHostExt as _,
+            SettingParameter, SettingsPayload,
         },
         set::{SettingList, Settings, SettingsOf},
     },
@@ -35,6 +35,7 @@ use hatate_wire_datagram::{H3Datagram, H3DatagramValueError};
 use hatate_wire_extended_connect::{EnableConnectProtocol, EnableConnectProtocolValueError};
 use hatate_wire_qpack::{QpackBlockedStreams, QpackMaxTableCapacity};
 use nitori_call::{ReceiverAccess, call};
+use nitori_codec::prelude::*;
 use nitori_io::{Read, Skip};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
@@ -560,6 +561,15 @@ fn without_the_extensions_their_settings_are_unknown_and_unchecked() {
     assert!(matches!(read[1], Setting::Unknown(_)));
 }
 
+/// The bytes of a SETTINGS frame of `settings`, at the shortest widths.
+fn write_settings(settings: Vec<Setting<AllSetting>>) -> Vec<u8> {
+    let payload = SettingsPayload::<AllList>::new(settings).unwrap();
+    let frame = nitori_call::__private::run_sync(Frame::new(SettingsFrameType, payload)).unwrap();
+    let mut wire = Vec::new();
+    wire.sync_encode_unpin(frame).unwrap();
+    wire
+}
+
 #[test]
 fn a_frame_of_settings_of_all_parts_is_written_and_read_back() {
     let settings: Vec<Setting<AllSetting>> = vec![
@@ -569,16 +579,8 @@ fn a_frame_of_settings_of_all_parts_is_written_and_read_back() {
         ))),
         keyed(EnableConnectProtocol::new(true)),
     ];
-    let widths = FrameWidths::new(VarIntWidth::Two, VarIntWidth::Two);
-    let frame = SettingsFrame::<AllList>::new(settings.clone(), widths).unwrap();
-    let mut wire = Vec::new();
-    wire.sync_write_settings_frame_unpin(&frame).unwrap();
-    assert_eq!(
-        wire,
-        [
-            0x40, 0x04, 0x40, 0x07, 0x33, 0x01, 0x06, 0x43, 0xe8, 0x08, 0x01
-        ]
-    );
+    let wire = write_settings(settings.clone());
+    assert_eq!(wire, [0x04, 0x07, 0x33, 0x01, 0x06, 0x43, 0xe8, 0x08, 0x01]);
     let mut input = &wire[..];
     let read = input
         .sync_read_settings_unpin(&mut Settings::<AllList>::new())
@@ -589,16 +591,19 @@ fn a_frame_of_settings_of_all_parts_is_written_and_read_back() {
 
 #[test]
 fn each_setting_of_the_extensions_is_written_and_read_back() {
-    for setting in [
-        keyed(H3Datagram::new(false)),
-        keyed(H3Datagram::new(true)),
-        keyed(EnableConnectProtocol::new(false)),
-        keyed(EnableConnectProtocol::new(true)),
+    for (setting, wire) in [
+        (keyed(H3Datagram::new(false)), [0x04, 0x02, 0x33, 0x00]),
+        (keyed(H3Datagram::new(true)), [0x04, 0x02, 0x33, 0x01]),
+        (
+            keyed(EnableConnectProtocol::new(false)),
+            [0x04, 0x02, 0x08, 0x00],
+        ),
+        (
+            keyed(EnableConnectProtocol::new(true)),
+            [0x04, 0x02, 0x08, 0x01],
+        ),
     ] {
-        let frame = SettingsFrame::<AllList>::new(vec![setting], FrameWidths::SHORTEST).unwrap();
-        let mut wire = Vec::new();
-        wire.sync_write_settings_frame_unpin(&frame).unwrap();
-        assert_eq!(wire.len(), 4);
+        assert_eq!(write_settings(vec![setting]), wire);
         let mut input = &wire[..];
         let read = input
             .sync_read_settings_unpin(&mut Settings::<AllList>::new())
@@ -779,7 +784,7 @@ fn a_list_with_the_extensions_reads_control_push_and_qpack_streams() {
 
 #[test]
 fn an_unknown_setting_cannot_take_the_identifier_of_a_type_of_the_list() {
-    use hatate_wire::settings::{UnknownSetting, codec::SettingsFrameError};
+    use hatate_wire::settings::{UnknownSetting, codec::SettingsPayloadError};
     fn unknown<T>(identifier: u32) -> Setting<T> {
         Setting::Unknown(
             UnknownSetting::new(
@@ -792,17 +797,16 @@ fn an_unknown_setting_cannot_take_the_identifier_of_a_type_of_the_list() {
     // SETTINGS_H3_DATAGRAM and SETTINGS_ENABLE_CONNECT_PROTOCOL are claimed
     // when their parts are in the list, and free when they are not.
     for identifier in [0x33, 0x08] {
-        let error = SettingsFrame::<AllList>::new(vec![unknown(identifier)], FrameWidths::SHORTEST)
-            .unwrap_err();
+        let error = SettingsPayload::<AllList>::new(vec![unknown(identifier)]).unwrap_err();
         assert!(
-            matches!(&error, SettingsFrameError::ClaimedIdentifier { identifier: found }
+            matches!(&error, SettingsPayloadError::ClaimedIdentifier { identifier: found }
                 if found.get() == u64::from(identifier)),
             "{error:?}"
         );
-        SettingsFrame::<Http3List>::new(vec![unknown(identifier)], FrameWidths::SHORTEST).unwrap();
+        SettingsPayload::<Http3List>::new(vec![unknown(identifier)]).unwrap();
     }
-    let only_datagram = SettingsFrame::<
+    let only_datagram = SettingsPayload::<
         <HList![hatate_wire::Part, hatate_wire_datagram::Part] as SettingsOf>::Settings,
-    >::new(vec![unknown(0x08)], FrameWidths::SHORTEST);
+    >::new(vec![unknown(0x08)]);
     assert!(only_datagram.is_ok());
 }

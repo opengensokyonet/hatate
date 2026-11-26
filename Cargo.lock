@@ -75,6 +75,7 @@ dependencies = [
  "hatate_wire_extended_connect",
  "hatate_wire_qpack",
  "nitori_call",
+ "nitori_codec",
  "nitori_io",
  "sakuya_var_int",
  "snafu",

@@ -1,5 +1,4 @@
-//! Reading and checking frame heads, decoding and encoding frames, and
-//! writing frame heads.
+//! Reading and checking frame heads, and decoding and encoding frames.
 use super::{
     Frame, FrameType, Http2FrameType, Http2FrameTypeError,
     payload::{FramePayload, PayloadError},
@@ -12,11 +11,11 @@ use crate::{
 };
 use core::num::NonZeroU64;
 use length_check::PayloadWriteLimit;
-use nitori_call::{AsAccess, Composed, ReceiverAccess};
-use nitori_codec::{DecodeFrom, EncodeInto, prelude::*};
+use nitori_call::{AsAccess, Composed};
+use nitori_codec::{DecodeFrom, EncodeInto};
 use nitori_io::{Combine, Read, Write, calls::ReadValue};
 use sakuya_var_int::{
-    VarInt, VarIntField, VarIntWidth, VarIntWidthError,
+    VarInt, VarIntField,
     stream::{ReadVarIntError, WriteVarIntError},
 };
 use snafu::{ResultExt, Snafu};
@@ -191,56 +190,6 @@ impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadFrameHeadError<E>
             Self::Unexpected { source } => source.error_code(),
         }
     }
-}
-
-/// Writes the Type and Length of a frame, each at its width: the step every
-/// writer of a frame takes before its payload, which must follow, of exactly
-/// `length` bytes. A type of HTTP/2 is reported before anything is written.
-/// The result is the merged report of writing the Type and the Length.
-pub(crate) async fn write_head<F: Write<Report: Combine>, A: ReceiverAccess<Family = F>>(
-    io: &mut A,
-    type_field: VarIntField<VarInt>,
-    length: VarIntField<VarInt>,
-) -> Result<F::Report, WriteFrameHeadError<F::Error>> {
-    if let Some(frame_type) = Http2FrameType::of(type_field.get()) {
-        return Err(WriteFrameHeadError::Http2Type {
-            source: Http2FrameTypeError::new(frame_type),
-        });
-    }
-    let r#type = io
-        .encode(type_field)
-        .await
-        .context(write_frame_head_error::TypeSnafu)?;
-    let length = io
-        .encode(length)
-        .await
-        .context(write_frame_head_error::LengthSnafu)?;
-    Ok(r#type.combine(length))
-}
-
-/// Failures of writing the Type and Length of a frame.
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum WriteFrameHeadError<E> {
-    /// The type is one HTTP/2 defines and HTTP/3 does not, which must not
-    /// be sent.
-    #[snafu(display("cannot send a frame type of HTTP/2"))]
-    Http2Type {
-        /// The type given.
-        source: Http2FrameTypeError,
-    },
-    /// The Type could not be written.
-    #[snafu(display("could not write frame type"))]
-    Type {
-        /// The failure of writing the integer.
-        source: WriteVarIntError<E>,
-    },
-    /// The Length could not be written.
-    #[snafu(display("could not write frame length"))]
-    Length {
-        /// The failure of writing the integer.
-        source: WriteVarIntError<E>,
-    },
 }
 
 /// Decodes a frame in stages: the Type and the Length now, and the payload,
@@ -533,35 +482,6 @@ pub enum EncodeFrameError<W, P> {
         /// The payload's failure.
         source: P,
     },
-}
-
-/// The Length of a frame cannot be written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
-#[snafu(module)]
-pub enum FrameLengthError {
-    /// The payload is longer than a variable-length integer can state.
-    #[snafu(display("frame payload length exceeds 2^62 - 1"))]
-    OutOfRange,
-    /// The Length does not fit the requested width.
-    #[snafu(display("frame length does not fit its width"))]
-    Width {
-        /// The length and the width.
-        source: VarIntWidthError,
-    },
-}
-
-/// The Length field for `length` bytes from the source after `prefix`
-/// bytes of fields.
-pub(crate) fn length_field(
-    length: u64,
-    prefix: u64,
-    width: VarIntWidth,
-) -> Result<VarIntField<VarInt>, FrameLengthError> {
-    let total = length
-        .checked_add(prefix)
-        .and_then(|total| VarInt::new(total).ok())
-        .ok_or(FrameLengthError::OutOfRange)?;
-    VarIntField::new(total, width).context(frame_length_error::WidthSnafu)
 }
 
 /// The connection error for a failure reading an integer from a frame

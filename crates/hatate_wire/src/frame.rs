@@ -359,10 +359,7 @@ impl From<GoawayId> for VarInt {
     }
 }
 
-/// The widths of the Type and Length of a frame whose Length the payload
-/// determines. Every width holds the Type of a frame of RFC 9114 and the
-/// Length of a CANCEL_PUSH, GOAWAY or MAX_PUSH_ID; the Length of a SETTINGS
-/// frame may not fit, which building or writing the frame reports.
+/// The widths of the Type and Length of a frame ([`Frame::widths`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameWidths {
     type_width: VarIntWidth,
