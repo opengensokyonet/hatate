@@ -1,4 +1,7 @@
 #![feature(impl_trait_in_assoc_type)]
+mod common;
+
+use common::Flaky;
 use core::{fmt::Debug, num::NonZeroU64};
 use hatate_qpack::{
     decoder_instruction::{
@@ -244,9 +247,9 @@ fn padded_integers_write_back_their_original_octets() {
 
 #[test]
 fn failed_instruction_interrupts_the_stream() {
-    // Failure inside a number, a zero increment, and a wire limit that stops
-    // before the first octet is read: each one leaves the stream interrupted.
-    let cases: [(&[u8], usize); 3] = [(&[0xff], 11), (&[0, 0x84], 1), (&[0x84], 0)];
+    // Failure inside a number and a zero increment: each one leaves the
+    // stream interrupted.
+    let cases: [(&[u8], usize); 2] = [(&[0xff], 11), (&[0, 0x84], 1)];
     for (wire, limit) in cases {
         let mut input = wire;
         let results = input.sync_sequence_unpin(limit, 3);
@@ -254,6 +257,17 @@ fn failed_instruction_interrupts_the_stream() {
         assert!(matches!(results[1], Err(ReadError::Interrupted)));
         assert!(matches!(results[2], Err(ReadError::Interrupted)));
     }
+    // A wire limit that stops before the first octet reads nothing: the
+    // stream stays at the boundary and fails the same way each time.
+    let mut input = &[0x84][..];
+    let results = input.sync_sequence_unpin(0, 3);
+    assert!(results.iter().all(|result| matches!(
+        result,
+        Err(ReadError::Prefix {
+            source: hatate_qpack::instruction::OctetError::WireLimit { .. }
+        })
+    )));
+    assert_eq!(input, [0x84]);
     // A stream that failed does not read on: the byte after the failed
     // instruction is untouched by the later calls.
     let mut input = &[0, 0x84][..];
@@ -539,4 +553,54 @@ fn host_write_failure_preserves_the_accepted_prefix_and_interrupts() {
         .sync_put_each_unpin(vec![increment(1), increment(1)], 2);
     assert!(matches!(&results[0], Err(WriteError::Send { source }) if source.completed()==0));
     assert!(matches!(results[1], Err(WriteError::Send { .. })));
+}
+
+#[test]
+fn a_host_failure_before_the_first_octet_leaves_the_stream_at_the_boundary() {
+    // Two acknowledgments of stream 127, two octets each.
+    let wire = [0xff, 0x00, 0xff, 0x00];
+    // The failure is the first octet's: the next call reads the instruction.
+    let mut host = Flaky::new(&wire, 0);
+    let results = host.sync_sequence_unpin(11, 3);
+    assert!(
+        matches!(results[0], Err(ReadError::Prefix { .. })),
+        "{results:?}"
+    );
+    assert_eq!(results[1].as_ref().unwrap().as_ref(), Some(&ack(127)));
+    assert_eq!(results[2].as_ref().unwrap().as_ref(), Some(&ack(127)));
+    // The same at the first octet of a later instruction.
+    let mut host = Flaky::new(&wire, 2);
+    let results = host.sync_sequence_unpin(11, 3);
+    assert_eq!(results[0].as_ref().unwrap().as_ref(), Some(&ack(127)));
+    assert!(
+        matches!(results[1], Err(ReadError::Prefix { .. })),
+        "{results:?}"
+    );
+    assert_eq!(results[2].as_ref().unwrap().as_ref(), Some(&ack(127)));
+}
+
+#[test]
+fn a_host_failure_after_the_first_octet_interrupts_the_stream() {
+    let wire = [0xff, 0x00, 0xff, 0x00];
+    // Failing at the second octet of the first instruction.
+    let mut host = Flaky::new(&wire, 1);
+    let results = host.sync_sequence_unpin(11, 3);
+    assert!(matches!(results[0], Err(ref error) if !matches!(error, ReadError::Interrupted)));
+    assert!(
+        matches!(results[1], Err(ReadError::Interrupted)),
+        "{results:?}"
+    );
+    assert!(
+        matches!(results[2], Err(ReadError::Interrupted)),
+        "{results:?}"
+    );
+    // And at the second octet of a later one.
+    let mut host = Flaky::new(&wire, 3);
+    let results = host.sync_sequence_unpin(11, 3);
+    assert_eq!(results[0].as_ref().unwrap().as_ref(), Some(&ack(127)));
+    assert!(matches!(results[1], Err(ref error) if !matches!(error, ReadError::Interrupted)));
+    assert!(
+        matches!(results[2], Err(ReadError::Interrupted)),
+        "{results:?}"
+    );
 }

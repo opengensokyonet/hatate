@@ -14,7 +14,7 @@ use crate::string_literal::StringLiteral;
 use crate::{static_table, string_literal};
 
 mod write;
-pub(crate) use write::{Part, Prepared, transfer};
+pub(crate) use write::{LineBuf, Part, Prepared};
 pub use write::{WriteError, write_field_line};
 
 /// A field line's reference, relative to its field section where applicable.
@@ -66,6 +66,33 @@ pub enum FieldLine<S = Bytes, H = Bytes> {
         /// Literal field value.
         value: StringLiteral<S, H>,
     },
+}
+
+impl<S: AsRef<[u8]>, H: AsRef<[u8]>> FieldLine<S, H> {
+    /// The line with the octets of its literals borrowed as slices.
+    pub(crate) fn as_slices(&self) -> FieldLine<&[u8], &[u8]> {
+        match self {
+            Self::Indexed { index } => FieldLine::Indexed { index: *index },
+            Self::LiteralWithNameReference {
+                never_index,
+                name,
+                value,
+            } => FieldLine::LiteralWithNameReference {
+                never_index: *never_index,
+                name: *name,
+                value: value.as_slices(),
+            },
+            Self::LiteralWithLiteralName {
+                never_index,
+                name,
+                value,
+            } => FieldLine::LiteralWithLiteralName {
+                never_index: *never_index,
+                name: name.as_slices(),
+                value: value.as_slices(),
+            },
+        }
+    }
 }
 
 /// A field line could not be read. The source identifies which wire rule failed.

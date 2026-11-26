@@ -237,11 +237,21 @@ where
         Ok(Some(read)) => Outcome::Item(read.value),
         Ok(None) => Outcome::End,
         Err(error) => {
-            // A failed instruction leaves the stream interrupted.
-            assert!(matches!(
-                Option::<ReadValue<Read, ()>>::decode_from(&mut stream).await,
-                Err(DecodeEncoderInstructionError::Interrupted)
-            ));
+            // A failed instruction leaves the stream interrupted, unless
+            // nothing of it was read: a failure before the first octet leaves
+            // the stream at the boundary, to fail the same way again.
+            let again = Option::<ReadValue<Read, ()>>::decode_from(&mut stream).await;
+            if matches!(error, DecodeEncoderInstructionError::Prefix { .. }) {
+                assert!(matches!(
+                    again,
+                    Err(DecodeEncoderInstructionError::Prefix { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    again,
+                    Err(DecodeEncoderInstructionError::Interrupted)
+                ));
+            }
             Outcome::Failed(Failure::of(&error))
         }
     }

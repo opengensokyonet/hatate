@@ -25,7 +25,9 @@ use snafu::{ResultExt, Snafu};
 ///
 /// # Errors
 ///
-/// [`DecodeDecoderInstructionError`]; after any of them the stream is
+/// [`DecodeDecoderInstructionError`]. A failure before the first octet,
+/// such as of the stream or of a wire limit of zero, has read nothing and
+/// leaves the stream at the boundary; after any other the stream is
 /// interrupted. EOF inside a number is attributed to that instruction's
 /// field.
 impl<'s, A, M> DecodeFrom<&'s mut DecoderStream<A>> for Option<ReadValue<DecoderInstruction, M>>
@@ -39,18 +41,15 @@ where
         if !stream.position.at_boundary() {
             return Err(DecodeDecoderInstructionError::Interrupted);
         }
-        // A call dropped before the first octet has read nothing: the stream
-        // stays at the boundary.
+        // A call dropped before the first octet, or failing before it, has
+        // read nothing: the stream stays at the boundary.
         let mut budget = WireBudget::new(stream.limits.max_wire_len);
         let mut merged = MergedMetadata(M::default());
         let mut source = MergingSource::new(&mut stream.io, &mut merged);
         let first = match instruction::octet(&mut source.access(), &mut budget).await {
             Ok(first) => first,
             Err(error) if error.ended_before_first_octet() => return Ok(None),
-            Err(source) => {
-                stream.position.interrupt();
-                return Err(DecodeDecoderInstructionError::Prefix { source });
-            }
+            Err(source) => return Err(DecodeDecoderInstructionError::Prefix { source }),
         };
         stream.position.interrupt();
         let instruction = read_instruction(source.access(), budget, first).await?;

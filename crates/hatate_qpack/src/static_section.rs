@@ -15,7 +15,7 @@
 //! assert_eq!(fields[0].value.as_ref(), b"GET");
 //! assert_eq!(fields[1].value.as_ref(), b"https");
 //! let mut output = Vec::new();
-//! write_static_section(&mut output, &prefix, fields.into_iter().map(|field| field.line))?;
+//! write_static_section(&mut output, &prefix, fields.iter().map(|field| &field.line))?;
 //! assert_eq!(output, payload);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```

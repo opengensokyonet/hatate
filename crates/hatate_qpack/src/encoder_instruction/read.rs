@@ -40,7 +40,9 @@ use snafu::{ResultExt, Snafu};
 ///
 /// # Errors
 ///
-/// [`DecodeEncoderInstructionError`]; after any of them, and after
+/// [`DecodeEncoderInstructionError`]. A failure before the first octet,
+/// such as of the stream or of a wire limit of zero, has read nothing and
+/// leaves the stream at the boundary; after any other, and after
 /// [`DecodeEncoderInstructionError::Interrupted`] itself, the stream is
 /// interrupted.
 ///
@@ -60,18 +62,15 @@ where
             return Err(DecodeEncoderInstructionError::Interrupted);
         }
         let limits = stream.limits;
-        // A call dropped before the first octet has read nothing: the stream
-        // stays at the boundary.
+        // A call dropped before the first octet, or failing before it, has
+        // read nothing: the stream stays at the boundary.
         let mut wire = WireBudget::new(limits.max_wire_len);
         let mut merged = MergedMetadata(M::default());
         let mut source = MergingSource::new(&mut stream.io, &mut merged);
         let first = match instruction::octet(&mut source.access(), &mut wire).await {
             Ok(first) => first,
             Err(error) if error.ended_before_first_octet() => return Ok(None),
-            Err(source) => {
-                stream.position.interrupt();
-                return Err(DecodeEncoderInstructionError::Prefix { source });
-            }
+            Err(source) => return Err(DecodeEncoderInstructionError::Prefix { source }),
         };
         // Until the instruction is complete, a failure or dropping this call
         // leaves the stream interrupted.

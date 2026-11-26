@@ -71,7 +71,7 @@ fuzz_target!(|data: &[u8]| {
         assert!(fields.next().is_none());
         if complete {
             let mut written = Vec::new();
-            write_static_section(&mut written, &prefix, lines).unwrap();
+            write_static_section(&mut written, &prefix, &lines).unwrap();
             assert_eq!(written, body);
         }
     }
@@ -93,7 +93,7 @@ fuzz_target!(|data: &[u8]| {
         let Some(expected) = resolve(&line) else {
             rows.push(line);
             let mut dst = vec![0x77];
-            assert!(write_static_section(&mut dst, &prefix, rows.clone()).is_err());
+            assert!(write_static_section(&mut dst, &prefix, &rows).is_err());
             assert_eq!(dst, [0x77]);
             assert!(fields.next().unwrap().is_err());
             break;
@@ -117,9 +117,9 @@ fuzz_target!(|data: &[u8]| {
     // The accepted rows came from the start of `body`.
     let reference = &wire[..2 + accepted];
     let mut dst = vec![0xaa; reference.len() - 1];
-    assert!(write_static_section(&mut dst.as_mut_slice(), &prefix, rows.clone()).is_err());
+    assert!(write_static_section(&mut dst.as_mut_slice(), &prefix, &rows).is_err());
     assert!(dst.iter().all(|b| *b == 0xaa));
     let mut exact = vec![0; reference.len()];
-    write_static_section(&mut exact.as_mut_slice(), &prefix, rows).unwrap();
+    write_static_section(&mut exact.as_mut_slice(), &prefix, &rows).unwrap();
     assert_eq!(exact, reference);
 });

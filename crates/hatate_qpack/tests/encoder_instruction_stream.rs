@@ -1,7 +1,7 @@
 #![feature(impl_trait_in_assoc_type)]
 mod common;
 
-use common::{PausingSink, Trickle, encoder_stream, next_encoder};
+use common::{Flaky, PausingSink, Trickle, encoder_stream, next_encoder};
 use core::fmt::Debug;
 use hatate_qpack::{
     encoder_instruction::{
@@ -34,22 +34,16 @@ where
             source: hatate_qpack::instruction::OctetError::WireLimit { .. }
         })
     ));
-    // The failed call left the stream interrupted.
-    assert!(matches!(
-        next_encoder(&mut reader, 1, 0).await,
-        Err(StartError::Interrupted)
-    ));
-    assert!(matches!(
-        next_encoder(&mut reader, 1, 0).await,
-        Err(StartError::Interrupted)
-    ));
+    // The failed call read nothing and left the stream at the boundary: with
+    // a limit that admits it, the instruction is read.
+    assert!(next_encoder(&mut reader, 1, 0).await.is_ok());
 }
 
 #[test]
-fn zero_budget_failure_interrupts_without_reading() {
+fn zero_budget_failure_leaves_the_stream_at_the_boundary() {
     let mut input = &[2, 0x20][..];
     input.sync_zero_budget_unpin();
-    assert_eq!(input, [2, 0x20]);
+    assert_eq!(input, [0x20]);
 }
 
 /// Drops the call after `polls` pending polls, then asks again: the
@@ -191,10 +185,10 @@ async fn handed_back<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>
         _ => "other",
     };
     let mut stream = encoder_stream(stream.into_io());
-    // This one fails on its wire limit before the opcode is read; the
+    // This one fails on its wire limit after its first octet; the
     // interrupted stream still gives the access back.
-    let second = match next_encoder(&mut stream, 0, 0).await {
-        Err(StartError::Prefix { .. }) => "limit error",
+    let second = match next_encoder(&mut stream, 1, 0).await {
+        Err(StartError::Capacity { .. }) => "limit error",
         _ => "other",
     };
     let third = match next_encoder(&mut stream, 64, 64).await {
@@ -211,12 +205,12 @@ async fn handed_back<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>
 
 #[test]
 fn into_io_gives_back_the_access_at_the_cursor() {
-    let mut input = &[0x02, 0x3f, 0x01, 0x20][..];
+    let mut input = &[0x02, 0x3f, 0x3f, 0x01][..];
     assert_eq!(
         input.sync_handed_back_unpin(),
         ["duplicate", "limit error", "interrupted", "capacity"]
     );
-    assert_eq!(input, [0x20]);
+    assert!(input.is_empty());
 }
 
 #[call(sync)]
@@ -334,4 +328,58 @@ fn dropped_write_before_the_first_octet_leaves_the_stream_at_the_boundary() {
     // interrupted, and the rest of the instruction is never written.
     assert_eq!(write_after(2), (false, vec![0x3f]));
     assert_eq!(write_after(3), (false, vec![0x3f, 0xbd]));
+}
+
+/// What each of `count` successive instructions came to when the host
+/// failed once: a host failure, an instruction, or an interruption.
+#[call(sync)]
+async fn through_a_failure<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    count: usize,
+) -> Vec<String> {
+    let mut stream = encoder_stream(io);
+    let mut outcomes = Vec::new();
+    for _ in 0..count {
+        outcomes.push(match next_encoder(&mut stream, 64, 64).await {
+            Ok(None) => "end".to_owned(),
+            Ok(Some(instruction)) => match capacity_of(&instruction) {
+                Some(capacity) => format!("capacity {capacity}"),
+                None => "other".to_owned(),
+            },
+            Err(StartError::Interrupted) => "interrupted".to_owned(),
+            Err(_) => "failed".to_owned(),
+        });
+    }
+    outcomes
+}
+
+#[test]
+fn a_host_failure_before_the_first_octet_leaves_the_stream_at_the_boundary() {
+    // The capacity instruction takes three octets.
+    let wire = [0x3f, 0xbd, 0x01, 0x3f, 0xbd, 0x01];
+    let mut host = Flaky::new(&wire, 0);
+    let results = host.sync_through_a_failure_unpin(3);
+    assert_eq!(results[0], "failed");
+    assert_eq!(results[1..], ["capacity 220", "capacity 220"]);
+    // The failure of the first octet of a later instruction is the same.
+    let mut host = Flaky::new(&wire, 3);
+    let results = host.sync_through_a_failure_unpin(3);
+    assert_eq!(results, ["capacity 220", "failed", "capacity 220"]);
+}
+
+#[test]
+fn a_host_failure_after_the_first_octet_interrupts_the_stream() {
+    let wire = [0x3f, 0xbd, 0x01, 0x3f, 0xbd, 0x01];
+    for fail_after in [1, 2, 4] {
+        let mut host = Flaky::new(&wire, fail_after);
+        let results = host.sync_through_a_failure_unpin(3);
+        let first = if fail_after < 3 { 0 } else { 1 };
+        assert_eq!(results[first], "failed", "{fail_after}");
+        assert!(
+            results[first + 1..]
+                .iter()
+                .all(|result| result == "interrupted"),
+            "{fail_after}: {results:?}"
+        );
+    }
 }

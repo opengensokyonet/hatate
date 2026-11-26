@@ -179,6 +179,30 @@ impl<S, H> StringLiteral<S, H> {
         }
     }
 
+    /// The literal with its octets borrowed as slices, with the same length
+    /// prefix.
+    pub(crate) fn as_slices(&self) -> StringLiteral<&[u8], &[u8]>
+    where
+        S: AsRef<[u8]>,
+        H: AsRef<[u8]>,
+    {
+        StringLiteral(match &self.0 {
+            Repr::Raw { bytes, length } => Repr::Raw {
+                bytes: bytes.as_ref(),
+                length: *length,
+            },
+            Repr::Huffman {
+                decoded,
+                decoded_len,
+                length,
+            } => Repr::Huffman {
+                decoded: decoded.as_ref(),
+                decoded_len: *decoded_len,
+                length: *length,
+            },
+        })
+    }
+
     /// A raw literal read from the wire with the length prefix `length`.
     pub(crate) fn read_raw(bytes: S, length: PrefixedField) -> Self {
         Self(Repr::Raw { bytes, length })

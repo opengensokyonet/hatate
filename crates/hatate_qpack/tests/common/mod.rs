@@ -170,3 +170,98 @@ impl nitori_io::Write for PausingSink {
         })))
     }
 }
+
+/// The failure of a [`Flaky`] host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hiccup;
+
+impl core::fmt::Display for Hiccup {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("hiccup")
+    }
+}
+
+impl core::error::Error for Hiccup {}
+
+/// A source that gives one octet per read or chunk and fails once, when it
+/// has given `fail_after` octets; the read after the failure goes on.
+pub struct Flaky<'a> {
+    pub rest: &'a [u8],
+    pub fail_after: usize,
+    pub given: usize,
+    pub failed: bool,
+}
+nitori_call::family_receiver!(impl ['a] for Flaky<'a>);
+
+impl<'a> Flaky<'a> {
+    pub fn new(rest: &'a [u8], fail_after: usize) -> Self {
+        Self {
+            rest,
+            fail_after,
+            given: 0,
+            failed: false,
+        }
+    }
+
+    fn step(&mut self) -> Result<Option<&'a [u8]>, Hiccup> {
+        if !self.failed && self.given == self.fail_after {
+            self.failed = true;
+            return Err(Hiccup);
+        }
+        let Some((first, rest)) = self.rest.split_first_chunk::<1>() else {
+            return Ok(None);
+        };
+        let chunk = &self.rest[..first.len()];
+        self.rest = rest;
+        self.given += 1;
+        Ok(Some(chunk))
+    }
+}
+
+impl nitori_io::Read for Flaky<'_> {
+    type Error = Hiccup;
+    type Metadata = ();
+    fn poll_read<'v, B: bytes::BufMut + ?Sized>(
+        host: core::pin::Pin<&mut Self::ReceiverView<'v>>,
+        _cx: &mut core::task::Context<'_>,
+        dst: &mut B,
+    ) -> core::task::Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
+    where
+        Self: 'v,
+    {
+        use core::task::Poll;
+        let this = host.get_pin_mut().get_mut();
+        if !dst.has_remaining_mut() {
+            return Poll::Ready(Ok(None));
+        }
+        Poll::Ready(this.step().map(|chunk| {
+            chunk.map(|chunk| {
+                dst.put_slice(chunk);
+                nitori_io::ReadSegment {
+                    count: core::num::NonZeroUsize::MIN,
+                    metadata: (),
+                }
+            })
+        }))
+    }
+}
+
+impl<'a> ReadChunk for Flaky<'a> {
+    type Chunk = &'a [u8];
+    fn poll_read_chunk<'v>(
+        host: core::pin::Pin<&mut Self::ReceiverView<'v>>,
+        _cx: &mut core::task::Context<'_>,
+        _: core::num::NonZeroUsize,
+    ) -> core::task::Poll<Result<Option<nitori_io::ChunkSegment<&'a [u8], ()>>, Self::Error>>
+    where
+        Self: 'v,
+    {
+        let this = host.get_pin_mut().get_mut();
+        core::task::Poll::Ready(this.step().map(|chunk| {
+            chunk.map(|chunk| nitori_io::ChunkSegment {
+                chunk,
+                metadata: (),
+            })
+        }))
+    }
+}

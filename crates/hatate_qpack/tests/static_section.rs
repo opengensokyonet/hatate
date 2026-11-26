@@ -58,11 +58,11 @@ fn appendix_b1_reads_and_writes_a_complete_section() {
         value: raw(&b"/index.html"[..]),
     }];
     let mut out = Vec::new();
-    write_static_section(&mut out, &prefix, lines).unwrap();
+    write_static_section(&mut out, &prefix, &lines).unwrap();
     assert_eq!(out, wire);
     // The line that was read writes back the same octets.
     let mut again = Vec::new();
-    write_static_section(&mut again, &prefix, [field.line]).unwrap();
+    write_static_section(&mut again, &prefix, [&field.line]).unwrap();
     assert_eq!(again, wire);
 }
 
@@ -90,7 +90,7 @@ fn prefix_is_eager_and_section_errors_are_terminal() {
     assert!(matches!(fields.next(), Some(Err(ReadError::Line { .. }))));
     assert!(fields.next().is_none());
     let mut out = Vec::new();
-    write_static_section(&mut out, &zero(), Vec::<FieldLine<Bytes, Bytes>>::new()).unwrap();
+    write_static_section(&mut out, &zero(), &Vec::<FieldLine<Bytes, Bytes>>::new()).unwrap();
     assert_eq!(out, [0, 0]);
 }
 
@@ -106,7 +106,7 @@ fn padded_prefixes_read_back_and_write_their_original_octets() {
         assert!(!prefix.is_negative());
         assert_eq!(prefix.encoded_insert_count().value(), PrefixedInt::ZERO);
         let mut out = Vec::new();
-        write_static_section(&mut out, &prefix, Vec::<FieldLine<Bytes, Bytes>>::new()).unwrap();
+        write_static_section(&mut out, &prefix, &Vec::<FieldLine<Bytes, Bytes>>::new()).unwrap();
         assert_eq!(out, wire);
     }
     let padded = SectionPrefix::new(
@@ -116,7 +116,7 @@ fn padded_prefixes_read_back_and_write_their_original_octets() {
     )
     .unwrap();
     let mut out = Vec::new();
-    write_static_section(&mut out, &padded, Vec::<FieldLine<Bytes, Bytes>>::new()).unwrap();
+    write_static_section(&mut out, &padded, &Vec::<FieldLine<Bytes, Bytes>>::new()).unwrap();
     assert_eq!(out, [0x00, 0x7f, 0x81, 0x80, 0x80, 0x00]);
 }
 
@@ -132,7 +132,7 @@ fn prefixes_that_need_a_dynamic_table_are_not_written() {
             write_static_section(
                 &mut out,
                 &prefix.unwrap(),
-                Vec::<FieldLine<Bytes, Bytes>>::new()
+                &Vec::<FieldLine<Bytes, Bytes>>::new()
             ),
             Err(WriteError::DynamicPrefix)
         ));
@@ -191,12 +191,7 @@ fn repeated_names_keep_their_order_storage_and_never_index_bit() {
     assert!(never_index(&fields[2]));
     assert_eq!(fields[2].value.as_ref(), b"z");
     let mut out = Vec::new();
-    write_static_section(
-        &mut out,
-        &prefix,
-        fields.into_iter().map(|field| field.line),
-    )
-    .unwrap();
+    write_static_section(&mut out, &prefix, fields.iter().map(|field| &field.line)).unwrap();
     assert_eq!(out, wire);
 }
 
@@ -240,7 +235,7 @@ fn dynamic_references_fail_before_reading_an_associated_value() {
             bad,
         ];
         assert!(matches!(
-            write_static_section(&mut out, &zero(), lines),
+            write_static_section(&mut out, &zero(), &lines),
             Err(WriteError::DynamicReference { index: 1, source: error }) if error == source
         ));
         assert_eq!(out, b"unchanged");
@@ -266,7 +261,7 @@ fn all_short_destinations_are_untouched_and_exact_fit_preserves_choices() {
     for capacity in 0..expected.len() {
         let mut buf = [0xa5; 7];
         let mut dst = &mut buf[..capacity];
-        let error = write_static_section(&mut dst, &zero(), rows()).unwrap_err();
+        let error = write_static_section(&mut dst, &zero(), &rows()).unwrap_err();
         assert!(
             matches!(error, WriteError::InsufficientCapacity {source} if source.required()==7 && source.available()==capacity)
         );
@@ -274,10 +269,10 @@ fn all_short_destinations_are_untouched_and_exact_fit_preserves_choices() {
         assert_eq!(buf, [0xa5; 7]);
     }
     let mut buf = BytesMut::new();
-    write_static_section(&mut buf, &zero(), rows()).unwrap();
+    write_static_section(&mut buf, &zero(), &rows()).unwrap();
     assert_eq!(buf.as_ref(), expected);
     let mut exact = [0; 7];
-    write_static_section(&mut &mut exact[..], &zero(), rows()).unwrap();
+    write_static_section(&mut &mut exact[..], &zero(), &rows()).unwrap();
     assert_eq!(exact, expected);
 }
 
@@ -336,7 +331,7 @@ fn capacity_can_be_reported_conservatively_after_the_first_write() {
             advanced: false,
         },
         &zero(),
-        [line()],
+        &[line()],
     )
     .unwrap();
     assert_eq!(&section[..6], &[0, 0, 0x51, 0x82, 0x18, 0xff]);
@@ -356,11 +351,144 @@ fn segmented_destination_can_cross_several_encoded_chunks() {
         rest: &mut storage,
         advanced: false,
     };
-    write_static_section(&mut dst, &zero(), [line]).unwrap();
+    write_static_section(&mut dst, &zero(), [&line]).unwrap();
     let length = 1500 - dst.rest.len();
     let mut fields = read(&storage[..length], 670, 1372).unwrap();
     let field = fields.next().unwrap().unwrap();
     assert_eq!(field.name.as_ref(), &octets);
     assert_eq!(field.value.as_ref(), &octets);
     assert!(fields.next().is_none());
+}
+
+type Line = FieldLine<&'static [u8], &'static [u8]>;
+
+fn indexed(number: u64) -> Line {
+    FieldLine::Indexed {
+        index: static_index(number),
+    }
+}
+
+fn literal(value: &'static [u8]) -> Line {
+    FieldLine::LiteralWithNameReference {
+        never_index: false,
+        name: static_index(1),
+        value: raw(value),
+    }
+}
+
+/// The octets of a section of these lines, written as they stand.
+fn written(lines: &[Line]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_static_section(&mut out, &zero(), lines.iter()).unwrap();
+    out
+}
+
+/// Lines that give `normal` the first time they are walked and `changed`
+/// the second time, whichever of the iterator and its clone is walked first.
+#[derive(Clone)]
+struct Rewalked<'a> {
+    normal: &'a [Line],
+    changed: &'a [Line],
+    walks: std::rc::Rc<std::cell::Cell<usize>>,
+    chosen: Option<&'a [Line]>,
+    position: usize,
+}
+
+impl<'a> Rewalked<'a> {
+    fn new(normal: &'a [Line], changed: &'a [Line]) -> Self {
+        Self {
+            normal,
+            changed,
+            walks: Default::default(),
+            chosen: None,
+            position: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for Rewalked<'a> {
+    type Item = &'a Line;
+
+    fn next(&mut self) -> Option<&'a Line> {
+        let chosen = *self.chosen.get_or_insert_with(|| {
+            let walk = self.walks.get();
+            self.walks.set(walk + 1);
+            if walk == 0 { self.normal } else { self.changed }
+        });
+        let line = chosen.get(self.position)?;
+        self.position += 1;
+        Some(line)
+    }
+}
+
+/// What writing `normal` as walked once more as `changed` came to: the
+/// result and the octets left in the destination.
+fn rewalk(normal: &[Line], changed: &[Line]) -> (Result<(), WriteError>, Vec<u8>) {
+    let mut out = Vec::new();
+    let result = write_static_section(&mut out, &zero(), Rewalked::new(normal, changed));
+    (result, out)
+}
+
+#[test]
+fn lines_that_change_between_the_walks_report_where() {
+    let normal = [indexed(17), indexed(18), indexed(19)];
+    // The second line grows beyond what was measured.
+    let (result, out) = rewalk(&normal, &[indexed(17), literal(b"abcdefgh"), indexed(19)]);
+    assert!(
+        matches!(result, Err(WriteError::LineChanged { index: 1 })),
+        "{result:?}"
+    );
+    assert_eq!(out, written(&normal[..1]));
+    // The last line is missing.
+    let (result, out) = rewalk(&normal, &[indexed(17), indexed(18)]);
+    assert!(
+        matches!(result, Err(WriteError::LineChanged { index: 2 })),
+        "{result:?}"
+    );
+    assert_eq!(out, written(&normal[..2]));
+    // A line too many.
+    let (result, out) = rewalk(
+        &normal,
+        &[indexed(17), indexed(18), indexed(19), indexed(20)],
+    );
+    assert!(
+        matches!(result, Err(WriteError::LineChanged { index: 3 })),
+        "{result:?}"
+    );
+    assert_eq!(out, written(&normal));
+    // No lines at all where there were some.
+    let (result, out) = rewalk(&normal, &[]);
+    assert!(
+        matches!(result, Err(WriteError::LineChanged { index: 0 })),
+        "{result:?}"
+    );
+    assert_eq!(out, written(&[]));
+    // The same lines in the second walk write the section.
+    let (result, out) = rewalk(&normal, &normal);
+    result.unwrap();
+    assert_eq!(out, written(&normal));
+}
+
+#[test]
+fn a_vec_of_lines_or_of_things_that_hold_lines_is_written_by_borrowing() {
+    struct Entry {
+        line: Line,
+    }
+    let lines = vec![indexed(17), literal(b"value"), indexed(25)];
+    let mut by_iter = Vec::new();
+    write_static_section(&mut by_iter, &zero(), lines.iter()).unwrap();
+    let entries: Vec<Entry> = lines.iter().cloned().map(|line| Entry { line }).collect();
+    let mut by_field = Vec::new();
+    write_static_section(
+        &mut by_field,
+        &zero(),
+        entries.iter().map(|entry| &entry.line),
+    )
+    .unwrap();
+    assert_eq!(by_iter, by_field);
+    assert_eq!(by_iter[..2], [0, 0]);
+    // Walking the lines to write them leaves them to be written again.
+    let mut again = Vec::new();
+    write_static_section(&mut again, &zero(), &lines).unwrap();
+    assert_eq!(again, by_iter);
 }

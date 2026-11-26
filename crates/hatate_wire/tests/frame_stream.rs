@@ -5,7 +5,7 @@
 //! before every read, and the results must agree.
 mod common;
 
-use common::{Dribble, Ty, known, read_some, run, ty};
+use common::{Boom, Dribble, Ty, known, read_some, run, ty};
 use core::convert::Infallible;
 use frunk_core::HList;
 use hatate_wire::{
@@ -803,4 +803,151 @@ fn frames_read_write_back_to_the_same_bytes() {
         [h3(Http3FrameType::Headers), h3(Http3FrameType::Data)]
     );
     assert!(copied(RequestStreamKind, &[], Role::Server).is_empty());
+}
+
+/// A stream that gives its bytes one at a time and fails once, when it has
+/// given `fail_after` of them; the read or skip after the failure goes on.
+struct Flaky<'a> {
+    input: &'a [u8],
+    fail_after: usize,
+    given: usize,
+    failed: bool,
+}
+
+nitori_call::family_receiver!(impl ['a] for Flaky<'a>);
+
+impl Flaky<'_> {
+    /// How many bytes, at most `wanted`, the next read or skip gives.
+    fn allowed(&mut self, wanted: usize) -> Result<usize, Boom> {
+        if !self.failed && self.given == self.fail_after {
+            self.failed = true;
+            return Err(Boom);
+        }
+        let count = wanted.min(self.input.len()).min(1);
+        self.given += count;
+        Ok(count)
+    }
+}
+
+impl Read for Flaky<'_> {
+    type Error = Boom;
+    type Metadata = ();
+    fn poll_read<'v, B: bytes::BufMut + ?Sized>(
+        host: core::pin::Pin<&mut Self::ReceiverView<'v>>,
+        _cx: &mut core::task::Context<'_>,
+        dst: &mut B,
+    ) -> core::task::Poll<Result<Option<nitori_io::ReadSegment<()>>, Boom>>
+    where
+        Self: 'v,
+    {
+        let this = host.get_pin_mut().get_mut();
+        let count = match this.allowed(dst.remaining_mut()) {
+            Ok(count) => count,
+            Err(error) => return core::task::Poll::Ready(Err(error)),
+        };
+        dst.put_slice(&this.input[..count]);
+        this.input = &this.input[count..];
+        core::task::Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| {
+            nitori_io::ReadSegment {
+                count,
+                metadata: (),
+            }
+        })))
+    }
+}
+
+impl Skip for Flaky<'_> {
+    type Count = usize;
+    fn poll_skip<'v, M: nitori_io::Min<usize, Output = usize> + Clone>(
+        host: core::pin::Pin<&mut Self::ReceiverView<'v>>,
+        _cx: &mut core::task::Context<'_>,
+        maximum: M,
+    ) -> core::task::Poll<Result<Option<usize>, Boom>>
+    where
+        Self: 'v,
+    {
+        let this = host.get_pin_mut().get_mut();
+        let wanted = nitori_io::Min::min(maximum, usize::MAX);
+        if wanted != 0 && this.input.is_empty() {
+            return core::task::Poll::Ready(Ok(None));
+        }
+        // A skip stops where the failure is due.
+        let room = if this.failed {
+            usize::MAX
+        } else {
+            this.fail_after - this.given
+        };
+        let count = wanted.min(this.input.len()).min(room);
+        if count == 0 && wanted != 0 {
+            return core::task::Poll::Ready(this.allowed(1).map(|_| Some(0)));
+        }
+        this.input = &this.input[count..];
+        this.given += count;
+        core::task::Poll::Ready(Ok(Some(count)))
+    }
+}
+
+/// What each of `count` calls of `next_frame` on a request stream came to,
+/// with the payload of each frame it gave.
+#[call(sync)]
+async fn through_a_failure<F>(io: &mut impl ReceiverAccess<Family = F>, count: usize) -> Vec<String>
+where
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Boom, Metadata = ()>,
+{
+    let mut stream =
+        match FrameStream::<Parts, RequestStreamKind, _>::read(&mut *io, Role::Server).await {
+            Ok(Some(stream)) => stream,
+            _ => panic!("the first frame was not read"),
+        };
+    let mut outcomes = vec![format!(
+        "first {:?}",
+        read_some(stream.frame().payload(), 8).await.unwrap()
+    )];
+    for _ in 0..count {
+        outcomes.push(match stream.next_frame().await {
+            Ok(None) => "end".to_owned(),
+            Ok(Some(_)) => {
+                format!(
+                    "frame {:?}",
+                    read_some(stream.frame().payload(), 8).await.unwrap()
+                )
+            }
+            Err(NextFrameError::Head { .. }) => "head".to_owned(),
+            Err(NextFrameError::Skip { .. }) => "skip".to_owned(),
+            Err(NextFrameError::Interrupted) => "interrupted".to_owned(),
+        });
+    }
+    outcomes
+}
+
+// Two DATA frames of one byte each, "a" and "b", then a third, "c".
+const THREE_FRAMES: [u8; 9] = [0x00, 0x01, b'a', 0x00, 0x01, b'b', 0x00, 0x01, b'c'];
+
+#[test]
+fn a_host_failure_before_the_first_byte_of_a_head_leaves_the_stream_at_the_boundary() {
+    // The first frame's payload is skipped, and the failure is due at the
+    // first byte of the next head: the next call reads that head.
+    let mut host = Flaky {
+        input: &THREE_FRAMES,
+        fail_after: 3,
+        given: 0,
+        failed: false,
+    };
+    let outcomes = host.sync_through_a_failure_unpin(3);
+    assert_eq!(outcomes, ["first [97]", "head", "frame [98]", "frame [99]"]);
+}
+
+#[test]
+fn a_host_failure_after_the_first_byte_of_a_head_interrupts_the_stream() {
+    let mut host = Flaky {
+        input: &THREE_FRAMES,
+        fail_after: 4,
+        given: 0,
+        failed: false,
+    };
+    let outcomes = host.sync_through_a_failure_unpin(3);
+    assert_eq!(
+        outcomes,
+        ["first [97]", "head", "interrupted", "interrupted"]
+    );
 }

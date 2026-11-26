@@ -275,8 +275,8 @@ impl Default for EncoderStreamLimits {
 /// interrupted: what is left of the instruction is never skipped or written
 /// later, since the dynamic table would no longer match the peer's. A read
 /// has begun once it has read the first octet; a write once the stream has
-/// accepted one. A read or write dropped before that, or a write refused
-/// before it wrote anything, leaves the stream at the boundary. An
+/// accepted one. A read or write dropped or failing before that leaves the
+/// stream at the boundary. An
 /// interrupted stream reports an error on every later instruction and is
 /// abandoned; [`into_io`](Self::into_io) gives the access back.
 #[derive(Debug)]

@@ -17,7 +17,8 @@ use nitori_codec::{DecodeFrom, EncodeInto};
 use nitori_io::{Read, Write, calls::ReadValue};
 
 /// One instruction from a fresh stream; after a failure the same stream must
-/// report the interruption.
+/// report the interruption, unless nothing was read: a failure before the
+/// first octet leaves the stream at the boundary, to fail the same way again.
 #[call(sync)]
 async fn read_one<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
@@ -26,6 +27,13 @@ async fn read_one<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     let mut stream = DecoderStream::new(io, DecoderStreamLimits { max_wire_len });
     match Option::<ReadValue<D, ()>>::decode_from(&mut stream).await {
         Ok(instruction) => Ok(instruction.map(|read| read.value)),
+        Err(DecodeDecoderInstructionError::Prefix { .. }) => {
+            assert!(matches!(
+                Option::<ReadValue<D, ()>>::decode_from(&mut stream).await,
+                Err(DecodeDecoderInstructionError::Prefix { .. })
+            ));
+            Err(())
+        }
         Err(_) => {
             assert!(matches!(
                 Option::<ReadValue<D, ()>>::decode_from(&mut stream).await,

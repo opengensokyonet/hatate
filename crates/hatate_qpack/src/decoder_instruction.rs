@@ -179,9 +179,9 @@ impl Default for DecoderStreamLimits {
 /// stream's octets, or encoded into it. Each instruction is read whole and
 /// handed over by value, or written whole.
 ///
-/// A read dropped before the first octet of an instruction has read nothing,
-/// and a write dropped before the stream accepted an octet, or refused
-/// before it wrote one, has written nothing: the stream stays at the
+/// A read dropped or failing before the first octet of an instruction has
+/// read nothing, and a write dropped before the stream accepted an octet, or
+/// failing before it, has written nothing: the stream stays at the
 /// boundary. An instruction that fails, or whose read or write is dropped
 /// after it began, leaves the stream interrupted: it reports an error on
 /// every later instruction and is abandoned; [`into_io`](Self::into_io)

@@ -58,10 +58,10 @@ pub mod part;
 /// The frame [`frame`](Self::frame) gives borrows the payload, so it is read
 /// before the next frame is: [`next_frame`](Self::next_frame) skips
 /// what is left of it. Skipping resumes where it stopped if the call is
-/// dropped, and so does a call dropped before it read any byte of the next
-/// head. A stream whose next head was begun but not read whole, because the
-/// call was dropped or the head was rejected, is interrupted and is
-/// abandoned. [`into_io`](Self::into_io) gives the access back.
+/// dropped, and so does a call dropped or failing before it read any byte of
+/// the next head. A stream whose next head was begun but not read whole,
+/// because the call was dropped, failed or the head was rejected, is
+/// interrupted and is abandoned. [`into_io`](Self::into_io) gives the access back.
 pub struct FrameStream<L: FrameSetOn<K>, K: StreamKind, I, M = ()> {
     role: Role,
     r#type: ReadValue<VarIntField<FrameType<L::FrameType>>, M>,
@@ -315,7 +315,11 @@ where
                 Ok(false)
             }
             Err(source) => {
-                self.state = FrameStreamState::Interrupted;
+                // A failure before the first byte of the head read nothing
+                // of it: the stream stays at the boundary.
+                if self.head.0 != u64::MAX {
+                    self.state = FrameStreamState::Interrupted;
+                }
                 Err(NextFrameError::Head { source })
             }
         }
@@ -355,8 +359,9 @@ pub enum NextFrameError<E> {
         /// The failure of reading the head.
         source: ReadFrameHeadError<E>,
     },
-    /// An earlier call did not complete reading a head, or failed: the stream
-    /// is inside a frame head and is abandoned.
+    /// An earlier call began reading a head and did not complete it, or
+    /// failed after it began: the stream is inside a frame head and is
+    /// abandoned.
     #[snafu(display("frame stream is inside a frame head"))]
     Interrupted,
 }
