@@ -1,7 +1,6 @@
 //! A frame is written with a payload of exactly its Length: one that writes
-//! more or fewer bytes panics rather than leave a head that does not match.
-//! A payload that fills storage its sink lends (`Fill`) and is longer than
-//! its Length fails with the copy's no-progress error instead.
+//! more is stopped at the Length and fails with its own error, one that
+//! writes fewer fails the frame, and neither panics.
 mod common;
 
 use common::{Liar, Quota, run};
@@ -25,24 +24,32 @@ fn buffered(
 }
 
 #[test]
-#[should_panic(expected = "ended 1 bytes before its Length 3")]
-fn a_source_shorter_than_its_length_panics() {
+fn a_source_shorter_than_its_length_fails_the_frame() {
     let frame =
         nitori_call::__private::run_sync(Frame::new(DataFrameType, buffered(b"ab", 3))).unwrap();
-    let _ = Vec::new().sync_encode_unpin(frame);
+    let mut out = Vec::new();
+    let Err(EncodeFrameError::ShortPayload { source }) = out.sync_encode_unpin(frame) else {
+        panic!("expected a short payload");
+    };
+    assert_eq!((source.length(), source.missing().get()), (3, 1));
+    assert_eq!(out, b"\x00\x03ab");
 }
 
 #[test]
-#[should_panic(expected = "wrote more than its Length 2")]
-fn a_source_longer_than_its_length_panics() {
+fn a_source_longer_than_its_length_stops_at_it() {
     let frame =
         nitori_call::__private::run_sync(Frame::new(DataFrameType, buffered(b"abc", 2))).unwrap();
-    let _ = Vec::new().sync_encode_unpin(frame);
+    let mut out = Vec::new();
+    assert!(matches!(
+        out.sync_encode_unpin(frame),
+        Err(EncodeFrameError::Payload { .. })
+    ));
+    // Nothing beyond the Length reaches the sink.
+    assert_eq!(out, b"\x00\x02ab");
 }
 
 #[test]
-#[should_panic(expected = "wrote more than its Length 1")]
-fn a_payload_swapped_for_a_longer_one_panics() {
+fn a_payload_swapped_for_a_longer_one_stops_at_the_length() {
     let short = ReadValue {
         value: VarIntField::shortest(VarInt::from_u32(1)),
         metadata: (),
@@ -52,7 +59,13 @@ fn a_payload_swapped_for_a_longer_one_panics() {
         value: VarIntField::shortest(VarInt::from_u32(300)),
         metadata: (),
     });
-    let _ = Vec::new().sync_encode_unpin(longer);
+    let mut out = Vec::new();
+    assert!(matches!(
+        out.sync_encode_unpin(longer),
+        Err(EncodeFrameError::Payload { .. })
+    ));
+    // 300 takes two bytes; the Length of 1 holds the first.
+    assert_eq!(out, b"\x00\x01\x41");
 }
 
 #[test]
@@ -84,7 +97,7 @@ fn a_filled_payload_is_written_to_a_sink_that_is_then_full() {
 }
 
 /// A source longer than its Length ends the copy with the copy's no-progress
-/// error rather than a panic; what was written is the head and the Length.
+/// error; what was written is the head and the Length.
 #[test]
 fn a_filled_source_longer_than_its_length_fails_without_panicking() {
     let frame =

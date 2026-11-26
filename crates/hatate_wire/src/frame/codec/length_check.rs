@@ -2,24 +2,23 @@
 use bytes::Buf;
 use core::{
     marker::PhantomData,
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     pin::Pin,
     task::{Context, Poll, ready},
 };
 use nitori_call::{Compose, ReceiverFamily};
 use nitori_io::{LentBuffer, LentOutcome, Write, WriteLent, WriteLentResult, WriteResult};
+use snafu::Snafu;
 
 /// What a frame being written has left of its Length, as composition state
 /// on the sink its payload is written to.
 ///
-/// A payload that writes more than the Length, or ends before it, panics
-/// ([`Frame`](crate::frame::Frame)'s encoding): the Length came from the
-/// payload, so the two disagree only when the payload, or the source it
-/// writes out, does not keep the length it reported. One case fails
-/// instead: a payload that fills storage the sink lends ([`WriteLent`]),
-/// such as `nitori_codec::Fill`, is refused any loan once the Length is
-/// used up, so a source longer than the Length ends its copy with the
-/// copy's no-progress error.
+/// The sink accepts at most what is left of the Length: once it is used
+/// up, it accepts nothing (`Ok(None)`), so a payload that writes more fails
+/// with its own error, such as a copy's no-progress error, and nothing
+/// beyond the Length reaches the stream. A payload that ends before the
+/// Length fails the frame ([`Frame`](crate::frame::Frame)'s encoding,
+/// [`ShortPayloadError`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayloadWriteLimit {
     length: u64,
@@ -35,28 +34,49 @@ impl PayloadWriteLimit {
         }
     }
 
-    /// Panics unless the payload wrote all of its Length.
-    pub(crate) fn finish(&self) {
-        assert!(
-            self.remaining == 0,
-            "the payload of a frame ended {} bytes before its Length {}",
-            self.remaining,
-            self.length
-        );
+    /// Whether the payload wrote all of its Length.
+    pub(crate) fn finish(&self) -> Result<(), ShortPayloadError> {
+        match NonZeroU64::new(self.remaining) {
+            None => Ok(()),
+            Some(missing) => Err(ShortPayloadError {
+                length: self.length,
+                missing,
+            }),
+        }
     }
 
-    /// Takes `count` written bytes off what is left, panicking past the Length.
+    /// What is left of the Length, as much of it as a write can offer.
+    fn left(&self) -> usize {
+        usize::try_from(self.remaining).unwrap_or(usize::MAX)
+    }
+
+    /// Takes `count` written bytes off what is left.
     fn take(&mut self, count: usize) {
-        let taken = u64::try_from(count)
-            .ok()
-            .and_then(|count| self.remaining.checked_sub(count));
-        let Some(remaining) = taken else {
-            panic!(
-                "the payload of a frame wrote more than its Length {}",
-                self.length
-            );
-        };
-        self.remaining = remaining;
+        // invariant: the sink below accepts at most what it is offered, and
+        // it is offered at most what is left.
+        self.remaining -= count as u64;
+    }
+}
+
+/// The payload of a frame ended before its Length: it wrote fewer bytes
+/// than it reported. Its measurements can only be obtained from a payload
+/// that ended short.
+#[derive(Debug, PartialEq, Eq, Snafu)]
+#[snafu(display("frame payload ended {missing} bytes before its Length {length}"))]
+pub struct ShortPayloadError {
+    length: u64,
+    missing: NonZeroU64,
+}
+
+impl ShortPayloadError {
+    /// The Length of the frame.
+    pub const fn length(&self) -> u64 {
+        self.length
+    }
+
+    /// The bytes of the Length the payload did not write.
+    pub const fn missing(&self) -> NonZeroU64 {
+        self.missing
     }
 }
 
@@ -98,8 +118,8 @@ impl<F: ReceiverFamily> Compose<F> for PayloadWriteLimit {
     }
 }
 
-/// Passes writes on, panicking when one offers more than is left of the
-/// Length.
+/// Passes writes on, held to what is left of the Length. Once it is used
+/// up, it accepts nothing (`Ok(None)`) without asking the sink below.
 impl<F: Write> Write for PayloadSink<F> {
     type Error = F::Error;
     type Report = F::Report;
@@ -112,12 +132,15 @@ impl<F: Write> Write for PayloadSink<F> {
         Self: 'v,
     {
         let view = host.project();
-        assert!(
-            u64::try_from(input.remaining()).is_ok_and(|offered| offered <= view.state.remaining),
-            "the payload of a frame wrote more than its Length {}",
-            view.state.length
-        );
-        let segment = ready!(F::poll_write(view.parent, cx, input))?;
+        let left = view.state.left();
+        if left == 0 {
+            return Poll::Ready(Ok(None));
+        }
+        let segment = ready!(F::poll_write(
+            view.parent,
+            cx,
+            &mut (&mut *input).take(left)
+        ))?;
         if let Some(segment) = &segment {
             view.state.take(segment.count.get());
         }
@@ -143,9 +166,7 @@ impl<F: WriteLent> WriteLent for PayloadSink<F> {
         Fill: for<'l> FnOnce(&mut LentBuffer<Self::Buffer<'l>>) -> Result<T, A>,
     {
         let view = host.project();
-        let Some(left) =
-            NonZeroUsize::new(usize::try_from(view.state.remaining).unwrap_or(usize::MAX))
-        else {
+        let Some(left) = NonZeroUsize::new(view.state.left()) else {
             return Poll::Ready(Ok(None));
         };
         let allowed = left.min(wanted);

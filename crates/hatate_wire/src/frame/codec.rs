@@ -10,7 +10,7 @@ use crate::{
     stream::kind::StreamKind,
 };
 use core::num::NonZeroU64;
-use length_check::PayloadWriteLimit;
+use length_check::{PayloadWriteLimit, ShortPayloadError};
 use nitori_call::{AsAccess, Composed};
 use nitori_codec::{DecodeFrom, EncodeInto};
 use nitori_io::{Combine, Read, Write, calls::ReadValue};
@@ -396,18 +396,20 @@ impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadVarIntError<Paylo
 /// ([`PayloadWriteLimit`]). The output is the merged report of the head and
 /// the payload's output.
 ///
-/// # Panics
+/// # Errors
 ///
-/// When the payload writes more or fewer bytes than the Length, which it
-/// does only if it, or the source it writes out, does not keep the length it
-/// reported: such as a source whose exact length ([`ExactLen`](nitori_io::ExactLen))
-/// is wrong, or a payload swapped for one of another length
-/// ([`Frame::map_payload`]). A frame with such a payload would be written
-/// with a head that does not match it. A frame that was read keeps the
-/// Length of the wire, so to write it back its payload must write as many
-/// bytes as it read: a payload that writes a value at another width than
-/// the one it read, such as at its shortest, panics on a peer's longer
-/// encoding.
+/// [`EncodeFrameError`]. The payload must write as many bytes as the
+/// Length, which it fails to do only if it, or the source it writes out,
+/// does not keep the length it reported: such as a source whose exact
+/// length ([`ExactLen`](nitori_io::ExactLen)) is wrong, or a payload swapped
+/// for one of another length ([`Frame::map_payload`]). One that writes more
+/// is stopped at the end of the Length, where its write fails
+/// ([`EncodeFrameError::Payload`]); one that writes fewer fails the frame
+/// ([`EncodeFrameError::ShortPayload`]). Either way the stream holds no byte
+/// beyond the Length. A frame that was read keeps the Length of the wire,
+/// so to write it back its payload must write as many bytes as it read: a
+/// payload that writes a value at another width than the one it read, such
+/// as at its shortest, fails on a peer's longer encoding.
 impl<S, T, P, M, O, E> EncodeInto<S> for Frame<T, P, M>
 where
     S: AsAccess<Family: Write<Report: Combine>>,
@@ -440,7 +442,9 @@ where
             .encode_into(Composed::new(sink.access(), &mut limit))
             .await
             .context(encode_frame_error::PayloadSnafu)?;
-        limit.finish();
+        limit
+            .finish()
+            .context(encode_frame_error::ShortPayloadSnafu)?;
         Ok(FrameOutput {
             head: r#type.combine(length),
             payload,
@@ -481,6 +485,12 @@ pub enum EncodeFrameError<W, P> {
     Payload {
         /// The payload's failure.
         source: P,
+    },
+    /// The payload ended before the Length.
+    #[snafu(display("frame payload ended short of its length"))]
+    ShortPayload {
+        /// The Length and the bytes missing.
+        source: ShortPayloadError,
     },
 }
 
