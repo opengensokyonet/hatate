@@ -16,7 +16,11 @@
 //! and a source of `Bytes` chunks, a literal that arrives in one chunk shares
 //! its storage. A Huffman literal collects its decoded octets in `H`
 //! (`Default + Extend<u8>`). To write an instruction back, `S` must also
-//! encode itself into the stream and `H` must be a `Buf`.
+//! encode itself into the stream and `H` must be a `Buf`. A raw literal to
+//! write can also be a source wrapped in `nitori_codec::payload::Chunks`,
+//! `Fill` or `Buffered`; the [`EncoderInstructionOutput`] of a write holds
+//! the report of the octets the instruction wrote itself and the output of
+//! each raw literal.
 //!
 //! ```
 //! # #![feature(impl_trait_in_assoc_type)]
@@ -59,7 +63,7 @@ mod read;
 mod write;
 
 pub use read::{DecodeEncoderInstructionError, DecodeLiteralError, DecodedLengthError};
-pub use write::EncodeEncoderInstructionError;
+pub use write::{EncodeEncoderInstructionError, EncoderInstructionOutput};
 
 use crate::{
     instruction::Position,

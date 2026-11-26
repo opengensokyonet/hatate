@@ -294,7 +294,7 @@ where
         index: PrefixedField::shortest(PrefixedInt::ZERO),
     };
     match second.encode_into(&mut writer).await {
-        Ok(()) => true,
+        Ok(_) => true,
         Err(EncodeEncoderInstructionError::Interrupted) => false,
         Err(other) => panic!("{other:?}"),
     }

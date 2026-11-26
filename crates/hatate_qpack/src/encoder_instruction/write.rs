@@ -15,8 +15,9 @@ use nitori_codec::EncodeInto;
 use nitori_io::{Combine, Write, adapters::WriteLimit, calls::WriteAllError};
 use snafu::{ResultExt, Snafu};
 
-/// Writes the instruction whole and returns the merged report of its octets
-/// and of what its raw literals reported.
+/// Writes the instruction whole and returns what writing it produced
+/// ([`EncoderInstructionOutput`]): the merged report of the octets it wrote
+/// itself and the output of each raw literal.
 ///
 /// Before it writes the first octet, it checks that every integer and
 /// literal length has an encoding in its position, that each Huffman
@@ -28,25 +29,23 @@ use snafu::{ResultExt, Snafu};
 /// the boundary.
 ///
 /// A raw literal writes itself into the stream's access, held to the
-/// octets of the instruction not written yet ([`WriteLimit`]); it must
-/// write as many octets as its length prefix says, or the instruction fails.
+/// octets of the instruction not written yet ([`WriteLimit`]), so a source
+/// wrapped in `nitori_codec::payload::Chunks`, `Fill` or `Buffered` can be
+/// one; it must write as many octets as its length prefix says, or the
+/// instruction fails.
 /// A Huffman literal is encoded as it is written.
 ///
 /// # Errors
 ///
 /// [`EncodeEncoderInstructionError`]. A failure after the stream accepted
 /// an octet of the instruction leaves the stream interrupted.
-impl<'s, A, S, H, P> EncodeInto<&'s mut EncoderStream<A>> for EncoderInstruction<S, H>
+impl<'s, A, S, H, O, P> EncodeInto<&'s mut EncoderStream<A>> for EncoderInstruction<S, H>
 where
     A: ReceiverAccess<Family: Write<Report: Combine>>,
-    S: for<'a> EncodeInto<
-            Composed<&'a mut A, &'a mut WriteLimit>,
-            Output = <A::Family as Write>::Report,
-            Error = P,
-        >,
+    S: for<'a> EncodeInto<Composed<&'a mut A, &'a mut WriteLimit>, Output = O, Error = P>,
     H: Buf,
 {
-    type Output = <A::Family as Write>::Report;
+    type Output = EncoderInstructionOutput<<A::Family as Write>::Report, O>;
     type Error = EncodeEncoderInstructionError<<A::Family as Write>::Error, P>;
 
     async fn encode_into(
@@ -112,32 +111,39 @@ impl<S, H: Buf> EncoderInstruction<S, H> {
 /// in its position before anything is written.
 const CHECKED: &str = "checked before writing";
 
-async fn write_instruction<A, S, H, P>(
+async fn write_instruction<A, S, H, O, P>(
     instruction: EncoderInstruction<S, H>,
     io: &mut A,
     unwritten: &mut WriteLimit,
 ) -> Result<
-    <A::Family as Write>::Report,
+    EncoderInstructionOutput<<A::Family as Write>::Report, O>,
     EncodeEncoderInstructionError<<A::Family as Write>::Error, P>,
 >
 where
     A: ReceiverAccess<Family: Write<Report: Combine>>,
-    S: for<'a> EncodeInto<Sink<'a, A>, Output = <A::Family as Write>::Report, Error = P>,
+    S: for<'a> EncodeInto<Sink<'a, A>, Output = O, Error = P>,
     H: Buf,
 {
     use encode_encoder_instruction_error::*;
+    let integer_only = |head| EncoderInstructionOutput {
+        head,
+        name: None,
+        value: None,
+    };
     match instruction {
         EncoderInstruction::SetDynamicTableCapacity { capacity } => {
             let head = integer::encode::<CAPACITY_BITS, _>(0x20, capacity).expect(CHECKED);
             instruction::put(io, unwritten, head.as_slice())
                 .await
                 .context(SendSnafu)
+                .map(integer_only)
         }
         EncoderInstruction::Duplicate { index } => {
             let head = integer::encode::<DUPLICATE_BITS, _>(0, index).expect(CHECKED);
             instruction::put(io, unwritten, head.as_slice())
                 .await
                 .context(SendSnafu)
+                .map(integer_only)
         }
         EncoderInstruction::InsertWithNameReference { name, value } => {
             let head = match name {
@@ -152,15 +158,22 @@ where
             let report = instruction::put(io, unwritten, head.as_slice())
                 .await
                 .context(SendSnafu)?;
-            let value =
-                write_literal::<VALUE_LENGTH_BITS, _, _, _, _>(io, unwritten, 0, value, |source| {
-                    EncodeEncoderInstructionError::Value { source }
-                })
-                .await?;
-            Ok(report.combine(value))
+            let (value_head, value) = write_literal::<VALUE_LENGTH_BITS, _, _, _, _, _>(
+                io,
+                unwritten,
+                0,
+                value,
+                |source| EncodeEncoderInstructionError::Value { source },
+            )
+            .await?;
+            Ok(EncoderInstructionOutput {
+                head: report.combine(value_head),
+                name: None,
+                value,
+            })
         }
         EncoderInstruction::InsertWithLiteralName { name, value } => {
-            let name = write_literal::<NAME_LENGTH_BITS, _, _, _, _>(
+            let (name_head, name) = write_literal::<NAME_LENGTH_BITS, _, _, _, _, _>(
                 io,
                 unwritten,
                 0x40,
@@ -168,19 +181,28 @@ where
                 |source| EncodeEncoderInstructionError::Name { source },
             )
             .await?;
-            let value =
-                write_literal::<VALUE_LENGTH_BITS, _, _, _, _>(io, unwritten, 0, value, |source| {
-                    EncodeEncoderInstructionError::Value { source }
-                })
-                .await?;
-            Ok(name.combine(value))
+            let (value_head, value) = write_literal::<VALUE_LENGTH_BITS, _, _, _, _, _>(
+                io,
+                unwritten,
+                0,
+                value,
+                |source| EncodeEncoderInstructionError::Value { source },
+            )
+            .await?;
+            Ok(EncoderInstructionOutput {
+                head: name_head.combine(value_head),
+                name,
+                value,
+            })
         }
     }
 }
 
 /// Writes a literal whose length prefix of `N` bits begins in an octet with
 /// the high bits `flags`; `which` tells which literal a failure of it is.
-async fn write_literal<const N: u8, A, S, H, P>(
+/// Gives the report of the octets written here, the length prefix and a
+/// Huffman payload, and the output of a raw payload.
+async fn write_literal<const N: u8, A, S, H, O, P>(
     io: &mut A,
     unwritten: &mut WriteLimit,
     flags: u8,
@@ -189,12 +211,12 @@ async fn write_literal<const N: u8, A, S, H, P>(
         string_literal::WriteError,
     ) -> EncodeEncoderInstructionError<<A::Family as Write>::Error, P>,
 ) -> Result<
-    <A::Family as Write>::Report,
+    (<A::Family as Write>::Report, Option<O>),
     EncodeEncoderInstructionError<<A::Family as Write>::Error, P>,
 >
 where
     A: ReceiverAccess<Family: Write<Report: Combine>>,
-    S: for<'a> EncodeInto<Sink<'a, A>, Output = <A::Family as Write>::Report, Error = P>,
+    S: for<'a> EncodeInto<Sink<'a, A>, Output = O, Error = P>,
     H: Buf,
 {
     use encode_encoder_instruction_error::*;
@@ -218,15 +240,34 @@ where
                     actual: written,
                 }));
             }
-            Ok(report.combine(output))
+            Ok((report, Some(output)))
         }
         LiteralBytes::Huffman(decoded) => {
             let payload = EncodedBuf::new(decoded, length.value().get());
-            instruction::put(io, unwritten, head.as_slice().chain(payload))
+            let report = instruction::put(io, unwritten, head.as_slice().chain(payload))
                 .await
-                .context(SendSnafu)
+                .context(SendSnafu)?;
+            Ok((report, None))
         }
     }
+}
+
+/// What writing an [`EncoderInstruction`] produced: the merged report `R`
+/// of the octets the instruction wrote itself, and the output `O` of each
+/// raw literal, which wrote its own octets.
+///
+/// The octets the instruction writes itself are its integers, the length
+/// prefixes of its literals and the payloads of its Huffman literals. A raw
+/// literal's output is what its encoding gave, such as the stream's report
+/// for `Bytes`, or a `CopyTotal` for a source wrapped in `Chunks`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EncoderInstructionOutput<R, O> {
+    /// The merged report of the octets the instruction wrote itself.
+    pub head: R,
+    /// The output of the name, if it is a raw literal.
+    pub name: Option<O>,
+    /// The output of the value, if it is a raw literal.
+    pub value: Option<O>,
 }
 
 /// An encoder instruction could not be written to a stream whose failures

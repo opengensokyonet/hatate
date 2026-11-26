@@ -14,14 +14,19 @@ use hatate_qpack::{
     decoder_instruction::{
         DecoderInstruction as D, DecoderStream, DecoderStreamLimits, Increment, StreamId,
     },
-    encoder_instruction::{EncoderInstruction, EncoderStream, EncoderStreamLimits, NameReference},
+    encoder_instruction::{
+        EncoderInstruction, EncoderInstructionOutput, EncoderStream, EncoderStreamLimits,
+        NameReference,
+    },
     integer::{PrefixedField, PrefixedInt},
     static_table::Index,
+    string_literal::StringLiteral,
 };
 use nitori_call::{ConstructedAccess, family_receiver};
-use nitori_codec::{DecodeFrom, EncodeInto};
+use nitori_codec::{DecodeFrom, EncodeInto, payload::Chunks};
 use nitori_io::{
-    ChunkSegment, Combine, Read, ReadChunk, ReadSegment, Write, WriteSegment, calls::ReadValue,
+    ChunkSegment, Combine, Read, ReadChunk, ReadSegment, Write, WriteSegment,
+    calls::{CopyTotal, ReadValue},
 };
 use support::{huffman, raw};
 
@@ -308,17 +313,19 @@ fn an_encoder_instruction_is_written_with_the_report_of_all_of_its_octets() {
     let mut sink = ConstructedAccess::new(Tally::default());
     let mut stream = EncoderStream::new(&mut sink, LIMITS);
     let mut write = |instruction: Made| run(instruction.encode_into(&mut stream)).unwrap();
+    let output = |head, name, value| EncoderInstructionOutput { head, name, value };
     // The integer instructions: the report of their octets.
     assert_eq!(
         write(EncoderInstruction::SetDynamicTableCapacity { capacity: int(220) }),
-        Writes(3)
+        output(Writes(3), None, None)
     );
     assert_eq!(
         write(EncoderInstruction::Duplicate { index: int(31) }),
-        Writes(2)
+        output(Writes(2), None, None)
     );
-    // An insertion with a name reference: the reference, the value's length
-    // and its octets, which the raw literal writes itself.
+    // An insertion with a name reference: the reference and the value's
+    // length, then the value's octets, which the raw literal writes itself
+    // and reports as its own output.
     let static_name = NameReference::Static {
         index: PrefixedField::shortest(Index::try_from(1).unwrap()),
     };
@@ -327,19 +334,54 @@ fn an_encoder_instruction_is_written_with_the_report_of_all_of_its_octets() {
             name: static_name,
             value: raw(&b"xy"[..]),
         }),
-        Writes(4)
+        output(Writes(2), None, Some(Writes(2)))
     );
-    // An insertion with a literal name: the name's header and payload, then
-    // the value's header and its Huffman code.
+    // An insertion with a literal name: the name's header with the value's
+    // header and Huffman code, which the instruction writes itself, and the
+    // name's raw payload.
     assert_eq!(
         write(EncoderInstruction::InsertWithLiteralName {
             name: raw(&b"ab"[..]),
             value: huffman(&b"a"[..]),
         }),
-        Writes(5)
+        output(Writes(3), Some(Writes(2)), None)
     );
     assert_eq!(
         sink.into_inner().bytes,
         b"\x3f\xbd\x01\x1f\x00\xc1\x02xy\x42ab\x81\x1f"
     );
+}
+
+#[test]
+fn a_raw_literal_from_a_source_gives_the_output_of_its_copy() {
+    type Source = Chunks<ConstructedAccess<&'static [u8]>>;
+    let source = |bytes: &'static [u8]| -> StringLiteral<Source, &'static [u8]> {
+        let chunks = Chunks {
+            source: ConstructedAccess::new(bytes),
+            chunk_maximum: NonZeroUsize::new(2).unwrap(),
+        };
+        run(StringLiteral::raw(chunks)).unwrap()
+    };
+    let mut sink = ConstructedAccess::new(Tally::default());
+    let mut stream = EncoderStream::new(&mut sink, LIMITS);
+    let instruction = EncoderInstruction::InsertWithLiteralName {
+        name: source(b"abc"),
+        value: source(b"xy"),
+    };
+    let copied = |count, report| CopyTotal {
+        count,
+        metadata: (),
+        report,
+    };
+    // The two length prefixes are the instruction's; each payload is copied
+    // from its source, two octets at a time.
+    assert_eq!(
+        run(instruction.encode_into(&mut stream)).unwrap(),
+        EncoderInstructionOutput {
+            head: Writes(2),
+            name: Some(copied(3, Writes(3))),
+            value: Some(copied(2, Writes(2))),
+        }
+    );
+    assert_eq!(sink.into_inner().bytes, b"\x43abc\x02xy");
 }

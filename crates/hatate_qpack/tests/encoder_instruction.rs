@@ -443,7 +443,7 @@ async fn put_each<G: Write<Report = ()>>(
     let mut writer = EncoderStream::new(output, limits(wire, decoded));
     let mut results = Vec::new();
     for instruction in instructions {
-        results.push(instruction.encode_into(&mut writer).await);
+        results.push(instruction.encode_into(&mut writer).await.map(|_| ()));
     }
     results
 }
