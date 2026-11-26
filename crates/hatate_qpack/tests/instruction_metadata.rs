@@ -2,7 +2,6 @@
 //! from them, and the reports of what is written.
 use bytes::{Buf, BufMut};
 use core::{
-    convert::Infallible,
     num::NonZeroUsize,
     pin::Pin,
     task::{Context, Poll},
@@ -49,13 +48,13 @@ struct Numbered<'a> {
 family_receiver!(impl ['a] for Numbered<'a>);
 
 impl Read for Numbered<'_> {
-    type Error = Infallible;
+    type Error = !;
     type Metadata = Positions;
     fn poll_read<'v, O: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'v>>,
         _: &mut Context<'_>,
         out: &mut O,
-    ) -> Poll<Result<Option<ReadSegment<Positions>>, Infallible>>
+    ) -> Poll<Result<Option<ReadSegment<Positions>>, !>>
     where
         Self: 'v,
     {
@@ -215,6 +214,47 @@ fn an_insertion_with_a_literal_name_has_the_metadata_of_each_part() {
 }
 
 #[test]
+fn a_huffman_value_has_the_metadata_of_the_octets_it_was_decoded_from() {
+    // A static name reference to :authority, then the value
+    // "www.example.com" as a Huffman literal of 12 octets (RFC 7541 C.4.1).
+    let wire = [
+        0xc0, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+    ];
+    let mut stream = EncoderStream::new(numbered(&wire), LIMITS);
+    let start = run(Option::<ReadValue<Started<'_, _>, Positions>>::decode_from(
+        &mut stream,
+    ))
+    .unwrap()
+    .unwrap();
+    assert_eq!(start.metadata, at(&[0]));
+    let Started::InsertWithNameReference { value, .. } = start.value else {
+        panic!("a name reference");
+    };
+    let mut value = run(value.open()).unwrap();
+    assert_eq!(value.metadata, at(&[1]));
+    let mut decoded = Vec::new();
+    let mut reported = Vec::new();
+    {
+        let LiteralSource::Huffman(mut source) = value.value.source() else {
+            panic!("a Huffman value");
+        };
+        let mut byte = [0u8; 1];
+        while let Some(segment) = run(source.read(&mut &mut byte[..])).unwrap() {
+            decoded.push(byte[0]);
+            // Each decoded byte comes from octets of the literal, in order.
+            assert!(!segment.metadata.0.is_empty());
+            assert!(segment.metadata.0.is_sorted());
+            reported.extend(segment.metadata.0);
+        }
+    }
+    assert_eq!(decoded, b"www.example.com");
+    reported.dedup();
+    // Every octet of the literal is reported.
+    assert_eq!(reported, (2..14).collect::<Vec<_>>());
+    value.value.finish().unwrap();
+}
+
+#[test]
 fn a_decoder_instruction_has_the_metadata_of_its_octets() {
     // Section acknowledgment of stream 4, Insert Count Increment 5, and the
     // cancellation of stream 64 (two octets).
@@ -281,13 +321,13 @@ struct Tally {
 family_receiver!(impl [] for Tally);
 
 impl Write for Tally {
-    type Error = Infallible;
+    type Error = !;
     type Report = Writes;
     fn poll_write<'v, B: Buf + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'v>>,
         _: &mut Context<'_>,
         input: &mut B,
-    ) -> Poll<Result<Option<WriteSegment<Writes>>, Infallible>>
+    ) -> Poll<Result<Option<WriteSegment<Writes>>, !>>
     where
         Self: 'v,
     {

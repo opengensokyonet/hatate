@@ -3,16 +3,23 @@
 //! an instruction.
 use bytes::BufMut;
 use core::{
-    convert::Infallible,
     num::NonZeroUsize,
     pin::Pin,
     task::{Context, Poll},
 };
+use frunk_core::{HList, coproduct::Coproduct};
 use hatate_qpack::{
     decoder_instruction::{DecoderInstruction, DecoderStreamLimits, StreamId},
     encoder_instruction::{
         EncoderStreamLimits, Started,
         codec::{LiteralHeaderError, StartError, ValueError},
+    },
+};
+use hatate_wire::{
+    Part,
+    stream::{
+        ReceivedStream, class::ClientInitiatedUnidirectional, codec::read_unidirectional_stream,
+        http3::Http3UnidirectionalStream,
     },
 };
 use hatate_wire_qpack::stream::{CriticalStream, QpackDecoderStream, QpackEncoderStream};
@@ -49,13 +56,13 @@ struct Numbered<'a> {
 family_receiver!(impl ['a] for Numbered<'a>);
 
 impl Read for Numbered<'_> {
-    type Error = Infallible;
+    type Error = !;
     type Metadata = Positions;
     fn poll_read<'v, O: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'v>>,
         _: &mut Context<'_>,
         out: &mut O,
-    ) -> Poll<Result<Option<ReadSegment<Positions>>, Infallible>>
+    ) -> Poll<Result<Option<ReadSegment<Positions>>, !>>
     where
         Self: 'v,
     {
@@ -221,5 +228,35 @@ fn the_decoder_stream_has_its_limit_and_gives_the_metadata_of_an_instruction() {
             &mut stream
         ))
         .is_err()
+    );
+}
+
+#[test]
+fn the_qpack_streams_read_from_the_wire_start_with_the_default_limits() {
+    let read = |stream_type: &'static [u8]| {
+        let start = read_unidirectional_stream::<HList![Part], ClientInitiatedUnidirectional, _, ()>(
+            ConstructedAccess::new(stream_type),
+        );
+        let ReceivedStream::Known(known) = run(start).unwrap().unwrap().transpose() else {
+            panic!("a known stream");
+        };
+        let Coproduct::Inl(http3) = known.transpose() else {
+            panic!("an HTTP/3 stream");
+        };
+        http3.transpose()
+    };
+    let Http3UnidirectionalStream::QpackEncoder(stream) = read(&[0x02]) else {
+        panic!("the QPACK encoder stream");
+    };
+    assert_eq!(
+        stream.into_stream().limits(),
+        EncoderStreamLimits::default()
+    );
+    let Http3UnidirectionalStream::QpackDecoder(stream) = read(&[0x03]) else {
+        panic!("the QPACK decoder stream");
+    };
+    assert_eq!(
+        stream.into_stream().limits(),
+        DecoderStreamLimits::default()
     );
 }

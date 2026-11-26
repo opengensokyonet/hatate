@@ -41,7 +41,6 @@ use sakuya_var_int::{VarInt, VarIntField, VarIntWidth, VarIntWidthError};
 use snafu::Snafu;
 
 pub mod class;
-#[allow(missing_docs)] // The call macro also generates operation and extension trait items.
 pub mod codec;
 pub mod http3;
 pub mod kind;

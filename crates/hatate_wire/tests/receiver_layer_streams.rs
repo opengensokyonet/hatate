@@ -11,10 +11,17 @@ use common::{
 };
 use core::convert::Infallible;
 use frunk_core::{HList, coproduct::Coproduct};
-use hatate_qpack::encoder_instruction::{NameReference, Started, literal::LiteralSource};
+use hatate_qpack::{
+    decoder_instruction::DecoderInstruction,
+    encoder_instruction::{NameReference, Started, literal::LiteralSource},
+};
 use hatate_wire::{
     Part, Role,
     error_code::ErrorCodeOf,
+    frame::{
+        DataFrameType, Frame, GoawayFrameType, GoawayId, control::GoawayFrame,
+        payload::FramePayload,
+    },
     stream::{
         FrameStream, ReceivedStream, TypedStream as _,
         class::{
@@ -26,8 +33,11 @@ use hatate_wire::{
         kind::RequestStreamKind,
     },
 };
-use nitori_call::{ConstructedAccess, ReceiverAccess, call};
-use nitori_io::{Read, Skip};
+use hatate_wire_qpack::stream::{CriticalStream, QpackDecoderStream, QpackEncoderStream};
+use nitori_call::{Composed, ConstructedAccess, ReceiverAccess, call};
+use nitori_codec::{DecodeFrom as _, EncodeInto as _, payload::Chunks};
+use nitori_io::{Read, Skip, calls::ReadValue};
+use sakuya_var_int::VarIntField;
 
 type Parts = HList![Part];
 
@@ -464,4 +474,119 @@ fn the_streams_and_their_futures_are_send_when_the_receiver_is() {
         ConstructedAccess::new(Dribble::new(&input, 1)),
     );
     assert_send(&bidirectional);
+}
+
+type Host<'a> = ConstructedAccess<Dribble<'a>>;
+type Critical<A> = Composed<A, CriticalStream>;
+
+#[test]
+fn the_qpack_streams_and_their_reads_are_send_when_the_receiver_is() {
+    let input = [0x20];
+    // The access held by value.
+    let mut encoder = QpackEncoderStream::new(Host::new(Dribble::new(&input, 1)));
+    assert_send(&encoder);
+    {
+        let read = ReadValue::<Started<'_, Critical<Host<'_>>>, ()>::decode_from(&mut encoder);
+        assert_send(&read);
+    }
+    // The access held by `&mut`.
+    let mut host = Host::new(Dribble::new(&input, 1));
+    let mut encoder = QpackEncoderStream::new(&mut host);
+    assert_send(&encoder);
+    {
+        let read = ReadValue::<Started<'_, Critical<&mut Host<'_>>>, ()>::decode_from(&mut encoder);
+        assert_send(&read);
+    }
+    let mut decoder = QpackDecoderStream::new(Host::new(Dribble::new(&input, 1)));
+    assert_send(&decoder);
+    {
+        let read = ReadValue::<DecoderInstruction, ()>::decode_from(&mut decoder);
+        assert_send(&read);
+    }
+    let mut host = Host::new(Dribble::new(&input, 1));
+    let mut decoder = QpackDecoderStream::new(&mut host);
+    assert_send(&decoder);
+    {
+        let read = ReadValue::<DecoderInstruction, ()>::decode_from(&mut decoder);
+        assert_send(&read);
+    }
+}
+
+#[test]
+fn the_frame_reads_and_writes_are_send_when_the_access_is() {
+    let input = [0x07, 0x01, 0x04];
+    // The stages of a frame.
+    let staged = Frame::<GoawayFrameType, FramePayload<_>, ()>::decode_from(Host::new(
+        Dribble::new(&input, 1),
+    ));
+    assert_send(&staged);
+    let mut frame = run(staged).0.unwrap();
+    assert_send(&frame);
+    {
+        let read = frame
+            .payload()
+            .decode::<ReadValue<VarIntField<GoawayId>, ()>, _>();
+        assert_send(&read);
+    }
+    // A whole frame.
+    let whole = GoawayFrame::<()>::decode_from(Host::new(Dribble::new(&input, 1)));
+    assert_send(&whole);
+    // Writing a frame.
+    let data = [1u8, 2, 3];
+    let frame = run(Frame::new(
+        DataFrameType,
+        Chunks {
+            source: ConstructedAccess::new(&data[..]),
+            chunk_maximum: core::num::NonZeroUsize::new(2).unwrap(),
+        },
+    ))
+    .0
+    .unwrap();
+    let write = frame.encode_into(ConstructedAccess::new(Vec::<u8>::new()));
+    assert_send(&write);
+}
+
+#[test]
+fn the_control_and_push_streams_and_their_reads_are_send_when_the_receiver_is() {
+    // A control stream: SETTINGS, then a GOAWAY.
+    let control = [0x00, 0x04, 0x00, 0x07, 0x01, 0x04];
+    let start = read_unidirectional_stream::<Parts, ClientInitiatedUnidirectional, _, ()>(
+        Host::new(Dribble::new(&control, 1)),
+    );
+    assert_send(&start);
+    let ReceivedStream::Known(known) = run(start).0.unwrap().unwrap().transpose() else {
+        panic!("a known stream");
+    };
+    let Coproduct::Inl(http3) = known.transpose() else {
+        panic!("an HTTP/3 stream");
+    };
+    let Http3UnidirectionalStream::Control(stream) = http3.transpose() else {
+        panic!("a control stream");
+    };
+    let mut stream = stream.into_stream();
+    assert_send(&stream);
+    {
+        let next = stream.next_frame();
+        assert_send(&next);
+    }
+    // A push stream: Push ID 1, then a DATA frame.
+    let push = [0x01, 0x01, 0x00, 0x01, b'a'];
+    let start = read_unidirectional_stream::<Parts, ServerInitiatedUnidirectional, _, ()>(
+        Host::new(Dribble::new(&push, 1)),
+    );
+    let ReceivedStream::Known(known) = run(start).0.unwrap().unwrap().transpose() else {
+        panic!("a known stream");
+    };
+    let Coproduct::Inl(http3) = known.transpose() else {
+        panic!("an HTTP/3 stream");
+    };
+    let Http3UnidirectionalStream::Push(stream) = http3.transpose() else {
+        panic!("a push stream");
+    };
+    let mut stream = stream.into_stream();
+    assert_send(&stream);
+    {
+        let next = stream.frames().next_frame();
+        assert_send(&next);
+    }
 }

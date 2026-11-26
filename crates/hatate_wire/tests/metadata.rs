@@ -3,7 +3,6 @@
 //! fields made of them, and the payload's own reads report theirs.
 use bytes::{Buf, BufMut};
 use core::{
-    convert::Infallible,
     num::NonZeroUsize,
     pin::Pin,
     task::{Context, Poll},
@@ -66,13 +65,13 @@ impl<'a> Arrival<'a> {
 family_receiver!(impl ['a] for Arrival<'a>);
 
 impl Read for Arrival<'_> {
-    type Error = Infallible;
+    type Error = !;
     type Metadata = Early;
     fn poll_read<'v, O: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'v>>,
         _: &mut Context<'_>,
         out: &mut O,
-    ) -> Poll<Result<Option<ReadSegment<Early>>, Infallible>>
+    ) -> Poll<Result<Option<ReadSegment<Early>>, !>>
     where
         Self: 'v,
     {
@@ -95,7 +94,7 @@ impl Skip for Arrival<'_> {
         host: Pin<&mut Self::ReceiverView<'v>>,
         _: &mut Context<'_>,
         maximum: M,
-    ) -> Poll<Result<Option<usize>, Infallible>>
+    ) -> Poll<Result<Option<usize>, !>>
     where
         Self: 'v,
     {
@@ -289,13 +288,13 @@ struct Tally {
 family_receiver!(impl [] for Tally);
 
 impl Write for Tally {
-    type Error = Infallible;
+    type Error = !;
     type Report = Writes;
     fn poll_write<'v, B: Buf + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'v>>,
         _: &mut Context<'_>,
         input: &mut B,
-    ) -> Poll<Result<Option<WriteSegment<Writes>>, Infallible>>
+    ) -> Poll<Result<Option<WriteSegment<Writes>>, !>>
     where
         Self: 'v,
     {

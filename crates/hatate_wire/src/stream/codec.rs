@@ -37,7 +37,7 @@ pub type ReceivedBidirectionalStream<L, C, I, M = ()> =
 ///
 /// `io` is the stream and is passed through. The type keeps the width it
 /// was read with. Name the parts and the class with a turbofish:
-/// `read_unidirectional_stream::<Parts, ClientInitiatedUnidirectional, _>(io)`.
+/// `read_unidirectional_stream::<Parts, ClientInitiatedUnidirectional, _, ()>(io)`.
 /// Streams are read concurrently: one whose start has not arrived does not
 /// hold up the others. The metadata of the bytes of the type is kept
 /// ([`UnidirectionalStream::type_metadata`]).
@@ -157,7 +157,7 @@ impl<E: ErrorCodeOf<ErrorCode>, P: ErrorCodeOf<ErrorCode>, R: ErrorCodeOf<ErrorC
 /// the type of a reserved frame is judged by the parts, which are told
 /// whether anything was skipped. A request stream comes back at its first
 /// frame. Name the parts and the class with a turbofish:
-/// `read_bidirectional_stream::<Parts, ClientInitiatedBidirectional, _>(io)`.
+/// `read_bidirectional_stream::<Parts, ClientInitiatedBidirectional, _, ()>(io)`.
 ///
 /// Returns `None` if the stream ends before such a value. The parts do not
 /// judge such a stream, so on a class that HTTP/3 does not use, the

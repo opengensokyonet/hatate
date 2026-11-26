@@ -48,8 +48,10 @@ pub(crate) async fn read_length<S: AsAccess<Family: Read<Metadata = M>>, M: Comb
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum ReadFrameError<E> {
-    /// The Type could not be read: the stream failed, or ended after the
-    /// first byte of the Type.
+    /// The Type could not be read: the stream failed, or ended before the
+    /// Type was whole. Ended before its first byte, the stream ended at a
+    /// frame boundary, which [`FrameStream`](crate::stream::FrameStream)
+    /// reports as the end of the frames.
     #[snafu(display("could not read frame type"))]
     Type {
         /// The failure of reading the integer.
@@ -64,14 +66,16 @@ pub enum ReadFrameError<E> {
 }
 
 /// H3_FRAME_ERROR when the stream ends inside the head of a frame
-/// ([RFC 9114 §7.1]), on a stream that ended cleanly; otherwise the code of
-/// the stream's own failure, such as H3_CLOSED_CRITICAL_STREAM on a critical
-/// stream.
+/// ([RFC 9114 §7.1]), on a stream that ended cleanly; none when it ends
+/// before the first byte of the Type, at a frame boundary, which is not a
+/// frame error; otherwise the code of the stream's own failure, such as
+/// H3_CLOSED_CRITICAL_STREAM on a critical stream.
 ///
 /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
 impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadFrameError<E> {
     fn error_code(&self) -> Option<ErrorCode> {
         match self {
+            Self::Type { source } if source.is_incomplete() && source.completed() == 0 => None,
             Self::Type { source } | Self::Length { source } => {
                 if source.is_incomplete() {
                     return Some(ErrorCode::H3_FRAME_ERROR);
@@ -243,8 +247,10 @@ pub enum WriteFrameHeadError<E> {
 /// a [`FramePayload`] that holds the source, for the caller to read
 /// ([RFC 9114 §7.1]). The Type is read as a `VarInt` and converted to `T`.
 ///
-/// To read frame after frame, with the checks of a kind of stream and the
-/// skipping of what a frame leaves, read them on a
+/// Only frame types of HTTP/2 are rejected here: whether the type may appear
+/// on the kind of stream it was read from, and whether this endpoint's role
+/// receives it, are not checked. To read frame after frame, with those
+/// checks and the skipping of what a frame leaves, read them on a
 /// [`FrameStream`](crate::stream::FrameStream).
 ///
 /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
@@ -334,6 +340,11 @@ pub enum DecodeFrameError<E, T> {
     },
     /// The type is not one the Type field holds, such as a frame of another
     /// type for a field of one frame type ([`FrameTypeMismatchError`](super::FrameTypeMismatchError)).
+    ///
+    /// The source is then inside the head of the frame, after the Type and
+    /// before the Length, and cannot be read on as frames: give it up. To
+    /// pick frames by their type, read them on a
+    /// [`FrameStream`](crate::stream::FrameStream).
     #[snafu(display("frame type does not convert to the type of the field"))]
     Type {
         /// The failure of converting it.
@@ -443,7 +454,11 @@ impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadVarIntError<Paylo
 /// reported: such as a source whose exact length ([`ExactLen`](nitori_io::ExactLen))
 /// is wrong, or a payload swapped for one of another length
 /// ([`Frame::map_payload`]). A frame with such a payload would be written
-/// with a head that does not match it.
+/// with a head that does not match it. A frame that was read keeps the
+/// Length of the wire, so to write it back its payload must write as many
+/// bytes as it read: a payload that writes a value at another width than
+/// the one it read, such as at its shortest, panics on a peer's longer
+/// encoding.
 impl<S, T, P, M, O, E> EncodeInto<S> for Frame<T, P, M>
 where
     S: AsAccess<Family: Write<Report: Combine>>,

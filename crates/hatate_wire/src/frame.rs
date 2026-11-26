@@ -31,7 +31,6 @@ use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 use set::FrameKind;
 use snafu::Snafu;
 
-#[allow(missing_docs)] // The call macro also generates operation and extension trait items.
 pub mod codec;
 pub mod control;
 pub mod payload;
@@ -363,8 +362,7 @@ impl From<GoawayId> for VarInt {
 /// The widths of the Type and Length of a frame whose Length the payload
 /// determines. Every width holds the Type of a frame of RFC 9114 and the
 /// Length of a CANCEL_PUSH, GOAWAY or MAX_PUSH_ID; the Length of a SETTINGS
-/// or PUSH_PROMISE frame may not fit, which building or writing the frame
-/// reports.
+/// frame may not fit, which building or writing the frame reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameWidths {
     type_width: VarIntWidth,
@@ -425,8 +423,10 @@ impl<T: ClaimedValue> FrameType<T> {
 
 /// The type `value` as the list reads it: a type it has on this kind of
 /// stream, else reserved, else unknown. A type the list claims for other
-/// kinds of stream, or one of HTTP/2, is unknown here; reading a frame
-/// rejects it before it becomes a `FrameType`.
+/// kinds of stream, or one of HTTP/2, is unknown here; a
+/// [`FrameStream`](crate::stream::FrameStream) rejects it before it becomes
+/// a `FrameType`, while decoding a frame in stages rejects only the types of
+/// HTTP/2.
 impl<T: ClaimedValue> From<VarInt> for FrameType<T> {
     fn from(value: VarInt) -> Self {
         match T::of(value) {

@@ -180,7 +180,7 @@ macro_rules! drain_literal {
     }};
 }
 
-fn describe<A: ReceiverAccess, E: Debug>(
+fn describe<A: ReceiverAccess<Family: Read>, E: Debug>(
     result: Result<Option<Started<'_, A>>, StartError<E>>,
 ) -> String {
     match result {
@@ -572,4 +572,50 @@ fn a_decoder_read_dropped_in_the_middle_behaves_as_it_does_in_a_call() {
             .iter()
             .any(|(_, again, _)| again.contains("Interrupted"))
     );
+}
+
+fn assert_send<T: Send>(_: &T) {}
+
+#[test]
+fn the_instruction_streams_and_their_futures_are_send_when_the_receiver_is() {
+    let wire = [0x3f, 0xbd, 0x01];
+    // The access held by value.
+    let mut encoder = encoder_stream(ConstructedAccess::new(Trickle::new(&wire)));
+    assert_send(&encoder);
+    {
+        let next = next_encoder(&mut encoder, 64, 64);
+        assert_send(&next);
+    }
+    // The access held by `&mut`.
+    let mut host = ConstructedAccess::new(Trickle::new(&wire));
+    let mut encoder = encoder_stream(&mut host);
+    assert_send(&encoder);
+    {
+        let next = next_encoder(&mut encoder, 64, 64);
+        assert_send(&next);
+    }
+    // The start of a value, opened.
+    let mut encoder = encoder_stream(ConstructedAccess::new(Trickle::new(ENCODER_WIRE)));
+    let _ = run(next_encoder(&mut encoder, 64, 64));
+    let Some(Started::InsertWithNameReference { value, .. }) =
+        run(next_encoder(&mut encoder, 64, 64)).0.unwrap()
+    else {
+        panic!("not an insertion with a reference");
+    };
+    assert_send(&value);
+    let open = value.open::<()>();
+    assert_send(&open);
+    let mut decoder = decoder_stream(ConstructedAccess::new(Trickle::new(&wire)));
+    assert_send(&decoder);
+    {
+        let next = next_decoder(&mut decoder, 8);
+        assert_send(&next);
+    }
+    let mut host = ConstructedAccess::new(Trickle::new(&wire));
+    let mut decoder = decoder_stream(&mut host);
+    assert_send(&decoder);
+    {
+        let next = next_decoder(&mut decoder, 8);
+        assert_send(&next);
+    }
 }

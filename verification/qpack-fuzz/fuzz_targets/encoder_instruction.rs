@@ -174,7 +174,11 @@ async fn parse<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
 }
 
 #[call(sync)]
-async fn write_literals<N: Read<Metadata = ()> + ExactLen<LengthError = !>, V: Read<Metadata = ()> + ExactLen<LengthError = !>, W: Write<Report = ()>>(
+async fn write_literals<
+    N: Read<Metadata = ()> + ExactLen<LengthError = !>,
+    V: Read<Metadata = ()> + ExactLen<LengthError = !>,
+    W: Write<Report = ()>,
+>(
     name: &mut impl ReceiverAccess<Family = N>,
     value: &mut impl ReceiverAccess<Family = V>,
     out: &mut impl ReceiverAccess<Family = W>,
@@ -265,10 +269,7 @@ fuzz_target!(|data: &[u8]| {
         let mut input = src;
         let actual = input.sync_parse_unpin(wire, decoded, block);
         // The stream is not empty, so it cannot end at the boundary.
-        assert_eq!(
-            actual,
-            expected.map_or(Outcome::Failed, Outcome::Item)
-        );
+        assert_eq!(actual, expected.map_or(Outcome::Failed, Outcome::Item));
         assert!(before.len() - input.len() <= size);
         if actual == Outcome::Failed {
             return;

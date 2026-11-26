@@ -563,3 +563,66 @@ fn a_frame_in_stages_is_of_its_type() {
     );
     assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_UNEXPECTED));
 }
+
+#[test]
+fn a_stream_that_ends_at_a_frame_boundary_is_no_frame_error() {
+    // Ended before the first byte of the Type: at a frame boundary.
+    let error = (&[][..]).sync_staged_unpin().unwrap_err();
+    assert!(matches!(error, DecodeFrameError::Head { .. }), "{error:?}");
+    assert_eq!(error.error_code(), None);
+    // Ended inside the Type or after it, inside the head of a frame.
+    let error = (&[0x40][..]).sync_staged_unpin().unwrap_err();
+    assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
+    let error = (&[0x01][..]).sync_staged_unpin().unwrap_err();
+    assert_eq!(error.error_code(), Some(ErrorCode::H3_FRAME_ERROR));
+}
+
+/// Two integers of a payload, as one value whose fields are read with their
+/// own `decode_from`, as [`FramePayload::decode`] asks.
+#[derive(Debug, PartialEq, Eq)]
+struct Pair(u64, u64);
+
+impl<'a, S> DecodeFrom<&'a mut FramePayload<S>> for Pair
+where
+    S: AsAccess<Family: Read<Metadata = ()>>,
+{
+    type Error = sakuya_var_int::stream::ReadVarIntError<PayloadError<<S::Family as Read>::Error>>;
+
+    async fn decode_from(source: &'a mut FramePayload<S>) -> Result<Self, Self::Error> {
+        let first = VarIntField::<VarInt>::decode_from(&mut *source).await?;
+        let second = VarIntField::<VarInt>::decode_from(&mut *source).await?;
+        Ok(Self(first.get().get(), second.get().get()))
+    }
+}
+
+/// Opens the payload, drops a read of a [`Pair`] after `polls` polls, and
+/// reads a pair again.
+#[call(sync)]
+async fn drop_a_pair<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    polls: usize,
+) -> Result<Pair, sakuya_var_int::stream::ReadVarIntError<PayloadError<F::Error>>>
+where
+    <F as Read>::Error: core::fmt::Debug,
+{
+    let mut payload = open(io).await;
+    drop_after(payload.decode::<Pair, _>(), polls);
+    payload.decode::<Pair, _>().await
+}
+
+#[test]
+fn a_value_dropped_between_its_fields_interrupts_the_payload() {
+    let wire = data(&[0x01, 0x02, 0x03, 0x04]);
+    // Dropped after its first field, the pair has read some of its bytes.
+    let mut host = Dribble::new(&wire, 1);
+    let (result, _) = run(host.drop_a_pair_unpin(2));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error.host_error(), Some(PayloadError::Interrupted)),
+        "{error:?}"
+    );
+    // Dropped before its first byte, it is read again.
+    let mut host = Dribble::new(&wire, 1);
+    let (result, _) = run(host.drop_a_pair_unpin(1));
+    assert_eq!(result.unwrap(), Pair(1, 2));
+}

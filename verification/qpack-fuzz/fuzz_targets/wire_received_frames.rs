@@ -30,7 +30,9 @@ use frunk_core::HList;
 use hatate_wire::{
     Role,
     error_code::{ErrorCode, ErrorCodeOf},
-    frame::codec::{EncodeFrameError, ReadFrameError, ReadFrameHeadError, UnexpectedFrameTypeError},
+    frame::codec::{
+        EncodeFrameError, ReadFrameError, ReadFrameHeadError, UnexpectedFrameTypeError,
+    },
     stream::{
         FrameStream, NextFrameError,
         kind::{ControlStreamKind, PushStreamKind, RequestStreamKind},
@@ -92,7 +94,12 @@ impl Read for Arrival<'_> {
         let (head, tail) = this.input.split_at(count);
         dst.put_slice(head);
         this.input = tail;
-        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| nitori_io::ReadSegment { count, metadata: () })))
+        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| {
+            nitori_io::ReadSegment {
+                count,
+                metadata: (),
+            }
+        })))
     }
 }
 
@@ -270,7 +277,9 @@ async fn frames_of<I, B>(
     known: bool,
 ) -> Outcome
 where
-    I: ReceiverAccess<Family: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>>,
+    I: ReceiverAccess<
+        Family: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
+    >,
     B: ReceiverAccess<Family: Write<Error = Infallible, Report = ()>>,
 {
     match kind & 3 {
@@ -282,7 +291,10 @@ where
 
 /// [`frames_of`] on a host that skips by itself.
 #[call(sync)]
-async fn native<F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>, W: Write<Error = Infallible, Report = ()>>(
+async fn native<
+    F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
+    W: Write<Error = Infallible, Report = ()>,
+>(
     io: &mut impl ReceiverAccess<Family = F>,
     out: &mut impl ReceiverAccess<Family = W>,
     kind: u8,
@@ -295,7 +307,10 @@ async fn native<F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible,
 
 /// [`frames_of`] on a host that only reads, made to skip by [`ReadSkip`].
 #[call(sync)]
-async fn by_reading<F: Read<Error = Infallible, Metadata = ()>, W: Write<Error = Infallible, Report = ()>>(
+async fn by_reading<
+    F: Read<Error = Infallible, Metadata = ()>,
+    W: Write<Error = Infallible, Report = ()>,
+>(
     io: &mut impl ReceiverAccess<Family = F>,
     out: &mut impl ReceiverAccess<Family = W>,
     kind: u8,

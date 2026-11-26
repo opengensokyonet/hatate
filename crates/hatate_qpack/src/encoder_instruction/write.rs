@@ -16,6 +16,10 @@ use snafu::{ResultExt, Snafu};
 
 /// A source of the exact bytes to put on the wire for one literal.
 /// In both cases the advertised length is the encoded payload length.
+///
+/// The source states its length up front ([`ExactLen`]),
+/// which must not fail, since the length is written before the bytes. The
+/// metadata of what it reads is not carried into the write.
 pub enum Payload<S> {
     /// Uncompressed bytes.
     Raw(S),

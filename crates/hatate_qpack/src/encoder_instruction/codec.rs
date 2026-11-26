@@ -4,7 +4,7 @@ use crate::{
     instruction::{self, NumberError, OctetError, WireBudget, WireLimitError},
     static_table,
 };
-use nitori_call::{ReceiverAccess, call};
+use nitori_call::ReceiverAccess;
 use nitori_io::Read;
 use snafu::{ResultExt, Snafu};
 
@@ -95,7 +95,6 @@ pub enum StartError<E> {
     Name { source: LiteralHeaderError<E> },
 }
 
-#[call(sync)]
 pub(crate) async fn read_head<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     budget: &mut WireBudget,
@@ -165,7 +164,6 @@ pub enum ValueError<E> {
     Value { source: LiteralHeaderError<E> },
 }
 
-#[call(sync)]
 pub(crate) async fn read_value_header<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     budget: &mut WireBudget,

@@ -7,18 +7,18 @@ use core::{
     task::{Context, Poll, ready},
 };
 use nitori_call::{Compose, Composed, ReceiverAccess, ReceiverFamily};
-use nitori_io::{ChunkSegment, Read, ReadChunk, ReadSegment};
+use nitori_io::{ChunkSegment, Combine, Read, ReadChunk, ReadSegment};
 use snafu::Snafu;
 
 use crate::huffman::{self, SymbolDecoder};
 
 /// Access to the current literal. Raw chunks retain the host's chunk type.
 /// A Huffman read decodes into storage supplied by the consumer.
-pub enum LiteralSource<'a, A: ReceiverAccess> {
+pub enum LiteralSource<'a, A: ReceiverAccess<Family: Read>> {
     /// A bounded source providing the parent's read capabilities.
     Raw(Composed<&'a mut A, &'a mut RawLiteral>),
     /// A bounded, decoded source implementing [`Read`].
-    Huffman(Composed<&'a mut A, &'a mut HuffmanLiteral>),
+    Huffman(Composed<&'a mut A, &'a mut HuffmanLiteral<<A::Family as Read>::Metadata>>),
 }
 
 /// Receiver family for a literal composed onto its parent stream.
@@ -65,7 +65,20 @@ macro_rules! compose_literal {
     };
 }
 compose_literal!(RawLiteral);
-compose_literal!(HuffmanLiteral);
+
+impl<M: Unpin, F: ReceiverFamily> Compose<F> for HuffmanLiteral<M> {
+    type Family = Source<Self, F>;
+    fn compose<'v>(self: Pin<&'v mut Self>, parent: F::ReceiverView<'v>) -> SourceView<'v, Self, F>
+    where
+        F: 'v,
+        Self::Family: 'v,
+    {
+        SourceView {
+            parent,
+            state: self.get_mut(),
+        }
+    }
+}
 
 /// The original stream could not supply the literal's declared payload.
 #[derive(Debug, Snafu)]
@@ -89,7 +102,8 @@ pub enum InputError<E> {
 
 type RawPoll<F> =
     Poll<Result<Option<ReadSegment<<F as Read>::Metadata>>, InputError<<F as Read>::Error>>>;
-type HuffmanPoll<F> = Poll<Result<Option<ReadSegment<()>>, HuffmanReadError<<F as Read>::Error>>>;
+type HuffmanPoll<F> =
+    Poll<Result<Option<ReadSegment<<F as Read>::Metadata>>, HuffmanReadError<<F as Read>::Error>>>;
 
 /// Composition state for raw input, excluding all following fields.
 pub struct RawLiteral {
@@ -239,16 +253,26 @@ enum Decoding {
 
 /// Pull-based decoding state. A bounded encoded input window survives
 /// suspension. Decoded bytes go directly into the consumer's buffer.
-pub struct HuffmanLiteral {
+///
+/// `M` is the metadata of the parent's segments. A segment of decoded bytes
+/// carries the merged metadata of the encoded input it was decoded from,
+/// and of the input window the segment before it ended in, whose bits can
+/// begin its first byte.
+pub struct HuffmanLiteral<M = ()> {
     input: RawLiteral,
     decoding: Decoding,
     encoded: [u8; 64],
     pos: usize,
     end: usize,
     used_bits: u8,
+    /// The metadata of the segment of the parent in the input window.
+    window: M,
+    /// The metadata of the input read since the last segment of decoded
+    /// bytes, and of the window that segment ended in.
+    unreported: M,
 }
 
-impl HuffmanLiteral {
+impl<M: Default> HuffmanLiteral<M> {
     pub(crate) fn new(encoded_len: usize, limit: usize) -> Self {
         Self {
             input: RawLiteral::new(encoded_len),
@@ -261,29 +285,37 @@ impl HuffmanLiteral {
             pos: 0,
             end: 0,
             used_bits: 0,
+            window: M::default(),
+            unreported: M::default(),
         }
     }
-    fn poll<'v, F: Read + 'v, O: BufMut + ?Sized>(
+}
+
+impl<M: Combine + Clone> HuffmanLiteral<M> {
+    /// The segment of `written` decoded bytes, if any, with the metadata of
+    /// the input they came from. The window stays unreported, since its
+    /// bits can go on into the next segment.
+    fn segment(&mut self, written: usize) -> Option<ReadSegment<M>> {
+        let count = NonZeroUsize::new(written)?;
+        let metadata = core::mem::replace(&mut self.unreported, self.window.clone());
+        Some(ReadSegment { count, metadata })
+    }
+
+    fn poll<'v, F: Read<Metadata = M> + 'v, O: BufMut + ?Sized>(
         &mut self,
         mut parent: Pin<&mut F::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         dst: &mut O,
     ) -> HuffmanPoll<F> {
-        let segment = |written: usize| {
-            NonZeroUsize::new(written).map(|count| ReadSegment {
-                count,
-                metadata: (),
-            })
-        };
         let mut written = 0;
         loop {
             let decoder = match &mut self.decoding {
                 Decoding::Active(decoder) => decoder,
-                Decoding::Done(_) => return Poll::Ready(Ok(segment(written))),
+                Decoding::Done(_) => return Poll::Ready(Ok(self.segment(written))),
                 Decoding::Failed => return Poll::Ready(Err(HuffmanReadError::Failed)),
                 Decoding::Deferred(_) => {
                     if written > 0 {
-                        return Poll::Ready(Ok(segment(written)));
+                        return Poll::Ready(Ok(self.segment(written)));
                     }
                     let Decoding::Deferred(source) =
                         core::mem::replace(&mut self.decoding, Decoding::Failed)
@@ -302,12 +334,12 @@ impl HuffmanLiteral {
             }
             let capacity = dst.remaining_mut();
             if capacity == 0 {
-                return Poll::Ready(Ok(segment(written)));
+                return Poll::Ready(Ok(self.segment(written)));
             }
             if self.pos == self.end {
                 // Never report Pending or a host failure after emitting bytes.
                 if written > 0 {
-                    return Poll::Ready(Ok(segment(written)));
+                    return Poll::Ready(Ok(self.segment(written)));
                 }
                 let request = capacity
                     .saturating_mul(30)
@@ -317,7 +349,13 @@ impl HuffmanLiteral {
                 self.end = match ready!(self.input.poll::<F, _>(parent.as_mut(), cx, &mut buffer)) {
                     // The request is nonempty, so the literal reports a segment
                     // or an error; `None` would only be an empty request.
-                    Ok(read) => read.map_or(0, |segment| segment.count.get()),
+                    Ok(None) => 0,
+                    Ok(Some(segment)) => {
+                        self.window = segment.metadata.clone();
+                        let unreported = core::mem::take(&mut self.unreported);
+                        self.unreported = unreported.combine(segment.metadata);
+                        segment.count.get()
+                    }
                     Err(source) => {
                         self.decoding = Decoding::Failed;
                         return Poll::Ready(Err(HuffmanReadError::Input { source }));
@@ -343,16 +381,19 @@ impl HuffmanLiteral {
     }
 }
 
-impl<F: Read> Read for Source<HuffmanLiteral, F> {
+/// The decoded bytes, each segment with the merged metadata of the encoded
+/// input it came from ([`HuffmanLiteral`]).
+impl<F: Read> Read for Source<HuffmanLiteral<F::Metadata>, F>
+where
+    F::Metadata: Combine + Clone,
+{
     type Error = HuffmanReadError<F::Error>;
-    // Decoded bytes can span several segments of the parent, so they carry
-    // no attributes of their own.
-    type Metadata = ();
+    type Metadata = F::Metadata;
     fn poll_read<'v, O: BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'v>>,
         cx: &mut Context<'_>,
         dst: &mut O,
-    ) -> Poll<Result<Option<ReadSegment<()>>, Self::Error>>
+    ) -> Poll<Result<Option<ReadSegment<F::Metadata>>, Self::Error>>
     where
         Self: 'v,
     {
@@ -361,9 +402,9 @@ impl<F: Read> Read for Source<HuffmanLiteral, F> {
     }
 }
 
-pub(crate) enum Literal {
+pub(crate) enum Literal<M = ()> {
     Raw { state: RawLiteral, length: usize },
-    Huffman(HuffmanLiteral),
+    Huffman(HuffmanLiteral<M>),
 }
 impl Literal {
     pub(super) fn new(coded: bool, length: usize, limit: usize) -> Self {
@@ -376,10 +417,32 @@ impl Literal {
             }
         }
     }
-    pub(super) fn source<'a, A: ReceiverAccess>(
+    /// The literal, read from a source whose segments have metadata `M`.
+    /// Nothing of it has been read yet.
+    pub(super) fn with_metadata<M: Default>(self) -> Literal<M> {
+        match self {
+            Self::Raw { state, length } => Literal::Raw { state, length },
+            Self::Huffman(state) => Literal::Huffman(HuffmanLiteral {
+                input: state.input,
+                decoding: state.decoding,
+                encoded: state.encoded,
+                pos: state.pos,
+                end: state.end,
+                used_bits: state.used_bits,
+                window: M::default(),
+                unreported: M::default(),
+            }),
+        }
+    }
+}
+impl<M> Literal<M> {
+    pub(super) fn source<'a, A: ReceiverAccess<Family: Read<Metadata = M>>>(
         &'a mut self,
         io: &'a mut A,
-    ) -> LiteralSource<'a, A> {
+    ) -> LiteralSource<'a, A>
+    where
+        M: Unpin,
+    {
         match self {
             Self::Raw { state, .. } => LiteralSource::Raw(io.compose(state)),
             Self::Huffman(state) => LiteralSource::Huffman(io.compose(state)),

@@ -12,7 +12,6 @@ use snafu::{ResultExt, Snafu};
 /// was read: the step that decoding from a
 /// [`DecoderStream`](super::DecoderStream) takes after the first octet. `budget` has already counted the first
 /// octet. EOF inside a number is attributed to that instruction's field.
-#[call(sync)]
 pub(crate) async fn read_decoder_instruction<
     F: Read<Metadata = ()>,
     A: ReceiverAccess<Family = F>,

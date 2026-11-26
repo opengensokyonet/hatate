@@ -75,7 +75,7 @@ fn huge_capacities_saturate() {
 }
 
 #[test]
-fn the_defaults_are_those_of_a_table_that_cannot_hold_an_entry() {
+fn the_defaults_are_those_of_a_table_of_capacity_0() {
     // SETTINGS_QPACK_MAX_TABLE_CAPACITY is 0 until a SETTINGS frame says
     // otherwise (RFC 9204 Section 5).
     assert_eq!(
@@ -298,4 +298,38 @@ fn the_wire_limit_of_a_capacity_admits_an_insertion_at_the_longest_huffman_wire(
     }
     assert_eq!(decoded, [10]);
     let _ = name.finish().unwrap();
+}
+
+#[test]
+fn the_defaults_bound_the_literals_only() {
+    // With no literal octet allowed, an insertion that has none passes the
+    // limits, though its entry of 32 octets does not fit a capacity of 0:
+    // a referenced name and an empty value, and an empty name and value.
+    let wire = [0xc0, 0x00, 0x40, 0x00];
+    let mut stream = EncoderStream::new(
+        ConstructedAccess::new(&wire[..]),
+        EncoderStreamLimits::default(),
+    );
+    let Ok(Some(Started::InsertWithNameReference { value, .. })) = run(next_encoder(&mut stream))
+    else {
+        panic!("an insertion with a name reference");
+    };
+    run(value.open()).unwrap().value.finish().unwrap();
+    let Ok(Some(Started::InsertWithLiteralName(name))) = run(next_encoder(&mut stream)) else {
+        panic!("an insertion with a literal name");
+    };
+    let value = name.finish().unwrap();
+    run(value.open()).unwrap().value.finish().unwrap();
+    // A name of one octet is past them.
+    let wire = [0x41, b'x', 0x00];
+    let mut stream = EncoderStream::new(
+        ConstructedAccess::new(&wire[..]),
+        EncoderStreamLimits::default(),
+    );
+    assert!(matches!(
+        run(next_encoder(&mut stream)),
+        Err(StartError::Name {
+            source: LiteralHeaderError::DecodedLength { .. }
+        })
+    ));
 }

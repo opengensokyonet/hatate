@@ -11,7 +11,7 @@ use hatate_wire::{
     frame::{
         Frame, FrameWidths, Http3FrameType, PushId, PushPromiseFrameType,
         payload::{FramePayload, PayloadError},
-        push_promise::{PushPromisePayload, ReadPushPromisePushIdError},
+        push_promise::{DecodePushPromisePayloadError, PushPromisePayload},
     },
     stream::{FrameStream, kind::RequestStreamKind},
 };
@@ -38,7 +38,7 @@ struct Promise {
 #[call(sync)]
 async fn read_promise<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
-) -> Result<Promise, ReadPushPromisePushIdError<ReadVarIntError<PayloadError<F::Error>>>>
+) -> Result<Promise, DecodePushPromisePayloadError<ReadVarIntError<PayloadError<F::Error>>>>
 where
     <F as Read>::Error: core::fmt::Debug,
 {

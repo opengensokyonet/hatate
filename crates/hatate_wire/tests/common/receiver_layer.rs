@@ -2,7 +2,6 @@
 //! they share: the same script on the call layer and on every way of holding
 //! a receiver.
 use core::{
-    convert::Infallible,
     fmt::Debug,
     marker::PhantomPinned,
     pin::Pin,
@@ -32,7 +31,7 @@ impl<'a> Fixed<'a> {
 nitori_call::family_receiver!(impl ['a] for Fixed<'a>);
 
 impl Read for Fixed<'_> {
-    type Error = Infallible;
+    type Error = !;
     type Metadata = ();
     fn poll_read<'visit, B: bytes::BufMut + ?Sized>(
         host: Pin<&mut Self::ReceiverView<'visit>>,

@@ -108,6 +108,12 @@ impl<S: AsAccess> FramePayload<S> {
     /// [`FrameStream::next_frame`](crate::stream::FrameStream::next_frame)).
     /// Decoding `V` from the payload directly does not detect it.
     ///
+    /// One value is followed at a time. A value read through `decode` reads
+    /// its own fields with their `decode_from` on the payload, not with
+    /// `decode`: a call of `decode` inside another ends the following of
+    /// the outer value, which, dropped between two of its fields, would then
+    /// go undetected.
+    ///
     /// # Errors
     ///
     /// The value's error.

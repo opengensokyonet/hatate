@@ -97,7 +97,12 @@ impl Read for Arrival<'_> {
         let (head, tail) = this.input.split_at(count);
         dst.put_slice(head);
         this.input = tail;
-        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| nitori_io::ReadSegment { count, metadata: () })))
+        Poll::Ready(Ok(core::num::NonZeroUsize::new(count).map(|count| {
+            nitori_io::ReadSegment {
+                count,
+                metadata: (),
+            }
+        })))
     }
 }
 

@@ -44,14 +44,22 @@ pub enum NameReference {
 /// They are checked as each instruction is read and apply to the instructions
 /// read after they are set. The defaults are those of a peer that has not been
 /// given a dynamic table: see [`for_table_capacity`](Self::for_table_capacity).
+///
+/// They bound what reading an instruction takes, not what the dynamic table
+/// holds: the name of an insertion that references an entry does not count
+/// toward `max_decoded_len`, nor do the 32 octets an entry adds to its name
+/// and value (RFC 9204 §3.2.1). Whether an inserted entry fits the table's
+/// current capacity (RFC 9204 §3.2.2) is for the decoder that keeps the
+/// table to check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EncoderStreamLimits {
     /// The most wire octets one instruction may take, counting every prefix,
     /// integer and literal payload of it.
     pub max_wire_len: usize,
-    /// The most octets the name and the value of an insertion may have
-    /// together once decoded; the Huffman literals count their decoded
-    /// octets.
+    /// The most octets the literals of an insertion, its name if it has one
+    /// and its value, may have together once decoded; the Huffman literals
+    /// count their decoded octets. A name taken from a table entry does not
+    /// count.
     pub max_decoded_len: usize,
 }
 
@@ -66,9 +74,12 @@ impl EncoderStreamLimits {
     /// (SETTINGS_QPACK_MAX_TABLE_CAPACITY, RFC 9204 §5).
     ///
     /// An entry takes the lengths of its name and value and 32 octets (RFC
-    /// 9204 §3.2.1), so the name and the value of an insertion together have
-    /// at most `capacity` less 32 octets (none if the capacity is less than
-    /// 32), saturating at `usize::MAX`: that is `max_decoded_len`.
+    /// 9204 §3.2.1), so the name and the value of an entry that fits together
+    /// have at most `capacity` less 32 octets (none if the capacity is less
+    /// than 32), saturating at `usize::MAX`: that is `max_decoded_len`. It
+    /// bounds the literals only; an insertion within these limits can still
+    /// make an entry larger than `capacity`, such as an empty name and value,
+    /// or a long name referenced from a table.
     ///
     /// `max_wire_len` is what an insertion of that size can take on the wire
     /// at most: two prefixed integers, each of at most 11 octets (the
@@ -104,7 +115,9 @@ impl EncoderStreamLimits {
 
 /// The limits of a peer that has not been given a dynamic table: those of a
 /// capacity of 0, the value of SETTINGS_QPACK_MAX_TABLE_CAPACITY until a
-/// SETTINGS frame states another (RFC 9204 §5). No insertion is within them.
+/// SETTINGS frame states another (RFC 9204 §5). No literal octet is within
+/// them; an insertion whose name is referenced and whose value is empty, or
+/// whose name and value are both empty, is.
 impl Default for EncoderStreamLimits {
     fn default() -> Self {
         Self::for_table_capacity(0)
@@ -220,7 +233,7 @@ where
                     wire,
                     decoded_left: limits.max_decoded_len,
                 },
-                literal: name,
+                literal: name.with_metadata(),
             }),
         };
         Ok(Some(ReadValue {
@@ -261,7 +274,7 @@ impl<A> EncoderStream<A> {
 
 /// A completed integer instruction or the first readable state of an insertion.
 #[must_use]
-pub enum Started<'s, A: ReceiverAccess> {
+pub enum Started<'s, A: ReceiverAccess<Family: Read>> {
     /// The new dynamic table capacity in bytes.
     SetDynamicTableCapacity(u64),
     /// Relative index of the entry to duplicate.
@@ -285,14 +298,17 @@ struct Context<'s, A> {
 
 /// Read the name before attempting to read its value header.
 #[must_use]
-pub struct Name<'s, A> {
+pub struct Name<'s, A: ReceiverAccess<Family: Read>> {
     ctx: Context<'s, A>,
-    literal: Literal,
+    literal: Literal<<A::Family as Read>::Metadata>,
 }
 
-impl<'s, A: ReceiverAccess> Name<'s, A> {
+impl<'s, A: ReceiverAccess<Family: Read>> Name<'s, A> {
     /// Borrow the name's source. Further composition preserves backpressure.
-    pub fn source(&mut self) -> LiteralSource<'_, A> {
+    pub fn source(&mut self) -> LiteralSource<'_, A>
+    where
+        <A::Family as Read>::Metadata: Unpin,
+    {
         self.literal.source(&mut self.ctx.reader.io)
     }
     /// Validate the ending of the consumed name and release its value state.
@@ -331,7 +347,7 @@ impl<'s, A: ReceiverAccess> ValueStart<'s, A> {
         Ok(ReadValue {
             value: Value {
                 ctx: self.ctx,
-                literal,
+                literal: literal.with_metadata(),
             },
             metadata: merged.0,
         })
@@ -340,14 +356,17 @@ impl<'s, A: ReceiverAccess> ValueStart<'s, A> {
 
 /// An insertion's value. Only a successful finish completes the instruction.
 #[must_use]
-pub struct Value<'s, A> {
+pub struct Value<'s, A: ReceiverAccess<Family: Read>> {
     ctx: Context<'s, A>,
-    literal: Literal,
+    literal: Literal<<A::Family as Read>::Metadata>,
 }
 
-impl<A: ReceiverAccess> Value<'_, A> {
+impl<A: ReceiverAccess<Family: Read>> Value<'_, A> {
     /// Borrow the value's source.
-    pub fn source(&mut self) -> LiteralSource<'_, A> {
+    pub fn source(&mut self) -> LiteralSource<'_, A>
+    where
+        <A::Family as Read>::Metadata: Unpin,
+    {
         self.literal.source(&mut self.ctx.reader.io)
     }
     /// Validate the consumed value's ending and enable the next instruction.

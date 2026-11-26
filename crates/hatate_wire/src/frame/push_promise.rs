@@ -41,13 +41,13 @@ where
     M: Combine + Unpin,
     ReadValue<VarIntField<PushId>, M>: for<'b> DecodeFrom<&'b mut FramePayload<S>, Error = E>,
 {
-    type Error = ReadPushPromisePushIdError<E>;
+    type Error = DecodePushPromisePayloadError<E>;
 
     async fn decode_from(source: &'a mut FramePayload<S>) -> Result<Self, Self::Error> {
         let push_id = source
             .decode::<ReadValue<VarIntField<PushId>, M>, E>()
             .await
-            .context(ReadPushPromisePushIdSnafu)?;
+            .context(DecodePushPromisePayloadSnafu)?;
         Ok(Self {
             push_id,
             section: source,
@@ -55,15 +55,15 @@ where
     }
 }
 
-/// The Push ID of a PUSH_PROMISE could not be read, failing with `E`: the
-/// payload ended before it, or the stream failed.
+/// A [`PushPromisePayload`] could not be decoded, failing with `E`: the
+/// payload ended before its Push ID, or the stream failed.
 #[derive(Debug, Snafu)]
-#[snafu(display("could not read the push ID of PUSH_PROMISE"))]
-pub struct ReadPushPromisePushIdError<E> {
+#[snafu(display("could not decode the PUSH_PROMISE payload"))]
+pub struct DecodePushPromisePayloadError<E> {
     source: E,
 }
 
-impl<E> ReadPushPromisePushIdError<E> {
+impl<E> DecodePushPromisePayloadError<E> {
     /// The failure of reading the integer.
     pub const fn read_error(&self) -> &E {
         &self.source
@@ -74,7 +74,7 @@ impl<E> ReadPushPromisePushIdError<E> {
 /// payload is shorter than the Push ID ([RFC 9114 §7.1]).
 ///
 /// [RFC 9114 §7.1]: https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
-impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadPushPromisePushIdError<E> {
+impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for DecodePushPromisePayloadError<E> {
     fn error_code(&self) -> Option<ErrorCode> {
         self.source.error_code()
     }
