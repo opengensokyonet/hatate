@@ -6,7 +6,10 @@
 #[macro_use]
 mod common;
 
-use common::{Dribble, Ty, read_some, receiver_layer::Outcome, run};
+use common::{
+    Dribble, Ty, next_critical_decoder, next_critical_encoder, read_some, receiver_layer::Outcome,
+    run,
+};
 use core::convert::Infallible;
 use frunk_core::{HList, coproduct::Coproduct};
 use hatate_qpack::encoder_instruction::{NameReference, Started, literal::LiteralSource};
@@ -108,7 +111,8 @@ macro_rules! start_log {
                         Http3UnidirectionalStream::QpackEncoder(stream) => {
                             let mut encoder = stream.into_stream();
                             loop {
-                                let started = match $w!(encoder.next_instruction(32, 32)) {
+                                let started = match $w!(next_critical_encoder(&mut encoder, 32, 32))
+                                {
                                     Ok(started) => started,
                                     Err(error) => {
                                         log.push(format!("error {:?}", error.error_code()));
@@ -127,7 +131,9 @@ macro_rules! start_log {
                                             }
                                             NameReference::Relative(n) => vec![n as u8],
                                         };
-                                        let mut value = match $w!(value.open()) {
+                                        let mut value = match $w!(value.open())
+                                            .map(|read| read.value)
+                                        {
                                             Ok(value) => value,
                                             Err(error) => {
                                                 log.push(format!("error {:?}", error.error_code()));
@@ -153,7 +159,9 @@ macro_rules! start_log {
                                                 break;
                                             }
                                         };
-                                        let mut value = match $w!(name.finish().unwrap().open()) {
+                                        let mut value = match $w!(name.finish().unwrap().open())
+                                            .map(|read| read.value)
+                                        {
                                             Ok(value) => value,
                                             Err(error) => {
                                                 log.push(format!("error {:?}", error.error_code()));
@@ -178,7 +186,7 @@ macro_rules! start_log {
                         Http3UnidirectionalStream::QpackDecoder(stream) => {
                             let mut decoder = stream.into_stream();
                             loop {
-                                match $w!(decoder.next_instruction(16)) {
+                                match $w!(next_critical_decoder(&mut decoder, 16)) {
                                     Ok(instruction) => log.push(format!("{instruction:?}")),
                                     Err(error) => {
                                         log.push(format!("error {:?}", error.error_code()));

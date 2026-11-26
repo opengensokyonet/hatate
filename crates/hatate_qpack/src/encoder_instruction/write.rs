@@ -1,12 +1,15 @@
 //! Write a single encoder instruction in wire order. An insertion borrows
 //! the writer until its value has been transferred. Keep one writer for
 //! the stream. Abandon the stream on a partial write or cancelled insertion.
+//!
+//! Each write returns the merged report of the bytes it wrote; an insertion
+//! returns the report of all of it from [`PendingValue::value`].
 use super::{NameReference, codec::DecodedLengthError};
 use crate::huffman::{DecodeError, SymbolDecoder};
 use crate::instruction::{EncodedInteger, WireBudget, WireLimitError};
 use core::num::NonZeroU64;
 use nitori_call::ReceiverAccess;
-use nitori_io::{calls::WriteAllError, prelude::*};
+use nitori_io::{Combine, calls::WriteAllError, prelude::*};
 use snafu::{ResultExt, Snafu};
 
 /// A source of the exact bytes to put on the wire for one literal.
@@ -93,7 +96,7 @@ pub enum LiteralError<R, W> {
 
 impl<A: ReceiverAccess> Writer<A>
 where
-    A::Family: Write<Report = ()>,
+    A::Family: Write<Report: Combine>,
 {
     /// Start at an instruction boundary using an owned or borrowed access.
     pub fn new(io: A) -> Self {
@@ -114,7 +117,7 @@ where
     async fn header(
         &mut self,
         encoded: &EncodedInteger,
-    ) -> Result<(), HeaderError<<A::Family as Write>::Error>> {
+    ) -> Result<<A::Family as Write>::Report, HeaderError<<A::Family as Write>::Error>> {
         self.at_boundary = false;
         self.io
             .write_all(encoded.as_slice())
@@ -126,35 +129,38 @@ where
         &mut self,
         encoded: EncodedInteger,
         max_wire_len: usize,
-    ) -> Result<(), HeaderError<<A::Family as Write>::Error>> {
+    ) -> Result<<A::Family as Write>::Report, HeaderError<<A::Family as Write>::Error>> {
         self.boundary()?;
         WireBudget::new(max_wire_len).check(encoded.as_slice().len() as u128)?;
-        self.header(&encoded).await?;
+        let report = self.header(&encoded).await?;
         self.at_boundary = true;
-        Ok(())
+        Ok(report)
     }
 
-    /// Emit one Set Dynamic Table Capacity instruction.
+    /// Emit one Set Dynamic Table Capacity instruction and return the report
+    /// of writing it.
     pub async fn set_dynamic_table_capacity(
         &mut self,
         capacity: u64,
         max_wire_len: usize,
-    ) -> Result<(), HeaderError<<A::Family as Write>::Error>> {
+    ) -> Result<<A::Family as Write>::Report, HeaderError<<A::Family as Write>::Error>> {
         self.number(EncodedInteger::new::<5>(0x20, capacity), max_wire_len)
             .await
     }
 
-    /// Emit one Duplicate instruction carrying a relative index.
+    /// Emit one Duplicate instruction carrying a relative index and return
+    /// the report of writing it.
     pub async fn duplicate(
         &mut self,
         index: u64,
         max_wire_len: usize,
-    ) -> Result<(), HeaderError<<A::Family as Write>::Error>> {
+    ) -> Result<<A::Family as Write>::Report, HeaderError<<A::Family as Write>::Error>> {
         self.number(EncodedInteger::new::<5>(0, index), max_wire_len)
             .await
     }
 
-    /// Emit an insert's name reference and return the state awaiting its value.
+    /// Emit an insert's name reference and return the state awaiting its
+    /// value, which keeps the report of what was written.
     pub async fn name_reference(
         &mut self,
         name: NameReference,
@@ -169,15 +175,17 @@ where
         let mut wire = WireBudget::new(max_wire_len);
         wire.take(header.as_slice().len() as u64)?;
         wire.check(1)?; // Even an empty value needs its length prefix.
-        self.header(&header).await?;
+        let report = self.header(&header).await?;
         Ok(PendingValue {
             writer: self,
             wire,
             decoded_left: max_decoded_len,
+            report,
         })
     }
 
-    /// Transfer a literal name before asking the caller for its value.
+    /// Transfer a literal name before asking the caller for its value. The
+    /// state awaiting the value keeps the report of what was written.
     pub async fn literal_name<F: Read + ExactLen<LengthError = !>>(
         &mut self,
         name: Payload<&mut impl ReceiverAccess<Family = F>>,
@@ -192,6 +200,7 @@ where
             writer: self,
             wire: WireBudget::new(max_wire_len),
             decoded_left: max_decoded_len,
+            report: Default::default(),
         };
         pending.transfer::<5, F>(name, 0x40, 1).await?;
         Ok(pending)
@@ -199,17 +208,26 @@ where
 }
 
 /// A name has been fully emitted. Supply the value to complete this insertion.
+/// It holds the merged report of what the insertion has written so far.
 #[must_use]
-pub struct PendingValue<'a, A> {
+pub struct PendingValue<'a, A: ReceiverAccess>
+where
+    A::Family: Write,
+{
     writer: &'a mut Writer<A>,
     wire: WireBudget,
     decoded_left: usize,
+    report: <A::Family as Write>::Report,
 }
 
 impl<A: ReceiverAccess> PendingValue<'_, A>
 where
-    A::Family: Write<Report = ()>,
+    A::Family: Write<Report: Combine>,
 {
+    fn merge(&mut self, next: <A::Family as Write>::Report) {
+        self.report = core::mem::take(&mut self.report).combine(next);
+    }
+
     async fn transfer<const N: u8, F: Read + ExactLen<LengthError = !>>(
         &mut self,
         payload: Payload<&mut impl ReceiverAccess<Family = F>>,
@@ -243,7 +261,8 @@ where
             DecodedLengthError::check(length, self.decoded_left)?;
             self.decoded_left -= length as usize;
         }
-        self.writer.header(&header).await?;
+        let report = self.writer.header(&header).await?;
+        self.merge(report);
         let mut remaining = length;
         let mut buf = [0; 1024];
         while let Some(missing) = NonZeroU64::new(remaining) {
@@ -269,26 +288,30 @@ where
                     self.decoded_left -= decoder.finish().context(literal_error::HuffmanSnafu)?;
                 }
             }
-            self.writer
+            let report = self
+                .writer
                 .io
                 .write_all(&buf[..count])
                 .await
                 .context(literal_error::SendSnafu)?;
+            self.merge(report);
         }
         Ok(())
     }
 
     /// Transfer a literal value, consuming this state. Success restores the
-    /// instruction boundary. A failure leaves the writer inside the insertion.
+    /// instruction boundary and returns the merged report of the whole
+    /// insertion: its name reference or name, and the value. A failure leaves
+    /// the writer inside the insertion.
     pub async fn value<F: Read + ExactLen<LengthError = !>>(
         mut self,
         value: Payload<&mut impl ReceiverAccess<Family = F>>,
-    ) -> Result<(), LiteralError<F::Error, <A::Family as Write>::Error>>
+    ) -> Result<<A::Family as Write>::Report, LiteralError<F::Error, <A::Family as Write>::Error>>
     where
         F::Length: TryInto<u64>,
     {
         self.transfer::<7, F>(value, 0, 0).await?;
         self.writer.at_boundary = true;
-        Ok(())
+        Ok(self.report)
     }
 }

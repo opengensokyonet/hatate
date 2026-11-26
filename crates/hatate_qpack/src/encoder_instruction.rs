@@ -1,8 +1,10 @@
 //! Instructions sent on the QPACK encoder stream (RFC 9204 §4.3).
 //!
 //! Inside a `nitori_call` operation, create an [`EncoderStream`] over the
-//! current access, at an instruction boundary. Take the next instruction and
-//! match its state. For a literal name,
+//! current access, at an instruction boundary, with its [`EncoderStreamLimits`].
+//! Decode the next instruction as an `Option<ReadValue<Started<'_, A>, M>>`
+//! and match its state; the `ReadValue` carries the merged metadata of the
+//! bytes that began the instruction. For a literal name,
 //! borrow [`Name::source`] and read it to its boundary. [`Name::finish`]
 //! validates the ending and releases a [`ValueStart`]. Open and consume the
 //! value in the same way. Commit an insertion only after [`Value::finish`]
@@ -14,10 +16,15 @@
 pub mod literal;
 pub mod write;
 
-use crate::{instruction::WireBudget, static_table};
+use crate::{instruction::WireBudget, integer, static_table};
 use literal::{FinishError, Literal, LiteralSource};
-use nitori_call::ReceiverAccess;
-use nitori_io::Read;
+use nitori_call::{AsAccess, ReceiverAccess};
+use nitori_codec::DecodeFrom;
+use nitori_io::{
+    Combine, Read,
+    adapters::{MergedMetadata, MergingSource},
+    calls::ReadValue,
+};
 
 #[allow(missing_docs)] // #[call] also generates operation and extension trait items.
 pub mod codec;
@@ -32,11 +39,86 @@ pub enum NameReference {
     Relative(u64),
 }
 
+/// The limits on the instructions of one encoder stream.
+///
+/// They are checked as each instruction is read and apply to the instructions
+/// read after they are set. The defaults are those of a peer that has not been
+/// given a dynamic table: see [`for_table_capacity`](Self::for_table_capacity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncoderStreamLimits {
+    /// The most wire octets one instruction may take, counting every prefix,
+    /// integer and literal payload of it.
+    pub max_wire_len: usize,
+    /// The most octets the name and the value of an insertion may have
+    /// together once decoded; the Huffman literals count their decoded
+    /// octets.
+    pub max_decoded_len: usize,
+}
+
+impl EncoderStreamLimits {
+    /// The size that RFC 9204 §3.2.1 adds to the lengths of the name and the
+    /// value of an entry.
+    const ENTRY_OVERHEAD: u64 = 32;
+    /// The most bits of a Huffman code of RFC 7541 Appendix B.
+    const HUFFMAN_CODE_BITS: usize = 30;
+
+    /// The limits that suit a dynamic table of at most `capacity` octets
+    /// (SETTINGS_QPACK_MAX_TABLE_CAPACITY, RFC 9204 §5).
+    ///
+    /// An entry takes the lengths of its name and value and 32 octets (RFC
+    /// 9204 §3.2.1), so the name and the value of an insertion together have
+    /// at most `capacity` less 32 octets (none if the capacity is less than
+    /// 32), saturating at `usize::MAX`: that is `max_decoded_len`.
+    ///
+    /// `max_wire_len` is what an insertion of that size can take on the wire
+    /// at most: two prefixed integers, each of at most 11 octets (the
+    /// longest encoding of a `u64`), and the name and the value as Huffman
+    /// literals, where each decoded octet takes at most 30 bits (RFC 7541
+    /// Appendix B) and each literal fills its last octet. It saturates at
+    /// `usize::MAX`. The other instructions take one integer.
+    pub const fn for_table_capacity(capacity: u64) -> Self {
+        let room = capacity.saturating_sub(Self::ENTRY_OVERHEAD);
+        let max_decoded_len = if room > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            room as usize
+        };
+        let literals = if max_decoded_len == 0 {
+            0
+        } else {
+            // ceil(max_decoded_len * 30 / 8), saturating, without the overflow
+            // of the product, and one octet more: the name and the value
+            // each round up to whole octets, so together they can take one
+            // more than their decoded octets would as one literal.
+            (max_decoded_len / 8)
+                .saturating_mul(Self::HUFFMAN_CODE_BITS)
+                .saturating_add((max_decoded_len % 8 * Self::HUFFMAN_CODE_BITS).div_ceil(8))
+                .saturating_add(1)
+        };
+        Self {
+            max_wire_len: (2 * integer::MAX_ENCODED_LEN).saturating_add(literals),
+            max_decoded_len,
+        }
+    }
+}
+
+/// The limits of a peer that has not been given a dynamic table: those of a
+/// capacity of 0, the value of SETTINGS_QPACK_MAX_TABLE_CAPACITY until a
+/// SETTINGS frame states another (RFC 9204 §5). No insertion is within them.
+impl Default for EncoderStreamLimits {
+    fn default() -> Self {
+        Self::for_table_capacity(0)
+    }
+}
+
 /// One encoder stream, read instruction by instruction from within a call.
 ///
 /// It is made at an instruction boundary and reads nothing until asked for
 /// the next instruction: a peer that does not use the dynamic table may never
-/// send one. An insertion borrows the stream until its value is finished, so
+/// send one. The next instruction is decoded from the stream as an
+/// `Option<ReadValue<Started<'_, A>, M>>`, `M` being the metadata of the
+/// stream's bytes; it is `None` where the stream ends at an instruction
+/// boundary. An insertion borrows the stream until its value is finished, so
 /// the next instruction cannot be read before. An instruction that is not
 /// finished, because it failed or because it or the call reading it was
 /// dropped, leaves the stream interrupted: what is left of the instruction is
@@ -49,6 +131,7 @@ pub enum NameReference {
 pub struct EncoderStream<A> {
     io: A,
     state: StreamState,
+    limits: EncoderStreamLimits,
 }
 
 /// Where an instruction stream is.
@@ -60,85 +143,114 @@ pub(crate) enum StreamState {
     Interrupted,
 }
 
-impl<A: ReceiverAccess> EncoderStream<A>
+/// Reads the start of the next instruction. Numeric instructions finish
+/// here. Insertions lend this stream to their first state. The stream's
+/// [`EncoderStreamLimits`] apply to all wire octets and to the sum of the
+/// decoded literal octets, respectively.
+///
+/// The value is `None` if the stream ends at the instruction boundary.
+/// Whether that is an error is a question for the stream's place in the
+/// connection. Otherwise the metadata is the merged metadata of the octets
+/// read: the first octet and the integers of the instruction's start. A
+/// failure does not return the metadata of the octets read before it.
+///
+/// # Errors
+///
+/// [`StartError`](codec::StartError); after any of them, and after
+/// [`StartError::Interrupted`](codec::StartError::Interrupted) itself, the
+/// stream is interrupted.
+impl<'s, A, M> DecodeFrom<&'s mut EncoderStream<A>> for Option<ReadValue<Started<'s, A>, M>>
 where
-    A::Family: Read<Metadata = ()>,
+    A: ReceiverAccess<Family: Read<Metadata = M>>,
+    M: Combine + Unpin,
 {
-    /// Reads the start of the next instruction. Numeric instructions finish
-    /// here. Insertions lend this stream to their first state. Limits apply to
-    /// all wire octets and to the sum of the decoded literal octets,
-    /// respectively.
-    ///
-    /// Returns `None` if the stream ends at the instruction boundary. Whether
-    /// that is an error is a question for the stream's place in the connection.
-    ///
-    /// # Errors
-    ///
-    /// [`StartError`](codec::StartError); after any of them, and after
-    /// [`StartError::Interrupted`](codec::StartError::Interrupted) itself, the
-    /// stream is interrupted.
-    pub async fn next_instruction(
-        &mut self,
-        max_wire_len: usize,
-        max_decoded_len: usize,
-    ) -> Result<Option<Started<'_, A>>, codec::StartError<<A::Family as Read>::Error>> {
-        if self.state == StreamState::Interrupted {
+    type Error = codec::StartError<<A::Family as Read>::Error>;
+
+    async fn decode_from(stream: &'s mut EncoderStream<A>) -> Result<Self, Self::Error> {
+        if stream.state == StreamState::Interrupted {
             return Err(codec::StartError::Interrupted);
         }
+        let limits = stream.limits;
         // A call dropped before the first octet has read nothing: the stream
         // stays at the boundary.
-        let mut wire = WireBudget::new(max_wire_len);
-        let first = match crate::instruction::octet(&mut self.io, &mut wire).await {
+        let mut wire = WireBudget::new(limits.max_wire_len);
+        let mut merged = MergedMetadata(M::default());
+        let mut source = MergingSource::new(&mut stream.io, &mut merged);
+        let first = match crate::instruction::octet(&mut source.access(), &mut wire).await {
             Ok(first) => first,
             Err(error) if error.ended_before_first_octet() => return Ok(None),
             Err(source) => {
-                self.state = StreamState::Interrupted;
+                stream.state = StreamState::Interrupted;
                 return Err(codec::StartError::Prefix { source });
             }
         };
         // Until the instruction is complete, dropping this call or the state
         // it returns leaves the stream interrupted.
-        self.state = StreamState::Interrupted;
-        let head = codec::read_head(&mut self.io, &mut wire, max_decoded_len, first).await?;
-        Ok(Some(match head {
+        stream.state = StreamState::Interrupted;
+        let head = codec::read_head(
+            &mut source.access(),
+            &mut wire,
+            limits.max_decoded_len,
+            first,
+        )
+        .await?;
+        let metadata = merged.0;
+        let started = match head {
             codec::Head::Capacity(n) => {
-                self.state = StreamState::Boundary;
+                stream.state = StreamState::Boundary;
                 Started::SetDynamicTableCapacity(n)
             }
             codec::Head::Duplicate(n) => {
-                self.state = StreamState::Boundary;
+                stream.state = StreamState::Boundary;
                 Started::Duplicate(n)
             }
             codec::Head::Reference(name) => Started::InsertWithNameReference {
                 name,
                 value: ValueStart {
                     ctx: Context {
-                        reader: self,
+                        reader: stream,
                         wire,
-                        decoded_left: max_decoded_len,
+                        decoded_left: limits.max_decoded_len,
                     },
                 },
             },
             codec::Head::Literal(name) => Started::InsertWithLiteralName(Name {
                 ctx: Context {
-                    reader: self,
+                    reader: stream,
                     wire,
-                    decoded_left: max_decoded_len,
+                    decoded_left: limits.max_decoded_len,
                 },
                 literal: name,
             }),
+        };
+        Ok(Some(ReadValue {
+            value: started,
+            metadata,
         }))
     }
 }
 
 impl<A> EncoderStream<A> {
     /// The stream on `io`, an access or an exclusive borrow of one, at an
-    /// instruction boundary. Nothing is read.
-    pub fn new(io: A) -> Self {
+    /// instruction boundary, reading instructions within `limits`. Nothing
+    /// is read.
+    pub fn new(io: A, limits: EncoderStreamLimits) -> Self {
         Self {
             io,
             state: StreamState::Boundary,
+            limits,
         }
+    }
+
+    /// The limits the next instruction is read within.
+    pub const fn limits(&self) -> EncoderStreamLimits {
+        self.limits
+    }
+
+    /// Reads the instructions after this call within `limits`. An
+    /// instruction begun before is read within the limits it began with.
+    pub fn set_limits(&mut self, limits: EncoderStreamLimits) {
+        self.limits = limits;
     }
 
     /// The access, giving up the stream.
@@ -198,23 +310,30 @@ pub struct ValueStart<'s, A> {
     ctx: Context<'s, A>,
 }
 
-impl<'s, A: ReceiverAccess> ValueStart<'s, A>
-where
-    A::Family: Read<Metadata = ()>,
-{
-    /// Consume the value header and lend out its bounded payload source.
-    pub async fn open(
+impl<'s, A: ReceiverAccess> ValueStart<'s, A> {
+    /// Consume the value header and lend out its bounded payload source. The
+    /// metadata is the merged metadata of the octets of the header.
+    pub async fn open<M>(
         mut self,
-    ) -> Result<Value<'s, A>, codec::ValueError<<A::Family as Read>::Error>> {
+    ) -> Result<ReadValue<Value<'s, A>, M>, codec::ValueError<<A::Family as Read>::Error>>
+    where
+        A::Family: Read<Metadata = M>,
+        M: Combine + Unpin,
+    {
+        let mut merged = MergedMetadata(M::default());
+        let mut source = MergingSource::new(&mut self.ctx.reader.io, &mut merged);
         let literal = codec::read_value_header(
-            &mut self.ctx.reader.io,
+            &mut source.access(),
             &mut self.ctx.wire,
             self.ctx.decoded_left,
         )
         .await?;
-        Ok(Value {
-            ctx: self.ctx,
-            literal,
+        Ok(ReadValue {
+            value: Value {
+                ctx: self.ctx,
+                literal,
+            },
+            metadata: merged.0,
         })
     }
 }

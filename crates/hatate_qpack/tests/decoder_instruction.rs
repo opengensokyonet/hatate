@@ -2,13 +2,30 @@
 use core::num::NonZeroU64;
 use hatate_qpack::{
     decoder_instruction::{
-        DecoderInstruction as D, DecoderStream, StreamId,
+        DecoderInstruction as D, DecoderStream, DecoderStreamLimits, StreamId,
         codec::{ReadError, WriteDecoderInstructionHostExt, WriteError},
     },
     instruction::{NumberError, OctetError},
 };
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::{Read, calls::ReadArrayError};
+use nitori_codec::DecodeFrom;
+use nitori_io::{
+    Read,
+    calls::{ReadArrayError, ReadValue},
+};
+
+async fn next_decoder<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    reader: &mut DecoderStream<A>,
+    wire: usize,
+) -> Result<Option<D>, ReadError<F::Error>> {
+    reader.set_limits(DecoderStreamLimits { max_wire_len: wire });
+    let next = Option::<ReadValue<D, ()>>::decode_from(reader).await?;
+    Ok(next.map(|read| read.value))
+}
+
+fn decoder_stream<A>(io: A) -> DecoderStream<A> {
+    DecoderStream::new(io, DecoderStreamLimits::default())
+}
 
 /// One instruction from a fresh stream.
 #[call(sync)]
@@ -16,7 +33,7 @@ async fn one<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     max_wire_len: usize,
 ) -> Result<Option<D>, ReadError<F::Error>> {
-    DecoderStream::new(io).next_instruction(max_wire_len).await
+    next_decoder(&mut decoder_stream(io), max_wire_len).await
 }
 
 /// `count` instructions from one stream, whatever each returns.
@@ -26,10 +43,10 @@ async fn sequence<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     max_wire_len: usize,
     count: usize,
 ) -> Vec<Result<Option<D>, ReadError<F::Error>>> {
-    let mut stream = DecoderStream::new(io);
+    let mut stream = decoder_stream(io);
     let mut results = Vec::new();
     for _ in 0..count {
-        results.push(stream.next_instruction(max_wire_len).await);
+        results.push(next_decoder(&mut stream, max_wire_len).await);
     }
     results
 }
@@ -40,14 +57,10 @@ async fn sequence<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
 async fn handed_back<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
 ) -> (D, Option<D>) {
-    let mut stream = DecoderStream::new(io);
-    let first = stream.next_instruction(1).await.ok().flatten().unwrap();
+    let mut stream = decoder_stream(io);
+    let first = next_decoder(&mut stream, 1).await.ok().flatten().unwrap();
     let io = stream.into_io();
-    let second = DecoderStream::new(io)
-        .next_instruction(1)
-        .await
-        .ok()
-        .unwrap();
+    let second = next_decoder(&mut decoder_stream(io), 1).await.ok().unwrap();
     (first, second)
 }
 
@@ -232,7 +245,7 @@ async fn pending_read<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     max_wire_len: usize,
 ) -> Result<Option<D>, ReadError<F::Error>> {
-    DecoderStream::new(io).next_instruction(max_wire_len).await
+    next_decoder(&mut decoder_stream(io), max_wire_len).await
 }
 
 #[test]
@@ -276,9 +289,9 @@ async fn dropped_read<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
         pin::pin,
         task::Poll,
     };
-    let mut stream = DecoderStream::new(io);
+    let mut stream = decoder_stream(io);
     {
-        let mut read = pin!(stream.next_instruction(8));
+        let mut read = pin!(next_decoder(&mut stream, 8));
         poll_fn(|cx| {
             for _ in 0..polls {
                 assert!(read.as_mut().poll(cx).is_pending());
@@ -287,7 +300,7 @@ async fn dropped_read<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
         })
         .await;
     }
-    match stream.next_instruction(8).await {
+    match next_decoder(&mut stream, 8).await {
         Ok(instruction) => Some(instruction.unwrap()),
         Err(ReadError::Interrupted) => None,
         Err(_) => panic!("a read failed other than by interruption"),

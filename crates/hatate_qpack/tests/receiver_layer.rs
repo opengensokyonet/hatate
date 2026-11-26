@@ -14,13 +14,47 @@ use core::{
     task::{Context, Poll, Waker},
 };
 use hatate_qpack::{
-    decoder_instruction::DecoderStream,
+    decoder_instruction::{
+        DecoderInstruction, DecoderStream, DecoderStreamLimits, codec::ReadError,
+    },
     encoder_instruction::{
-        EncoderStream, NameReference, Started, codec::StartError, literal::LiteralSource,
+        EncoderStream, EncoderStreamLimits, NameReference, Started, codec::StartError,
+        literal::LiteralSource,
     },
 };
 use nitori_call::{ConstructedAccess, ReceiverAccess, call};
-use nitori_io::{Read, prelude::*};
+use nitori_codec::DecodeFrom;
+use nitori_io::{Read, calls::ReadValue, prelude::*};
+
+async fn next_encoder<'a, F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    reader: &'a mut EncoderStream<A>,
+    wire: usize,
+    decoded: usize,
+) -> Result<Option<Started<'a, A>>, StartError<F::Error>> {
+    reader.set_limits(EncoderStreamLimits {
+        max_wire_len: wire,
+        max_decoded_len: decoded,
+    });
+    let next = Option::<ReadValue<Started<'a, A>, ()>>::decode_from(reader).await?;
+    Ok(next.map(|read| read.value))
+}
+
+fn encoder_stream<A>(io: A) -> EncoderStream<A> {
+    EncoderStream::new(io, EncoderStreamLimits::default())
+}
+
+async fn next_decoder<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    reader: &mut DecoderStream<A>,
+    wire: usize,
+) -> Result<Option<DecoderInstruction>, ReadError<F::Error>> {
+    reader.set_limits(DecoderStreamLimits { max_wire_len: wire });
+    let next = Option::<ReadValue<DecoderInstruction, ()>>::decode_from(reader).await?;
+    Ok(next.map(|read| read.value))
+}
+
+fn decoder_stream<A>(io: A) -> DecoderStream<A> {
+    DecoderStream::new(io, DecoderStreamLimits::default())
+}
 
 /// A stream that gives one byte per read and answers Pending once before
 /// each read.
@@ -164,9 +198,9 @@ fn describe<A: ReceiverAccess, E: Debug>(
 macro_rules! encoder_log {
     ($io:expr, $w:ident) => {{
         let mut log = Vec::new();
-        let mut reader = EncoderStream::new($io);
+        let mut reader = encoder_stream($io);
         loop {
-            let started = match $w!(reader.next_instruction(64, 64)) {
+            let started = match $w!(next_encoder(&mut reader, 64, 64)) {
                 Ok(Some(started)) => started,
                 Ok(None) => {
                     log.push("end".to_string());
@@ -187,14 +221,14 @@ macro_rules! encoder_log {
                         }
                         NameReference::Relative(n) => format!("relative {n}"),
                     };
-                    let mut value = $w!(value.open()).unwrap();
+                    let mut value = $w!(value.open()).unwrap().value;
                     let text = drain_literal!($w, value.source());
                     value.finish().unwrap();
                     log.push(format!("{name} = {text}"));
                 }
                 Started::InsertWithLiteralName(mut name) => {
                     let name_text = drain_literal!($w, name.source());
-                    let mut value = $w!(name.finish().unwrap().open()).unwrap();
+                    let mut value = $w!(name.finish().unwrap().open()).unwrap().value;
                     let text = drain_literal!($w, value.source());
                     value.finish().unwrap();
                     log.push(format!("{name_text} = {text}"));
@@ -231,9 +265,9 @@ where
 /// the name left it.
 macro_rules! abandon_log {
     ($io:expr, $w:ident) => {{
-        let mut reader = EncoderStream::new($io);
-        let first = describe($w!(reader.next_instruction(32, 32)));
-        let second = describe($w!(reader.next_instruction(32, 32)));
+        let mut reader = encoder_stream($io);
+        let first = describe($w!(next_encoder(&mut reader, 32, 32)));
+        let second = describe($w!(next_encoder(&mut reader, 32, 32)));
         let mut io = reader.into_io();
         let rest = $w!(rest_of(&mut io));
         (vec![first, second], rest)
@@ -263,9 +297,9 @@ where
 /// next read of the stream says, and what the access has left.
 macro_rules! dropped_log {
     ($io:expr, $w:ident, $polls:expr) => {{
-        let mut reader = EncoderStream::new($io);
-        let done = poll_then_drop(reader.next_instruction(32, 32), $polls);
-        let again = describe($w!(reader.next_instruction(32, 32)));
+        let mut reader = encoder_stream($io);
+        let done = poll_then_drop(next_encoder(&mut reader, 32, 32), $polls);
+        let again = describe($w!(next_encoder(&mut reader, 32, 32)));
         let mut io = reader.into_io();
         let rest = $w!(rest_of(&mut io));
         (done, again, rest)
@@ -332,17 +366,17 @@ fn encoder_instructions_read_across_runs_agree_with_the_call_layer() {
 fn encoder_instructions_on_a_borrowed_receiver_leave_what_they_did_not_read() {
     let mut input = ENCODER_WIRE;
     {
-        let mut reader = EncoderStream::new(ConstructedAccess::new(&mut input));
+        let mut reader = encoder_stream(ConstructedAccess::new(&mut input));
         assert_eq!(
-            describe(run(reader.next_instruction(64, 64)).0),
+            describe(run(next_encoder(&mut reader, 64, 64)).0),
             "capacity 220"
         );
         let Some(Started::InsertWithNameReference { value, .. }) =
-            run(reader.next_instruction(64, 64)).0.unwrap()
+            run(next_encoder(&mut reader, 64, 64)).0.unwrap()
         else {
             panic!("not an insertion with a reference");
         };
-        let mut value = run(value.open()).0.unwrap();
+        let mut value = run(value.open()).0.unwrap().value;
         let LiteralSource::Raw(mut source) = value.source() else {
             panic!("not raw");
         };
@@ -355,7 +389,7 @@ fn encoder_instructions_on_a_borrowed_receiver_leave_what_they_did_not_read() {
         value.finish().unwrap();
         // The stream is at a boundary again.
         assert_eq!(
-            describe(run(reader.next_instruction(64, 64)).0),
+            describe(run(next_encoder(&mut reader, 64, 64)).0),
             "insert with literal name"
         );
     }
@@ -411,10 +445,10 @@ fn an_instruction_read_dropped_in_the_middle_behaves_as_it_does_in_a_call() {
 /// included; what the access has left.
 macro_rules! decoder_log {
     ($io:expr, $w:ident, $count:expr) => {{
-        let mut reader = DecoderStream::new($io);
+        let mut reader = decoder_stream($io);
         let mut log = Vec::new();
         for _ in 0..$count {
-            match $w!(reader.next_instruction(8)) {
+            match $w!(next_decoder(&mut reader, 8)) {
                 Ok(Some(instruction)) => log.push(format!("{instruction:?}")),
                 Ok(None) => log.push("end".to_string()),
                 Err(error) => log.push(format!("error {error:?}")),
@@ -455,9 +489,9 @@ async fn decoder_dropped_in_call<F: Read<Metadata = ()>, A: ReceiverAccess<Famil
 where
     <F as Read>::Error: Debug,
 {
-    let mut reader = DecoderStream::new(&mut *io);
-    let done = poll_then_drop(reader.next_instruction(8), polls);
-    let again = format!("{:?}", reader.next_instruction(8).await);
+    let mut reader = decoder_stream(&mut *io);
+    let done = poll_then_drop(next_decoder(&mut reader, 8), polls);
+    let again = format!("{:?}", next_decoder(&mut reader, 8).await);
     let mut io = reader.into_io();
     (done, again, rest_of(&mut io).await)
 }
@@ -469,9 +503,9 @@ fn decoder_dropped_on_receiver<F: Read<Metadata = ()>, A: ReceiverAccess<Family 
 where
     <F as Read>::Error: Debug,
 {
-    let mut reader = DecoderStream::new(io);
-    let done = poll_then_drop(reader.next_instruction(8), polls);
-    let again = format!("{:?}", run(reader.next_instruction(8)).0);
+    let mut reader = decoder_stream(io);
+    let done = poll_then_drop(next_decoder(&mut reader, 8), polls);
+    let again = format!("{:?}", run(next_decoder(&mut reader, 8)).0);
     let mut io = reader.into_io();
     (done, again, run(rest_of(&mut io)).0)
 }
@@ -500,8 +534,8 @@ fn decoder_instructions_read_across_runs_agree_with_the_call_layer() {
     // keeps the rest.
     let mut input = &wire[..];
     {
-        let mut reader = DecoderStream::new(ConstructedAccess::new(&mut input));
-        assert!(run(reader.next_instruction(8)).0.unwrap().is_some());
+        let mut reader = decoder_stream(ConstructedAccess::new(&mut input));
+        assert!(run(next_decoder(&mut reader, 8)).0.unwrap().is_some());
     }
     assert_eq!(input, [0x01, 0x48]);
 }

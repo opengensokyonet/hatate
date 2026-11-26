@@ -5,13 +5,12 @@ use crate::instruction::{
 };
 use core::num::NonZeroU64;
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::{calls::WriteAllError, prelude::*};
+use nitori_io::{Combine, calls::WriteAllError, prelude::*};
 use snafu::{ResultExt, Snafu};
 
 /// Read the rest of one RFC 9204 §4.4 instruction whose first octet `first`
-/// was read: the step
-/// [`DecoderStream::next_instruction`](super::DecoderStream::next_instruction)
-/// takes after the first octet. `budget` has already counted the first
+/// was read: the step that decoding from a
+/// [`DecoderStream`](super::DecoderStream) takes after the first octet. `budget` has already counted the first
 /// octet. EOF inside a number is attributed to that instruction's field.
 #[call(sync)]
 pub(crate) async fn read_decoder_instruction<
@@ -73,16 +72,17 @@ pub enum ReadError<E> {
     Interrupted,
 }
 
-/// Encode one complete instruction. The wire limit is checked before any
+/// Encode one complete instruction and return the merged report of the
+/// writes. The wire limit is checked before any
 /// write. A write error retains the number of bytes accepted by the host.
 /// Resume the same future across waits. If cancelled after accepting a prefix,
 /// abandon the output stream: the integer may be incomplete.
 #[call(sync)]
-pub async fn write_decoder_instruction<F: Write<Report = ()>, A: ReceiverAccess<Family = F>>(
+pub async fn write_decoder_instruction<F: Write<Report: Combine>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     instruction: DecoderInstruction,
     max_wire_len: usize,
-) -> Result<(), WriteError<F::Error>> {
+) -> Result<<F as Write>::Report, WriteError<F::Error>> {
     let encoded = match instruction {
         DecoderInstruction::SectionAcknowledgment(id) => EncodedInteger::new::<7>(0x80, id.get()),
         DecoderInstruction::StreamCancellation(id) => EncodedInteger::new::<6>(0x40, id.get()),

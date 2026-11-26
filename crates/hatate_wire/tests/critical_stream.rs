@@ -6,7 +6,9 @@
 mod common;
 
 use bytes::{BufMut, Bytes};
-use common::{Boom, Broken, ReadOnly, read_some, run};
+use common::{
+    Boom, Broken, ReadOnly, next_critical_decoder, next_critical_encoder, read_some, run,
+};
 use core::{
     convert::Infallible,
     num::NonZeroUsize,
@@ -481,7 +483,7 @@ async fn encoder_failure<
 ) -> Option<ErrorCode> {
     let mut stream = QpackEncoderStream::new(&mut *io);
     loop {
-        let started = match stream.next_instruction(1000, 1000).await {
+        let started = match next_critical_encoder(&mut stream, 1000, 1000).await {
             Ok(started) => started,
             Err(error) => return error.error_code(),
         };
@@ -501,7 +503,7 @@ async fn encoder_failure<
         if let Reach::Start | Reach::Name = reach {
             continue;
         }
-        let mut value = match value.open().await {
+        let mut value = match value.open().await.map(|read| read.value) {
             Ok(value) => value,
             Err(error) => return error.error_code(),
         };
@@ -601,7 +603,7 @@ async fn decoder_failure<
     let mut stream = QpackDecoderStream::new(&mut *io);
     let mut count = 0;
     loop {
-        match stream.next_instruction(1000).await {
+        match next_critical_decoder(&mut stream, 1000).await {
             Ok(_) => count += 1,
             Err(error) => return (count, error.error_code()),
         }

@@ -8,7 +8,9 @@
 //! and on the QPACK streams of hatate_wire_qpack, which are.
 mod common;
 
-use common::{read_some, run};
+use common::{
+    next_critical_decoder, next_critical_encoder, next_decoder, next_encoder, read_some, run,
+};
 use hatate_qpack::{
     decoder_instruction::DecoderStream,
     encoder_instruction::{EncoderStream, Started, literal::LiteralSource},
@@ -37,13 +39,21 @@ fn closed() -> Option<ErrorCode> {
 type Ended = Result<(), Option<ErrorCode>>;
 
 macro_rules! plain {
-    ($reader:ident, $($arg:expr),*) => {
-        run($reader.next_instruction($($arg),*)).0
+    ($reader:ident, $wire:expr, $decoded:expr) => {
+        run(next_encoder(&mut $reader, $wire, $decoded)).0
+    };
+    ($reader:ident, $wire:expr) => {
+        run(next_decoder(&mut $reader, $wire)).0
     };
 }
 macro_rules! critical {
-    ($reader:ident, $($arg:expr),*) => {
-        run($reader.next_instruction($($arg),*)).0.map(Some)
+    ($reader:ident, $wire:expr, $decoded:expr) => {
+        run(next_critical_encoder(&mut $reader, $wire, $decoded))
+            .0
+            .map(Some)
+    };
+    ($reader:ident, $wire:expr) => {
+        run(next_critical_decoder(&mut $reader, $wire)).0.map(Some)
     };
 }
 
@@ -61,7 +71,7 @@ macro_rules! encoder_ended {
             match started {
                 Started::SetDynamicTableCapacity(_) | Started::Duplicate(_) => {}
                 Started::InsertWithNameReference { value, .. } => {
-                    let mut value = match run(value.open()).0 {
+                    let mut value = match run(value.open()).0.map(|read| read.value) {
                         Ok(value) => value,
                         Err(error) => break Err(error.error_code()),
                     };
@@ -100,7 +110,7 @@ macro_rules! encoder_ended {
                         Ok(start) => start,
                         Err(error) => break Err(error.error_code()),
                     };
-                    let mut value = match run(start.open()).0 {
+                    let mut value = match run(start.open()).0.map(|read| read.value) {
                         Ok(value) => value,
                         Err(error) => break Err(error.error_code()),
                     };
@@ -141,7 +151,7 @@ macro_rules! decoder_ended {
 
 fn encoder_plain(wire: &[u8], max_wire: usize, max_decoded: usize) -> Ended {
     encoder_ended!(
-        EncoderStream::new(ConstructedAccess::new(wire)),
+        EncoderStream::new(ConstructedAccess::new(wire), Default::default()),
         plain,
         max_wire,
         max_decoded
@@ -159,7 +169,7 @@ fn encoder_critical(wire: &[u8], max_wire: usize, max_decoded: usize) -> Ended {
 
 fn decoder_plain(wire: &[u8], max_wire: usize) -> Ended {
     decoder_ended!(
-        DecoderStream::new(ConstructedAccess::new(wire)),
+        DecoderStream::new(ConstructedAccess::new(wire), Default::default()),
         plain,
         max_wire
     )
@@ -231,7 +241,7 @@ enum Literal {
 /// the failure of finishing it. The literal is read to its decoded length and
 /// no further, so a Huffman ending that is not valid is found by `finish`.
 fn finish_code(wire: &[u8], which: Literal, take: usize) -> Option<ErrorCode> {
-    let mut reader = EncoderStream::new(ConstructedAccess::new(wire));
+    let mut reader = EncoderStream::new(ConstructedAccess::new(wire), Default::default());
     let Some(Started::InsertWithLiteralName(mut name)) = plain!(reader, 64, 64).unwrap() else {
         panic!("not an insertion with a literal name");
     };
@@ -246,7 +256,7 @@ fn finish_code(wire: &[u8], which: Literal, take: usize) -> Option<ErrorCode> {
         }
         Literal::Value => {
             assert_eq!(read(name.source(), 1), 1);
-            let mut value = run(name.finish().unwrap().open()).0.unwrap();
+            let mut value = run(name.finish().unwrap().open()).0.unwrap().value;
             if take > 0 {
                 assert_eq!(read(value.source(), take), take);
             }
@@ -338,10 +348,10 @@ fn an_abandoned_encoder_stream_has_no_code() {
     // The name of an insertion is dropped unfinished: the next read is
     // Interrupted, on both kinds of stream.
     let wire = [0x41, b'x', 0x00, 0x20];
-    let mut plain = EncoderStream::new(ConstructedAccess::new(&wire[..]));
-    let _ = run(plain.next_instruction(64, 64)).0.unwrap();
+    let mut plain = EncoderStream::new(ConstructedAccess::new(&wire[..]), Default::default());
+    let _ = run(next_encoder(&mut plain, 64, 64)).0.unwrap();
     assert_eq!(
-        run(plain.next_instruction(64, 64))
+        run(next_encoder(&mut plain, 64, 64))
             .0
             .err()
             .unwrap()
@@ -349,9 +359,9 @@ fn an_abandoned_encoder_stream_has_no_code() {
         None
     );
     let mut critical = QpackEncoderStream::new(ConstructedAccess::new(&wire[..]));
-    let _ = run(critical.next_instruction(64, 64)).0.unwrap();
+    let _ = run(next_critical_encoder(&mut critical, 64, 64)).0.unwrap();
     assert_eq!(
-        run(critical.next_instruction(64, 64))
+        run(next_critical_encoder(&mut critical, 64, 64))
             .0
             .err()
             .unwrap()
@@ -395,10 +405,10 @@ fn a_limit_the_end_and_an_abandoned_decoder_stream_are_not_interpretation_failur
     assert_eq!(decoder(&[0x3f]), (Err(None), Err(closed())));
     assert_eq!(decoder(&[0x84, 0x7f, 0x80]), (Err(None), Err(closed())));
     // After a failure the stream is abandoned.
-    let mut plain = DecoderStream::new(ConstructedAccess::new(&[0x3f][..]));
-    assert!(run(plain.next_instruction(16)).0.is_err());
+    let mut plain = DecoderStream::new(ConstructedAccess::new(&[0x3f][..]), Default::default());
+    assert!(run(next_decoder(&mut plain, 16)).0.is_err());
     assert_eq!(
-        run(plain.next_instruction(16))
+        run(next_decoder(&mut plain, 16))
             .0
             .err()
             .unwrap()
@@ -407,7 +417,7 @@ fn a_limit_the_end_and_an_abandoned_decoder_stream_are_not_interpretation_failur
     );
     let mut critical = QpackDecoderStream::new(ConstructedAccess::new(&[0x00][..]));
     assert_eq!(
-        run(critical.next_instruction(16))
+        run(next_critical_decoder(&mut critical, 16))
             .0
             .err()
             .unwrap()
@@ -415,7 +425,7 @@ fn a_limit_the_end_and_an_abandoned_decoder_stream_are_not_interpretation_failur
         decoder_error()
     );
     assert_eq!(
-        run(critical.next_instruction(16))
+        run(next_critical_decoder(&mut critical, 16))
             .0
             .err()
             .unwrap()

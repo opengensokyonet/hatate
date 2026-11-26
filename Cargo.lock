@@ -43,6 +43,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "nitori_call",
+ "nitori_codec",
  "nitori_io",
  "pin-project-lite",
  "snafu",
@@ -98,6 +99,7 @@ dependencies = [
  "bytes",
  "hatate_qpack",
  "nitori_call",
+ "nitori_codec",
  "nitori_io",
  "pin-project-lite",
  "sakuya_var_int",

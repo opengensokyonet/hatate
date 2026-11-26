@@ -7,7 +7,7 @@ use bytes::{Buf, BufMut};
 use core::num::NonZeroUsize;
 use hatate_qpack::{
     encoder_instruction::{
-        EncoderStream, NameReference, Started,
+        EncoderStream, EncoderStreamLimits, NameReference, Started,
         codec::StartError,
         literal::LiteralSource,
         write::{Payload, Writer},
@@ -17,7 +17,8 @@ use hatate_qpack::{
 };
 use libfuzzer_sys::fuzz_target;
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::prelude::*;
+use nitori_codec::DecodeFrom;
+use nitori_io::{calls::ReadValue, prelude::*};
 
 #[derive(Debug, PartialEq, Eq)]
 enum Parsed {
@@ -109,8 +110,12 @@ async fn one<A: ReceiverAccess>(
 where
     A::Family: ReadChunk<Metadata = ()>,
 {
-    let start = match stream.next_instruction(wire, decoded).await {
-        Ok(Some(start)) => start,
+    stream.set_limits(EncoderStreamLimits {
+        max_wire_len: wire,
+        max_decoded_len: decoded,
+    });
+    let start = match Option::<ReadValue<Started<'_, A>, ()>>::decode_from(&mut *stream).await {
+        Ok(Some(start)) => start.value,
         Ok(None) => return Outcome::End,
         Err(_) => return Outcome::Failed,
     };
@@ -128,14 +133,14 @@ where
         Started::SetDynamicTableCapacity(n) => Some(Parsed::Capacity(n)),
         Started::Duplicate(n) => Some(Parsed::Duplicate(n)),
         Started::InsertWithNameReference { name, value } => {
-            let mut value = value.open().await.ok()?;
+            let mut value = value.open().await.ok()?.value;
             let data = collect(value.source(), block).await?;
             value.finish().ok()?;
             Some(Parsed::Reference(name, data))
         }
         Started::InsertWithLiteralName(mut name) => {
             let key = collect(name.source(), block).await?;
-            let mut value = name.finish().ok()?.open().await.ok()?;
+            let mut value = name.finish().ok()?.open().await.ok()?.value;
             let data = collect(value.source(), block).await?;
             value.finish().ok()?;
             Some(Parsed::Literal(key, data))
@@ -150,12 +155,18 @@ async fn parse<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     decoded: usize,
     block: NonZeroUsize,
 ) -> Outcome {
-    let mut stream = EncoderStream::new(io);
+    let mut stream = EncoderStream::new(
+        io,
+        EncoderStreamLimits {
+            max_wire_len: wire,
+            max_decoded_len: decoded,
+        },
+    );
     let outcome = one(&mut stream, wire, decoded, block).await;
     if outcome == Outcome::Failed {
         // A failed or unfinished instruction leaves the stream interrupted.
         assert!(matches!(
-            stream.next_instruction(wire, decoded).await,
+            Option::<ReadValue<Started<'_, _>, ()>>::decode_from(&mut stream).await,
             Err(StartError::Interrupted)
         ));
     }

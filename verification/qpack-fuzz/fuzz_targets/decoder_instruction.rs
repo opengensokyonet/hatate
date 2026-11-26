@@ -4,14 +4,15 @@
 use core::num::NonZeroU64;
 use hatate_qpack::{
     decoder_instruction::{
-        DecoderInstruction as D, DecoderStream, StreamId,
+        DecoderInstruction as D, DecoderStream, DecoderStreamLimits, StreamId,
         codec::{ReadError, WriteDecoderInstructionHostExt},
     },
     integer,
 };
 use libfuzzer_sys::fuzz_target;
 use nitori_call::{ReceiverAccess, call};
-use nitori_io::Read;
+use nitori_codec::DecodeFrom;
+use nitori_io::{Read, calls::ReadValue};
 
 /// One instruction from a fresh stream; after a failure the same stream must
 /// report the interruption.
@@ -20,12 +21,12 @@ async fn read_one<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     max_wire_len: usize,
 ) -> Result<Option<D>, ()> {
-    let mut stream = DecoderStream::new(io);
-    match stream.next_instruction(max_wire_len).await {
-        Ok(instruction) => Ok(instruction),
+    let mut stream = DecoderStream::new(io, DecoderStreamLimits { max_wire_len });
+    match Option::<ReadValue<D, ()>>::decode_from(&mut stream).await {
+        Ok(instruction) => Ok(instruction.map(|read| read.value)),
         Err(_) => {
             assert!(matches!(
-                stream.next_instruction(max_wire_len).await,
+                Option::<ReadValue<D, ()>>::decode_from(&mut stream).await,
                 Err(ReadError::Interrupted)
             ));
             Err(())

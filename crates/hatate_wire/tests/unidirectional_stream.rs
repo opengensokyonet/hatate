@@ -2,6 +2,9 @@
 //! The start of a unidirectional stream (RFC 9114 §6.2, RFC 9204 §4.2): the
 //! type, which keeps its width, what the parts of HTTP/3 make of each type in
 //! each of the two classes, and the streams they give.
+mod common;
+
+use common::{next_critical_decoder, next_critical_encoder};
 use core::convert::Infallible;
 use frunk_core::{HList, coproduct::Coproduct};
 use hatate_wire::{
@@ -719,7 +722,7 @@ async fn qpack_instructions<
         Http3UnidirectionalStream::QpackEncoder(stream) => {
             let mut stream: QpackEncoderStream<_> = stream.into_stream();
             loop {
-                match stream.next_instruction(1000, 1000).await {
+                match next_critical_encoder(&mut stream, 1000, 1000).await {
                     Ok(started) => {
                         // The variants of the instruction belong to hatate_qpack.
                         drop(started);
@@ -732,7 +735,7 @@ async fn qpack_instructions<
         Http3UnidirectionalStream::QpackDecoder(stream) => {
             let mut stream: QpackDecoderStream<_> = stream.into_stream();
             loop {
-                match stream.next_instruction(1000).await {
+                match next_critical_decoder(&mut stream, 1000).await {
                     Ok(instruction) => seen.push(format!("{instruction:?}")),
                     Err(error) => return (seen, ended(error.error_code())),
                 }
