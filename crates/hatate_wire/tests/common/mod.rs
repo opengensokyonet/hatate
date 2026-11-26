@@ -634,3 +634,96 @@ where
     let next = ReadValue::<DecoderInstruction, ()>::decode_from(reader).await?;
     Ok(next.value)
 }
+
+/// A sink that takes `quota` bytes in all, by writes or by lending its
+/// storage, and answers `Pending` once it is full, as a QUIC stream does when
+/// its flow-control credit is used up.
+pub struct Quota {
+    written: bytes::BytesMut,
+    quota: usize,
+}
+
+impl Quota {
+    pub fn new(quota: usize) -> Self {
+        Self {
+            written: bytes::BytesMut::new(),
+            quota,
+        }
+    }
+
+    /// The bytes taken so far.
+    pub fn written(&self) -> &[u8] {
+        &self.written
+    }
+
+    fn room(&self) -> usize {
+        self.quota - self.written.len()
+    }
+}
+
+nitori_call::family_receiver!(impl [] for Quota);
+
+impl nitori_io::Write for Quota {
+    type Error = !;
+    type Report = ();
+    fn poll_write<'visit, I: Buf + ?Sized>(
+        host: Pin<&mut Self::ReceiverView<'visit>>,
+        _cx: &mut Context<'_>,
+        input: &mut I,
+    ) -> Poll<nitori_io::WriteResult<Self>>
+    where
+        Self: 'visit,
+    {
+        let this = host.get_pin_mut().get_mut();
+        if !input.has_remaining() {
+            return Poll::Ready(Ok(None));
+        }
+        let count = this.room().min(input.remaining());
+        let Some(count) = core::num::NonZeroUsize::new(count) else {
+            return Poll::Pending;
+        };
+        this.written.put(input.take(count.get()));
+        Poll::Ready(Ok(Some(nitori_io::WriteSegment { count, report: () })))
+    }
+}
+
+impl nitori_io::WriteLent for Quota {
+    type Buffer<'l> = &'l mut bytes::BytesMut;
+    fn poll_write_lent<'visit, T, A, Fill>(
+        host: Pin<&mut Self::ReceiverView<'visit>>,
+        _cx: &mut Context<'_>,
+        wanted: core::num::NonZeroUsize,
+        fill: Fill,
+    ) -> Poll<nitori_io::WriteLentResult<Self, T, A>>
+    where
+        Self: 'visit,
+        Fill: for<'l> FnOnce(&mut nitori_io::LentBuffer<&'l mut bytes::BytesMut>) -> Result<T, A>,
+    {
+        use nitori_io::{LentOutcome, LentSegment};
+        let this = host.get_pin_mut().get_mut();
+        let Some(granted) = core::num::NonZeroUsize::new(wanted.get().min(this.room())) else {
+            return Poll::Pending;
+        };
+        // What is lent is the empty tail split off the written bytes.
+        this.written.reserve(granted.get());
+        let mut spare = this.written.split_off(this.written.len());
+        let mut lent =
+            nitori_io::LentBuffer::new(&mut spare, granted).expect("the grant fits the room");
+        let result = fill(&mut lent);
+        let kept = core::num::NonZeroUsize::new(spare.len()).filter(|count| *count <= granted);
+        let outcome = match (result, kept) {
+            (Ok(value), Some(count)) => LentOutcome::Kept(LentSegment {
+                count,
+                report: (),
+                value,
+            }),
+            (Ok(value), None) => LentOutcome::NotKept(value),
+            (Err(abandoned), _) => LentOutcome::GaveUp(abandoned),
+        };
+        if !matches!(outcome, LentOutcome::Kept(_)) {
+            spare.clear();
+        }
+        this.written.unsplit(spare);
+        Poll::Ready(Ok(Some(outcome)))
+    }
+}

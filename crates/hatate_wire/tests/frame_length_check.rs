@@ -1,12 +1,17 @@
 //! A frame is written with a payload of exactly its Length: one that writes
 //! more or fewer bytes panics rather than leave a head that does not match.
+//! A payload that fills storage its sink lends (`Fill`) and is longer than
+//! its Length fails with the copy's no-progress error instead.
 mod common;
 
-use common::Liar;
-use hatate_wire::frame::{DataFrameType, Frame};
+use common::{Liar, Quota, run};
+use hatate_wire::frame::{DataFrameType, Frame, codec::EncodeFrameError};
 use nitori_call::ConstructedAccess;
-use nitori_codec::{payload::Buffered, prelude::*};
-use nitori_io::calls::ReadValue;
+use nitori_codec::{
+    payload::{Buffered, Fill},
+    prelude::*,
+};
+use nitori_io::calls::{CopyIntoLentError, ReadValue};
 use sakuya_var_int::{VarInt, VarIntField};
 
 fn buffered(
@@ -57,4 +62,40 @@ fn a_source_that_keeps_its_length_is_written_whole() {
     let mut out = Vec::new();
     out.sync_encode_unpin(frame).unwrap();
     assert_eq!(out, b"\x00\x03abc");
+}
+
+fn fill(data: &'static [u8], claimed: usize) -> Fill<ConstructedAccess<Liar<'static>>> {
+    Fill {
+        source: ConstructedAccess::new(Liar::new(data, claimed)),
+        chunk_maximum: core::num::NonZeroUsize::new(16).unwrap(),
+    }
+}
+
+/// A sink that goes `Pending` once full still takes a whole frame that fills
+/// it exactly: the payload's last loan is not asked of the sink below.
+#[test]
+fn a_filled_payload_is_written_to_a_sink_that_is_then_full() {
+    let frame =
+        nitori_call::__private::run_sync(Frame::new(DataFrameType, fill(b"abc", 3))).unwrap();
+    let mut sink = ConstructedAccess::new(Quota::new(5));
+    let (result, _) = run(frame.encode_into(&mut sink));
+    result.unwrap();
+    assert_eq!(sink.get_ref().written(), b"\x00\x03abc");
+}
+
+/// A source longer than its Length ends the copy with the copy's no-progress
+/// error rather than a panic; what was written is the head and the Length.
+#[test]
+fn a_filled_source_longer_than_its_length_fails_without_panicking() {
+    let frame =
+        nitori_call::__private::run_sync(Frame::new(DataFrameType, fill(b"abcd", 3))).unwrap();
+    let mut sink = ConstructedAccess::new(Quota::new(100));
+    let (result, _) = run(frame.encode_into(&mut sink));
+    let Err(EncodeFrameError::Payload {
+        source: CopyIntoLentError::WriteZero { .. },
+    }) = result
+    else {
+        panic!("expected a WriteZero payload error");
+    };
+    assert_eq!(sink.get_ref().written(), b"\x00\x03abc");
 }
