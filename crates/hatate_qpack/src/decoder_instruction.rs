@@ -1,21 +1,21 @@
 //! Instructions on the QPACK decoder stream (RFC 9204 §4.4).
+//!
+//! A [`DecoderInstruction`] is the same type whether it was read or is to be
+//! written; its integers keep the padding of their encoding, so an
+//! instruction read and written back yields the octets it was read from.
+//! A [`DecoderStream`] reads them or writes them, one at a time.
+mod read;
+mod write;
+
+pub use read::DecodeDecoderInstructionError;
+pub use write::EncodeDecoderInstructionError;
+
 use crate::{
-    encoder_instruction::StreamState,
-    instruction::{self, WireBudget},
-    integer,
+    instruction::Position,
+    integer::{self, PrefixedField, PrefixedInt},
 };
 use core::num::NonZeroU64;
-use nitori_call::{AsAccess, ReceiverAccess};
-use nitori_codec::DecodeFrom;
-use nitori_io::{
-    Combine, Read,
-    adapters::{MergedMetadata, MergingSource},
-    calls::ReadValue,
-};
 use snafu::Snafu;
-
-#[allow(missing_docs)] // The call macro also generates operation and extension trait items.
-pub mod codec;
 
 /// A QUIC stream ID (RFC 9000 §2.1), carried as a QPACK prefixed integer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -27,6 +27,7 @@ impl StreamId {
         self.0
     }
 }
+
 impl TryFrom<u64> for StreamId {
     type Error = StreamIdError;
     fn try_from(value: u64) -> Result<Self, Self::Error> {
@@ -38,12 +39,26 @@ impl TryFrom<u64> for StreamId {
     }
 }
 
+impl TryFrom<PrefixedInt> for StreamId {
+    type Error = StreamIdError;
+    fn try_from(value: PrefixedInt) -> Result<Self, Self::Error> {
+        Self::try_from(value.get())
+    }
+}
+
+impl From<StreamId> for PrefixedInt {
+    fn from(id: StreamId) -> Self {
+        Self::from(id.0)
+    }
+}
+
 /// A QPACK integer that exceeds the QUIC stream ID range.
 #[derive(Debug, PartialEq, Eq, Snafu)]
 #[snafu(display("stream ID {value} exceeds 62 bits"))]
 pub struct StreamIdError {
     value: u64,
 }
+
 impl StreamIdError {
     /// The value received on the wire or passed to the constructor.
     pub const fn value(&self) -> u64 {
@@ -51,10 +66,93 @@ impl StreamIdError {
     }
 }
 
+/// The increment of Insert Count Increment (RFC 9204 §4.4.3): the number of
+/// insertions the decoder received since its last increment, never zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Increment(NonZeroU64);
+
+impl Increment {
+    /// The increment `value`.
+    pub const fn new(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
+    /// The number of insertions.
+    pub const fn get(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
+impl TryFrom<PrefixedInt> for Increment {
+    type Error = ZeroIncrementError;
+    fn try_from(value: PrefixedInt) -> Result<Self, Self::Error> {
+        NonZeroU64::new(value.get())
+            .map(Self)
+            .ok_or(ZeroIncrementError)
+    }
+}
+
+impl From<Increment> for PrefixedInt {
+    fn from(increment: Increment) -> Self {
+        Self::from(increment.0.get())
+    }
+}
+
+/// An increment of zero, which Insert Count Increment may not carry (RFC
+/// 9204 §4.4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Snafu)]
+#[snafu(display("insert count increment is zero"))]
+pub struct ZeroIncrementError;
+
+/// One decoder-stream instruction. Connection state determines whether a
+/// stream reference or the resulting known insert count is valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DecoderInstruction {
+    /// Section Acknowledgment (RFC 9204 §4.4.1): a field section on this
+    /// stream has been processed.
+    SectionAcknowledgment {
+        /// The stream of the field section.
+        stream_id: PrefixedField<StreamId>,
+    },
+    /// Stream Cancellation (RFC 9204 §4.4.2): the decoder abandoned
+    /// processing of this stream.
+    StreamCancellation {
+        /// The stream.
+        stream_id: PrefixedField<StreamId>,
+    },
+    /// Insert Count Increment (RFC 9204 §4.4.3): additional dynamic table
+    /// insertions received by the decoder.
+    InsertCountIncrement {
+        /// The number of insertions.
+        increment: PrefixedField<Increment>,
+    },
+}
+
+/// The prefix widths of the three instructions' integers.
+const ACKNOWLEDGMENT_BITS: u8 = 7;
+const CANCELLATION_BITS: u8 = 6;
+const INCREMENT_BITS: u8 = 6;
+
+impl DecoderInstruction {
+    /// The octets of the instruction on the wire. Exact for an instruction
+    /// whose integer has an encoding in its position, as one read or
+    /// constructed for it has.
+    pub fn wire_len(&self) -> u64 {
+        (match self {
+            Self::SectionAcknowledgment { stream_id } => {
+                stream_id.encoded_len::<ACKNOWLEDGMENT_BITS>()
+            }
+            Self::StreamCancellation { stream_id } => stream_id.encoded_len::<CANCELLATION_BITS>(),
+            Self::InsertCountIncrement { increment } => increment.encoded_len::<INCREMENT_BITS>(),
+        }) as u64
+    }
+}
+
 /// The limit on the instructions of one decoder stream.
 ///
-/// It is checked as each instruction is read and applies to the instructions
-/// read after it is set.
+/// A stream that reads checks it as each instruction is read; a stream that
+/// writes checks it before it writes an instruction. It applies to the
+/// instructions after it is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecoderStreamLimits {
     /// The most wire octets one instruction may take: its first octet and all
@@ -63,7 +161,7 @@ pub struct DecoderStreamLimits {
 }
 
 /// The longest an instruction can be: one prefixed integer, of at most 11
-/// octets, the longest encoding of a `u64`.
+/// octets, the longest encoding a stream reads.
 impl Default for DecoderStreamLimits {
     fn default() -> Self {
         Self {
@@ -72,91 +170,47 @@ impl Default for DecoderStreamLimits {
     }
 }
 
-/// One decoder stream, read instruction by instruction from within a call.
+/// One decoder stream, read or written instruction by instruction from
+/// within a call.
 ///
-/// It is made at an instruction boundary and reads nothing until asked for
-/// the next instruction, which is decoded from the stream as an
+/// It is made at an instruction boundary and does nothing until asked for
+/// the next instruction. An instruction is decoded from the stream as an
 /// `Option<ReadValue<DecoderInstruction, M>>`, `M` being the metadata of the
-/// stream's bytes. Each instruction is read whole and handed over by
-/// value. A read dropped before the first octet of an instruction has read
-/// nothing and leaves the stream at the boundary. An instruction that fails,
-/// or whose read is dropped after it began, leaves the stream interrupted: it reports an error on every later
-/// instruction and is abandoned; [`into_io`](Self::into_io) gives the access
-/// back.
+/// stream's octets, or encoded into it. Each instruction is read whole and
+/// handed over by value, or written whole.
+///
+/// A read dropped before the first octet of an instruction has read nothing,
+/// and a write dropped before the stream accepted an octet, or refused
+/// before it wrote one, has written nothing: the stream stays at the
+/// boundary. An instruction that fails, or whose read or write is dropped
+/// after it began, leaves the stream interrupted: it reports an error on
+/// every later instruction and is abandoned; [`into_io`](Self::into_io)
+/// gives the access back.
 #[derive(Debug)]
 pub struct DecoderStream<A> {
     io: A,
-    state: StreamState,
+    position: Position,
     limits: DecoderStreamLimits,
-}
-
-/// Reads the next instruction. The stream's [`DecoderStreamLimits`] count the
-/// first octet and all continuations.
-///
-/// The value is `None` if the stream ends at the instruction boundary.
-/// Whether that is an error is a question for the stream's place in the
-/// connection. Otherwise the metadata is the merged metadata of the octets of
-/// the instruction. A failure does not return the metadata of the octets read
-/// before it.
-///
-/// # Errors
-///
-/// [`ReadError`](codec::ReadError); after any of them the stream is
-/// interrupted. EOF inside a number is attributed to that instruction's
-/// field.
-impl<'s, A, M> DecodeFrom<&'s mut DecoderStream<A>> for Option<ReadValue<DecoderInstruction, M>>
-where
-    A: ReceiverAccess<Family: Read<Metadata = M>>,
-    M: Combine + Unpin,
-{
-    type Error = codec::ReadError<<A::Family as Read>::Error>;
-
-    async fn decode_from(stream: &'s mut DecoderStream<A>) -> Result<Self, Self::Error> {
-        if stream.state == StreamState::Interrupted {
-            return Err(codec::ReadError::Interrupted);
-        }
-        // A call dropped before the first octet has read nothing: the stream
-        // stays at the boundary.
-        let mut budget = WireBudget::new(stream.limits.max_wire_len);
-        let mut merged = MergedMetadata(M::default());
-        let mut source = MergingSource::new(&mut stream.io, &mut merged);
-        let first = match instruction::octet(&mut source.access(), &mut budget).await {
-            Ok(first) => first,
-            Err(error) if error.ended_before_first_octet() => return Ok(None),
-            Err(source) => {
-                stream.state = StreamState::Interrupted;
-                return Err(codec::ReadError::Prefix { source });
-            }
-        };
-        stream.state = StreamState::Interrupted;
-        let instruction =
-            codec::read_decoder_instruction(&mut source.access(), budget, first).await?;
-        stream.state = StreamState::Boundary;
-        Ok(Some(ReadValue {
-            value: instruction,
-            metadata: merged.0,
-        }))
-    }
 }
 
 impl<A> DecoderStream<A> {
     /// The stream on `io`, an access or an exclusive borrow of one, at an
-    /// instruction boundary, reading instructions within `limits`. Nothing
-    /// is read.
+    /// instruction boundary, with the instructions within `limits`. Nothing
+    /// is read or written.
     pub fn new(io: A, limits: DecoderStreamLimits) -> Self {
         Self {
             io,
-            state: StreamState::Boundary,
+            position: Position::new(),
             limits,
         }
     }
 
-    /// The limit the next instruction is read within.
+    /// The limit of the next instruction.
     pub const fn limits(&self) -> DecoderStreamLimits {
         self.limits
     }
 
-    /// Reads the instructions after this call within `limits`.
+    /// Reads or writes the instructions after this call within `limits`.
     pub fn set_limits(&mut self, limits: DecoderStreamLimits) {
         self.limits = limits;
     }
@@ -165,16 +219,4 @@ impl<A> DecoderStream<A> {
     pub fn into_io(self) -> A {
         self.io
     }
-}
-
-/// One complete decoder-stream instruction. Connection state determines
-/// whether a stream reference or the resulting known insert count is valid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecoderInstruction {
-    /// A field section on this stream has been processed.
-    SectionAcknowledgment(StreamId),
-    /// The decoder abandoned processing of this stream.
-    StreamCancellation(StreamId),
-    /// Additional dynamic table insertions received by the decoder.
-    InsertCountIncrement(NonZeroU64),
 }

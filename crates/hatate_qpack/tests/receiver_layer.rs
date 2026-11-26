@@ -5,43 +5,30 @@
 //! receiver and are kept across any number of separate polls. The same
 //! script runs on both, and what it sees must agree: on the receiver layer
 //! each step is its own poll loop, with the stream kept between them.
-use bytes::BufMut;
+mod common;
+mod support;
+
+use common::{Read as Instruction, Trickle, encoder_stream, next_encoder, octets};
 use core::{
-    convert::Infallible,
     fmt::Debug,
     future::Future,
-    pin::{Pin, pin},
+    num::NonZeroU64,
+    pin::pin,
     task::{Context, Poll, Waker},
 };
 use hatate_qpack::{
     decoder_instruction::{
-        DecoderInstruction, DecoderStream, DecoderStreamLimits, codec::ReadError,
+        DecodeDecoderInstructionError as ReadError, DecoderInstruction, DecoderStream,
+        DecoderStreamLimits, Increment,
     },
     encoder_instruction::{
-        EncoderStream, EncoderStreamLimits, NameReference, Started, codec::StartError,
-        literal::LiteralSource,
+        DecodeEncoderInstructionError as StartError, EncoderInstruction, NameReference,
     },
+    integer::PrefixedField,
 };
 use nitori_call::{ConstructedAccess, ReceiverAccess, call};
-use nitori_codec::DecodeFrom;
+use nitori_codec::{DecodeFrom, EncodeInto};
 use nitori_io::{Read, calls::ReadValue, prelude::*};
-
-async fn next_encoder<'a, F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
-    reader: &'a mut EncoderStream<A>,
-    wire: usize,
-    decoded: usize,
-) -> Result<Option<Started<'a, A>>, StartError<F::Error>> {
-    reader.set_limits(EncoderStreamLimits {
-        max_wire_len: wire,
-        max_decoded_len: decoded,
-    });
-    let next = Option::<ReadValue<Started<'a, A>, ()>>::decode_from(reader).await?;
-    Ok(next.map(|read| read.value))
-}
-
-fn encoder_stream<A>(io: A) -> EncoderStream<A> {
-    EncoderStream::new(io, EncoderStreamLimits::default())
-}
 
 async fn next_decoder<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     reader: &mut DecoderStream<A>,
@@ -58,52 +45,10 @@ fn decoder_stream<A>(io: A) -> DecoderStream<A> {
 
 /// A stream that gives one byte per read and answers Pending once before
 /// each read.
-struct Trickle<'a> {
-    rest: &'a [u8],
-    waiting: bool,
-}
-
-impl<'a> Trickle<'a> {
-    fn new(rest: &'a [u8]) -> Self {
-        Self {
-            rest,
-            waiting: false,
-        }
-    }
-}
-
-nitori_call::family_receiver!(impl ['a] for Trickle<'a>);
-
-impl Read for Trickle<'_> {
-    type Error = Infallible;
-    type Metadata = ();
-    fn poll_read<'v, B: BufMut + ?Sized>(
-        host: Pin<&mut Self::ReceiverView<'v>>,
-        cx: &mut Context<'_>,
-        dst: &mut B,
-    ) -> Poll<Result<Option<nitori_io::ReadSegment<()>>, Self::Error>>
-    where
-        Self: 'v,
-    {
-        let this = host.get_pin_mut().get_mut();
-        if !this.waiting {
-            this.waiting = true;
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-        this.waiting = false;
-        if !dst.has_remaining_mut() {
-            return Poll::Ready(Ok(None));
-        }
-        let Some((&byte, rest)) = this.rest.split_first() else {
-            return Poll::Ready(Ok(None));
-        };
-        this.rest = rest;
-        dst.put_u8(byte);
-        Poll::Ready(Ok(Some(nitori_io::ReadSegment {
-            count: core::num::NonZeroUsize::MIN,
-            metadata: (),
-        })))
+fn trickle(rest: &[u8]) -> Trickle<'_> {
+    Trickle {
+        rest,
+        waiting: false,
     }
 }
 
@@ -156,83 +101,47 @@ macro_rules! ru {
     };
 }
 
-/// Reads a literal to its end a byte at a time, each read a step.
-macro_rules! drain_literal {
-    ($w:ident, $source:expr) => {{
-        let mut got = Vec::new();
-        match $source {
-            LiteralSource::Raw(mut source) => loop {
-                let mut byte = [0u8; 1];
-                if $w!(source.read(&mut &mut byte[..])).unwrap().is_none() {
-                    break;
-                }
-                got.push(byte[0]);
-            },
-            LiteralSource::Huffman(mut source) => loop {
-                let mut byte = [0u8; 1];
-                if $w!(source.read(&mut &mut byte[..])).unwrap().is_none() {
-                    break;
-                }
-                got.push(byte[0]);
-            },
-        }
-        String::from_utf8(got).unwrap()
-    }};
+fn text(octets: &[u8]) -> String {
+    String::from_utf8_lossy(octets).into_owned()
 }
 
-fn describe<A: ReceiverAccess<Family: Read>, E: Debug>(
-    result: Result<Option<Started<'_, A>>, StartError<E>>,
-) -> String {
+fn describe<E: Debug>(result: Result<Option<Instruction>, StartError<E>>) -> String {
     match result {
         Ok(None) => "end".to_string(),
-        Ok(Some(Started::SetDynamicTableCapacity(n))) => format!("capacity {n}"),
-        Ok(Some(Started::Duplicate(n))) => format!("duplicate {n}"),
-        Ok(Some(Started::InsertWithNameReference { .. })) => "insert with reference".to_string(),
-        Ok(Some(Started::InsertWithLiteralName(_))) => "insert with literal name".to_string(),
+        Ok(Some(EncoderInstruction::SetDynamicTableCapacity { capacity })) => {
+            format!("capacity {}", capacity.value())
+        }
+        Ok(Some(EncoderInstruction::Duplicate { index })) => {
+            format!("duplicate {}", index.value())
+        }
+        Ok(Some(EncoderInstruction::InsertWithNameReference { name, value })) => {
+            let name = match name {
+                NameReference::Static { index } => {
+                    format!("static {}", text(index.value().entry().0))
+                }
+                NameReference::Relative { index } => format!("relative {}", index.value()),
+            };
+            format!("{name} = {}", text(octets(&value)))
+        }
+        Ok(Some(EncoderInstruction::InsertWithLiteralName { name, value })) => {
+            format!("{} = {}", text(octets(&name)), text(octets(&value)))
+        }
         Err(error) => format!("error {error:?}"),
     }
 }
 
-/// Every instruction of an encoder stream to the end or the first failure,
-/// with its literals read a byte at a time; what the access has left.
+/// Every instruction of an encoder stream to the end or the first failure;
+/// what the access has left.
 macro_rules! encoder_log {
     ($io:expr, $w:ident) => {{
         let mut log = Vec::new();
         let mut reader = encoder_stream($io);
         loop {
-            let started = match $w!(next_encoder(&mut reader, 64, 64)) {
-                Ok(Some(started)) => started,
-                Ok(None) => {
-                    log.push("end".to_string());
-                    break;
-                }
-                Err(error) => {
-                    log.push(format!("error {error:?}"));
-                    break;
-                }
-            };
-            match started {
-                Started::SetDynamicTableCapacity(n) => log.push(format!("capacity {n}")),
-                Started::Duplicate(n) => log.push(format!("duplicate {n}")),
-                Started::InsertWithNameReference { name, value } => {
-                    let name = match name {
-                        NameReference::Static(index) => {
-                            format!("static {}", String::from_utf8_lossy(index.entry().0))
-                        }
-                        NameReference::Relative(n) => format!("relative {n}"),
-                    };
-                    let mut value = $w!(value.open()).unwrap().value;
-                    let text = drain_literal!($w, value.source());
-                    value.finish().unwrap();
-                    log.push(format!("{name} = {text}"));
-                }
-                Started::InsertWithLiteralName(mut name) => {
-                    let name_text = drain_literal!($w, name.source());
-                    let mut value = $w!(name.finish().unwrap().open()).unwrap().value;
-                    let text = drain_literal!($w, value.source());
-                    value.finish().unwrap();
-                    log.push(format!("{name_text} = {text}"));
-                }
+            let entry = describe($w!(next_encoder(&mut reader, 64, 64)));
+            let last = entry == "end" || entry.starts_with("error");
+            log.push(entry);
+            if last {
+                break;
             }
         }
         let mut io = reader.into_io();
@@ -242,7 +151,7 @@ macro_rules! encoder_log {
 }
 
 #[call(sync)]
-async fn encoder_in_call<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+async fn encoder_in_call<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
 ) -> (Vec<String>, Vec<u8>)
 where
@@ -251,46 +160,13 @@ where
     encoder_log!(&mut *io, aw)
 }
 
-fn encoder_on_receiver<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+fn encoder_on_receiver<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: A,
 ) -> (Vec<String>, Vec<u8>)
 where
     <F as Read>::Error: Debug,
 {
     encoder_log!(io, ru)
-}
-
-/// A literal name that is read and then dropped, or left unfinished, never
-/// advances to its value: the stream is interrupted, and the access is where
-/// the name left it.
-macro_rules! abandon_log {
-    ($io:expr, $w:ident) => {{
-        let mut reader = encoder_stream($io);
-        let first = describe($w!(next_encoder(&mut reader, 32, 32)));
-        let second = describe($w!(next_encoder(&mut reader, 32, 32)));
-        let mut io = reader.into_io();
-        let rest = $w!(rest_of(&mut io));
-        (vec![first, second], rest)
-    }};
-}
-
-#[call(sync)]
-async fn abandon_in_call<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
-    io: &mut A,
-) -> (Vec<String>, Vec<u8>)
-where
-    <F as Read>::Error: Debug,
-{
-    abandon_log!(&mut *io, aw)
-}
-
-fn abandon_on_receiver<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
-    io: A,
-) -> (Vec<String>, Vec<u8>)
-where
-    <F as Read>::Error: Debug,
-{
-    abandon_log!(io, ru)
 }
 
 /// The read of an instruction dropped after `polls` polls, then what the
@@ -307,7 +183,7 @@ macro_rules! dropped_log {
 }
 
 #[call(sync)]
-async fn dropped_in_call<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+async fn dropped_in_call<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
     polls: usize,
 ) -> (bool, String, Vec<u8>)
@@ -317,7 +193,7 @@ where
     dropped_log!(&mut *io, aw, polls)
 }
 
-fn dropped_on_receiver<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+fn dropped_on_receiver<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: A,
     polls: usize,
 ) -> (bool, String, Vec<u8>)
@@ -350,13 +226,13 @@ fn encoder_instructions_read_across_runs_agree_with_the_call_layer() {
     let in_call = slice.sync_encoder_in_call_unpin();
     assert_eq!(in_call, (expected_encoder_log(), vec![]));
 
-    let mut host = Trickle::new(ENCODER_WIRE);
+    let mut host = trickle(ENCODER_WIRE);
     let (suspended, pending) = run(host.encoder_in_call_unpin());
     assert!(pending > 0);
     assert_eq!(suspended, in_call);
 
     // By value, each step its own poll loop.
-    let on_receiver = encoder_on_receiver(ConstructedAccess::new(Trickle::new(ENCODER_WIRE)));
+    let on_receiver = encoder_on_receiver(ConstructedAccess::new(trickle(ENCODER_WIRE)));
     assert_eq!(on_receiver, in_call);
     let on_receiver = encoder_on_receiver(ConstructedAccess::new(ENCODER_WIRE));
     assert_eq!(on_receiver, in_call);
@@ -371,51 +247,27 @@ fn encoder_instructions_on_a_borrowed_receiver_leave_what_they_did_not_read() {
             describe(run(next_encoder(&mut reader, 64, 64)).0),
             "capacity 220"
         );
-        let Some(Started::InsertWithNameReference { value, .. }) =
-            run(next_encoder(&mut reader, 64, 64)).0.unwrap()
-        else {
-            panic!("not an insertion with a reference");
-        };
-        let mut value = run(value.open()).0.unwrap().value;
-        let LiteralSource::Raw(mut source) = value.source() else {
-            panic!("not raw");
-        };
-        // The literal is read in two separate runs.
-        assert_eq!(run(source.read_array::<4>()).0.unwrap().value, *b"www.");
-        assert_eq!(
-            run(source.read_array::<11>()).0.unwrap().value,
-            *b"example.com"
-        );
-        value.finish().unwrap();
-        // The stream is at a boundary again.
         assert_eq!(
             describe(run(next_encoder(&mut reader, 64, 64)).0),
-            "insert with literal name"
+            "static :authority = www.example.com"
         );
     }
-    // The literal name was dropped unfinished: its first byte is still there.
-    assert_eq!(input, b"x\x81\x1f\x42ab\x01y\x00");
+    // The stream was dropped at a boundary: the next instruction is there.
+    assert_eq!(input, b"\x41x\x81\x1f\x42ab\x01y\x00");
 }
 
 #[test]
-fn a_literal_name_left_unfinished_interrupts_the_stream_on_the_receiver_layer() {
-    let wire = [0x41, b'x', 0, 0x20];
+fn an_insertion_cut_in_its_value_interrupts_the_stream_on_the_receiver_layer_too() {
+    let wire = [0x41, b'x', 0x02, b'y'];
     let mut slice = &wire[..];
-    let in_call = slice.sync_abandon_in_call_unpin();
-    assert_eq!(
-        in_call,
-        (
-            vec![
-                "insert with literal name".to_string(),
-                "error Interrupted".to_string()
-            ],
-            vec![b'x', 0, 0x20]
-        )
-    );
-    let on_receiver = abandon_on_receiver(ConstructedAccess::new(Trickle::new(&wire)));
+    let in_call = slice.sync_encoder_in_call_unpin();
+    assert_eq!(in_call.0.len(), 1);
+    assert!(in_call.0[0].contains("Truncated"), "{in_call:?}");
+    assert!(in_call.1.is_empty());
+    let on_receiver = encoder_on_receiver(ConstructedAccess::new(trickle(&wire)));
     assert_eq!(on_receiver, in_call);
-    let mut host = Trickle::new(&wire);
-    assert_eq!(run(host.abandon_in_call_unpin()).0, in_call);
+    let mut host = trickle(&wire);
+    assert_eq!(run(host.encoder_in_call_unpin()).0, in_call);
 }
 
 #[test]
@@ -424,9 +276,9 @@ fn an_instruction_read_dropped_in_the_middle_behaves_as_it_does_in_a_call() {
     let wire = b"\x3f\xbd\x01\x41x\x01y";
     let mut outcomes = Vec::new();
     for polls in 0..14 {
-        let mut host = Trickle::new(wire);
+        let mut host = trickle(wire);
         let in_call = run(host.dropped_in_call_unpin(polls)).0;
-        let on_receiver = dropped_on_receiver(ConstructedAccess::new(Trickle::new(wire)), polls);
+        let on_receiver = dropped_on_receiver(ConstructedAccess::new(trickle(wire)), polls);
         assert_eq!(on_receiver, in_call, "polls {polls}");
         outcomes.push(in_call);
     }
@@ -525,9 +377,9 @@ fn decoder_instructions_read_across_runs_agree_with_the_call_layer() {
     assert_eq!(in_call.0[3..], ["end", "end"]);
     assert!(in_call.1.is_empty());
 
-    let mut host = Trickle::new(&wire);
+    let mut host = trickle(&wire);
     assert_eq!(run(host.decoder_in_call_unpin(5)).0, in_call);
-    let on_receiver = decoder_on_receiver(ConstructedAccess::new(Trickle::new(&wire)), 5);
+    let on_receiver = decoder_on_receiver(ConstructedAccess::new(trickle(&wire)), 5);
     assert_eq!(on_receiver, in_call);
 
     // Borrowed: the stream is dropped after one instruction, and the access
@@ -551,7 +403,7 @@ fn a_decoder_stream_cut_in_a_number_is_interrupted_on_the_receiver_layer_too() {
     assert_eq!(in_call.0[2], "error Interrupted");
     assert_eq!(in_call.0[3], "error Interrupted");
     assert!(in_call.1.is_empty());
-    let on_receiver = decoder_on_receiver(ConstructedAccess::new(Trickle::new(&wire)), 4);
+    let on_receiver = decoder_on_receiver(ConstructedAccess::new(trickle(&wire)), 4);
     assert_eq!(on_receiver, in_call);
 }
 
@@ -560,10 +412,10 @@ fn a_decoder_read_dropped_in_the_middle_behaves_as_it_does_in_a_call() {
     let wire = [0x3f, 0x80, 0x01, 0x84];
     let mut outcomes = Vec::new();
     for polls in 0..8 {
-        let mut host = Trickle::new(&wire);
+        let mut host = trickle(&wire);
         let in_call = run(host.decoder_dropped_in_call_unpin(polls)).0;
         let on_receiver =
-            decoder_dropped_on_receiver(ConstructedAccess::new(Trickle::new(&wire)), polls);
+            decoder_dropped_on_receiver(ConstructedAccess::new(trickle(&wire)), polls);
         assert_eq!(on_receiver, in_call, "polls {polls}");
         outcomes.push(in_call);
     }
@@ -580,42 +432,53 @@ fn assert_send<T: Send>(_: &T) {}
 fn the_instruction_streams_and_their_futures_are_send_when_the_receiver_is() {
     let wire = [0x3f, 0xbd, 0x01];
     // The access held by value.
-    let mut encoder = encoder_stream(ConstructedAccess::new(Trickle::new(&wire)));
+    let mut encoder = encoder_stream(ConstructedAccess::new(trickle(&wire)));
     assert_send(&encoder);
     {
         let next = next_encoder(&mut encoder, 64, 64);
         assert_send(&next);
     }
     // The access held by `&mut`.
-    let mut host = ConstructedAccess::new(Trickle::new(&wire));
+    let mut host = ConstructedAccess::new(trickle(&wire));
     let mut encoder = encoder_stream(&mut host);
     assert_send(&encoder);
     {
         let next = next_encoder(&mut encoder, 64, 64);
         assert_send(&next);
     }
-    // The start of a value, opened.
-    let mut encoder = encoder_stream(ConstructedAccess::new(Trickle::new(ENCODER_WIRE)));
+    // An instruction read, and its write.
+    let mut encoder = encoder_stream(ConstructedAccess::new(trickle(ENCODER_WIRE)));
     let _ = run(next_encoder(&mut encoder, 64, 64));
-    let Some(Started::InsertWithNameReference { value, .. }) =
-        run(next_encoder(&mut encoder, 64, 64)).0.unwrap()
-    else {
-        panic!("not an insertion with a reference");
+    let instruction = run(next_encoder(&mut encoder, 64, 64)).0.unwrap().unwrap();
+    assert_send(&instruction);
+    let mut output = encoder_stream(ConstructedAccess::new(Vec::new()));
+    let made: EncoderInstruction<&[u8], &[u8]> = EncoderInstruction::InsertWithLiteralName {
+        name: support::raw(&b"x"[..]),
+        value: support::huffman(&b"y"[..]),
     };
-    assert_send(&value);
-    let open = value.open::<()>();
-    assert_send(&open);
-    let mut decoder = decoder_stream(ConstructedAccess::new(Trickle::new(&wire)));
+    {
+        let write = made.encode_into(&mut output);
+        assert_send(&write);
+    }
+    let mut decoder = decoder_stream(ConstructedAccess::new(trickle(&wire)));
     assert_send(&decoder);
     {
         let next = next_decoder(&mut decoder, 8);
         assert_send(&next);
     }
-    let mut host = ConstructedAccess::new(Trickle::new(&wire));
+    let mut host = ConstructedAccess::new(trickle(&wire));
     let mut decoder = decoder_stream(&mut host);
     assert_send(&decoder);
     {
         let next = next_decoder(&mut decoder, 8);
         assert_send(&next);
+    }
+    let mut output = decoder_stream(ConstructedAccess::new(Vec::new()));
+    let increment = DecoderInstruction::InsertCountIncrement {
+        increment: PrefixedField::shortest(Increment::new(NonZeroU64::MIN)),
+    };
+    {
+        let write = increment.encode_into(&mut output);
+        assert_send(&write);
     }
 }

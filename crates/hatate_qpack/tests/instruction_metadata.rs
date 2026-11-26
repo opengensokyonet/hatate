@@ -1,6 +1,10 @@
 //! The metadata of the bytes of an instruction, merged into what is read
 //! from them, and the reports of what is written.
+mod common;
+mod support;
+
 use bytes::{Buf, BufMut};
+use common::{Collected, octets};
 use core::{
     num::NonZeroUsize,
     pin::Pin,
@@ -8,19 +12,21 @@ use core::{
 };
 use hatate_qpack::{
     decoder_instruction::{
-        DecoderInstruction as D, DecoderStream, DecoderStreamLimits, StreamId,
-        codec::WriteDecoderInstructionHostExt,
+        DecoderInstruction as D, DecoderStream, DecoderStreamLimits, Increment, StreamId,
     },
-    encoder_instruction::{
-        EncoderStream, EncoderStreamLimits, NameReference, Started,
-        literal::LiteralSource,
-        write::{Payload, Writer},
-    },
+    encoder_instruction::{EncoderInstruction, EncoderStream, EncoderStreamLimits, NameReference},
+    integer::{PrefixedField, PrefixedInt},
     static_table::Index,
 };
 use nitori_call::{ConstructedAccess, family_receiver};
-use nitori_codec::DecodeFrom;
-use nitori_io::{Combine, Read, ReadSegment, Write, WriteSegment, calls::ReadValue, prelude::*};
+use nitori_codec::{DecodeFrom, EncodeInto};
+use nitori_io::{
+    ChunkSegment, Combine, Read, ReadChunk, ReadSegment, Write, WriteSegment, calls::ReadValue,
+};
+use support::{huffman, raw};
+
+/// An instruction as these tests read it.
+type E = EncoderInstruction<Collected, Vec<u8>>;
 
 /// The positions in the stream of the bytes read, in the order they were
 /// merged: a metadata that shows which segments were merged and how.
@@ -38,8 +44,8 @@ fn at(positions: &[usize]) -> Positions {
     Positions(positions.to_vec())
 }
 
-/// A stream that hands out one byte per read; the metadata of each byte is
-/// its position.
+/// A stream that hands out one byte per read or chunk; the metadata of each
+/// byte is its position.
 struct Numbered<'a> {
     data: &'a [u8],
     position: usize,
@@ -74,6 +80,28 @@ impl Read for Numbered<'_> {
     }
 }
 
+impl<'a> ReadChunk for Numbered<'a> {
+    type Chunk = &'a [u8];
+    fn poll_read_chunk<'v>(
+        host: Pin<&mut Self::ReceiverView<'v>>,
+        _: &mut Context<'_>,
+        _: NonZeroUsize,
+    ) -> Poll<Result<Option<ChunkSegment<&'a [u8], Positions>>, !>>
+    where
+        Self: 'v,
+    {
+        let this = host.get_pin_mut().get_mut();
+        if this.data.is_empty() {
+            return Poll::Ready(Ok(None));
+        }
+        let (chunk, rest) = this.data.split_at(1);
+        this.data = rest;
+        let metadata = Positions(vec![this.position]);
+        this.position += 1;
+        Poll::Ready(Ok(Some(ChunkSegment { chunk, metadata })))
+    }
+}
+
 fn numbered(data: &[u8]) -> ConstructedAccess<Numbered<'_>> {
     ConstructedAccess::new(Numbered { data, position: 0 })
 }
@@ -87,171 +115,90 @@ const LIMITS: EncoderStreamLimits = EncoderStreamLimits {
     max_decoded_len: 64,
 };
 
+fn int(value: u64) -> PrefixedField {
+    PrefixedField::shortest(PrefixedInt::from(value))
+}
+
+/// The next instruction of `stream` with the metadata of its octets.
+fn next<A: nitori_call::ReceiverAccess<Family: ReadChunk<Metadata = M, Chunk = &'static [u8]>>, M>(
+    stream: &mut EncoderStream<A>,
+) -> Option<ReadValue<E, M>>
+where
+    M: Combine + Unpin,
+    <A::Family as Read>::Error: core::fmt::Debug,
+{
+    run(Option::<ReadValue<E, M>>::decode_from(stream)).unwrap()
+}
+
 #[test]
 fn an_integer_instruction_has_the_metadata_of_its_octets() {
     // Set Dynamic Table Capacity 220 (three octets), Duplicate 1, Duplicate
     // 31 (two octets) and Set Dynamic Table Capacity 0.
-    let wire = [0x3f, 0xbd, 0x01, 0x01, 0x1f, 0x00, 0x20];
-    let mut stream = EncoderStream::new(numbered(&wire), LIMITS);
-    let capacity = run(Option::<ReadValue<Started<'_, _>, Positions>>::decode_from(
-        &mut stream,
-    ))
-    .unwrap()
-    .unwrap();
-    assert!(matches!(
-        capacity.value,
-        Started::SetDynamicTableCapacity(220)
-    ));
-    assert_eq!(capacity.metadata, at(&[0, 1, 2]));
-    let duplicate = run(Option::<ReadValue<Started<'_, _>, Positions>>::decode_from(
-        &mut stream,
-    ))
-    .unwrap()
-    .unwrap();
-    assert!(matches!(duplicate.value, Started::Duplicate(1)));
-    assert_eq!(duplicate.metadata, at(&[3]));
-    let duplicate = run(Option::<ReadValue<Started<'_, _>, Positions>>::decode_from(
-        &mut stream,
-    ))
-    .unwrap()
-    .unwrap();
-    assert!(matches!(duplicate.value, Started::Duplicate(31)));
-    assert_eq!(duplicate.metadata, at(&[4, 5]));
-    let capacity = run(Option::<ReadValue<Started<'_, _>, Positions>>::decode_from(
-        &mut stream,
-    ))
-    .unwrap()
-    .unwrap();
-    assert!(matches!(
-        capacity.value,
-        Started::SetDynamicTableCapacity(0)
-    ));
-    assert_eq!(capacity.metadata, at(&[6]));
-    // The end at the boundary has read nothing, so it has no metadata.
-    assert!(
-        run(Option::<ReadValue<Started<'_, _>, Positions>>::decode_from(
-            &mut stream
-        ))
-        .unwrap()
-        .is_none()
+    let wire: &'static [u8] = &[0x3f, 0xbd, 0x01, 0x01, 0x1f, 0x00, 0x20];
+    let mut stream = EncoderStream::new(numbered(wire), LIMITS);
+    let read = next(&mut stream).unwrap();
+    assert_eq!(
+        read.value,
+        E::SetDynamicTableCapacity { capacity: int(220) }
     );
+    assert_eq!(read.metadata, at(&[0, 1, 2]));
+    let read = next(&mut stream).unwrap();
+    assert_eq!(read.value, E::Duplicate { index: int(1) });
+    assert_eq!(read.metadata, at(&[3]));
+    let read = next(&mut stream).unwrap();
+    assert_eq!(read.value, E::Duplicate { index: int(31) });
+    assert_eq!(read.metadata, at(&[4, 5]));
+    let read = next(&mut stream).unwrap();
+    assert_eq!(read.value, E::SetDynamicTableCapacity { capacity: int(0) });
+    assert_eq!(read.metadata, at(&[6]));
+    // The end at the boundary has read nothing, so it has no metadata.
+    assert!(next(&mut stream).is_none());
 }
 
 #[test]
-fn an_insertion_with_a_name_reference_has_the_metadata_of_each_part() {
+fn an_insertion_has_the_metadata_of_all_of_its_octets() {
     // A relative index of 64 (two octets), then the value "xy" with its
     // length, and Set Dynamic Table Capacity 0.
-    let wire = [0xbf, 0x01, 0x02, b'x', b'y', 0x20];
-    let mut stream = EncoderStream::new(numbered(&wire), LIMITS);
-    let start = run(Option::<ReadValue<Started<'_, _>, Positions>>::decode_from(
-        &mut stream,
-    ))
-    .unwrap()
-    .unwrap();
-    assert_eq!(start.metadata, at(&[0, 1]));
-    let Started::InsertWithNameReference {
-        name: NameReference::Relative(64),
+    let wire: &'static [u8] = &[0xbf, 0x01, 0x02, b'x', b'y', 0x20];
+    let mut stream = EncoderStream::new(numbered(wire), LIMITS);
+    let read = next(&mut stream).unwrap();
+    let E::InsertWithNameReference {
+        name: NameReference::Relative { index },
         value,
-    } = start.value
+    } = read.value
     else {
         panic!("a reference to a dynamic entry");
     };
-    let mut value = run(value.open()).unwrap();
-    assert_eq!(value.metadata, at(&[2]));
-    // A raw literal reports the metadata of its own bytes.
-    let LiteralSource::Raw(mut source) = value.value.source() else {
-        panic!("a raw value");
-    };
-    let mut seen = Vec::new();
-    let mut byte = [0u8; 1];
-    while let Some(segment) = run(source.read(&mut &mut byte[..])).unwrap() {
-        seen.push((byte[0], segment.metadata));
-    }
-    assert_eq!(seen, [(b'x', at(&[3])), (b'y', at(&[4]))]);
-    value.value.finish().unwrap();
-    let next = run(Option::<ReadValue<Started<'_, _>, Positions>>::decode_from(
-        &mut stream,
-    ))
-    .unwrap()
-    .unwrap();
-    assert!(matches!(next.value, Started::SetDynamicTableCapacity(0)));
-    assert_eq!(next.metadata, at(&[5]));
-}
-
-#[test]
-fn an_insertion_with_a_literal_name_has_the_metadata_of_each_part() {
+    assert_eq!((index, octets(&value)), (int(64), &b"xy"[..]));
+    assert_eq!(read.metadata, at(&[0, 1, 2, 3, 4]));
+    let read = next(&mut stream).unwrap();
+    assert_eq!(read.value, E::SetDynamicTableCapacity { capacity: int(0) });
+    assert_eq!(read.metadata, at(&[5]));
     // The name "ab" (raw), the value "c" (raw).
-    let wire = [0x42, b'a', b'b', 0x01, b'c'];
-    let mut stream = EncoderStream::new(numbered(&wire), LIMITS);
-    let start = run(Option::<ReadValue<Started<'_, _>, Positions>>::decode_from(
-        &mut stream,
-    ))
-    .unwrap()
-    .unwrap();
-    assert_eq!(start.metadata, at(&[0]));
-    let Started::InsertWithLiteralName(mut name) = start.value else {
+    let wire: &'static [u8] = &[0x42, b'a', b'b', 0x01, b'c'];
+    let mut stream = EncoderStream::new(numbered(wire), LIMITS);
+    let read = next(&mut stream).unwrap();
+    let E::InsertWithLiteralName { name, value } = &read.value else {
         panic!("a literal name");
     };
-    {
-        let LiteralSource::Raw(mut source) = name.source() else {
-            panic!("a raw name");
-        };
-        let mut byte = [0u8; 1];
-        let first = run(source.read(&mut &mut byte[..])).unwrap().unwrap();
-        assert_eq!((byte[0], first.metadata), (b'a', at(&[1])));
-        let second = run(source.read(&mut &mut byte[..])).unwrap().unwrap();
-        assert_eq!((byte[0], second.metadata), (b'b', at(&[2])));
-    }
-    let mut value = run(name.finish().unwrap().open()).unwrap();
-    assert_eq!(value.metadata, at(&[3]));
-    let LiteralSource::Raw(mut source) = value.value.source() else {
-        panic!("a raw value");
-    };
-    let mut byte = [0u8; 1];
-    let third = run(source.read(&mut &mut byte[..])).unwrap().unwrap();
-    assert_eq!((byte[0], third.metadata), (b'c', at(&[4])));
-    value.value.finish().unwrap();
+    assert_eq!((octets(name), octets(value)), (&b"ab"[..], &b"c"[..]));
+    assert_eq!(read.metadata, at(&[0, 1, 2, 3, 4]));
 }
 
 #[test]
 fn a_huffman_value_has_the_metadata_of_the_octets_it_was_decoded_from() {
     // A static name reference to :authority, then the value
     // "www.example.com" as a Huffman literal of 12 octets (RFC 7541 C.4.1).
-    let wire = [
+    let wire: &'static [u8] = &[
         0xc0, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
     ];
-    let mut stream = EncoderStream::new(numbered(&wire), LIMITS);
-    let start = run(Option::<ReadValue<Started<'_, _>, Positions>>::decode_from(
-        &mut stream,
-    ))
-    .unwrap()
-    .unwrap();
-    assert_eq!(start.metadata, at(&[0]));
-    let Started::InsertWithNameReference { value, .. } = start.value else {
+    let mut stream = EncoderStream::new(numbered(wire), LIMITS);
+    let read = next(&mut stream).unwrap();
+    let E::InsertWithNameReference { value, .. } = &read.value else {
         panic!("a name reference");
     };
-    let mut value = run(value.open()).unwrap();
-    assert_eq!(value.metadata, at(&[1]));
-    let mut decoded = Vec::new();
-    let mut reported = Vec::new();
-    {
-        let LiteralSource::Huffman(mut source) = value.value.source() else {
-            panic!("a Huffman value");
-        };
-        let mut byte = [0u8; 1];
-        while let Some(segment) = run(source.read(&mut &mut byte[..])).unwrap() {
-            decoded.push(byte[0]);
-            // Each decoded byte comes from octets of the literal, in order.
-            assert!(!segment.metadata.0.is_empty());
-            assert!(segment.metadata.0.is_sorted());
-            reported.extend(segment.metadata.0);
-        }
-    }
-    assert_eq!(decoded, b"www.example.com");
-    reported.dedup();
-    // Every octet of the literal is reported.
-    assert_eq!(reported, (2..14).collect::<Vec<_>>());
-    value.value.finish().unwrap();
+    assert_eq!(octets(value), b"www.example.com");
+    assert_eq!(read.metadata, at(&(0..14).collect::<Vec<_>>()));
 }
 
 #[test]
@@ -265,41 +212,41 @@ fn a_decoder_instruction_has_the_metadata_of_its_octets() {
     {
         seen.push((read.value, read.metadata));
     }
+    let id = |id| PrefixedField::shortest(StreamId::try_from(id).unwrap());
     assert_eq!(
         seen,
         [
+            (D::SectionAcknowledgment { stream_id: id(4) }, at(&[0])),
             (
-                D::SectionAcknowledgment(StreamId::try_from(4).unwrap()),
-                at(&[0])
+                D::InsertCountIncrement {
+                    increment: PrefixedField::shortest(Increment::new(
+                        core::num::NonZeroU64::new(5).unwrap()
+                    ))
+                },
+                at(&[1])
             ),
-            (D::InsertCountIncrement(5.try_into().unwrap()), at(&[1])),
-            (
-                D::StreamCancellation(StreamId::try_from(64).unwrap()),
-                at(&[2, 3])
-            ),
+            (D::StreamCancellation { stream_id: id(64) }, at(&[2, 3])),
         ]
     );
 }
 
 #[test]
-fn the_first_octet_of_every_instruction_is_read_through_the_merged_source() {
-    // The same stream read without metadata gives the same instructions.
+fn an_instruction_read_without_metadata_is_the_same() {
     let wire = [0xbf, 0x01, 0x02, b'x', b'y', 0x20];
     let mut input = &wire[..];
     let mut stream = EncoderStream::new(ConstructedAccess::new(&mut input), LIMITS);
-    let start = run(Option::<ReadValue<Started<'_, _>, ()>>::decode_from(
-        &mut stream,
-    ))
-    .unwrap()
-    .unwrap();
-    assert_eq!(start.metadata, ());
+    let read = run(Option::<ReadValue<E, ()>>::decode_from(&mut stream))
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.metadata, ());
     assert!(matches!(
-        start.value,
-        Started::InsertWithNameReference {
-            name: NameReference::Relative(64),
+        read.value,
+        E::InsertWithNameReference {
+            name: NameReference::Relative { index },
             ..
-        }
+        } if index == int(64)
     ));
+    assert_eq!(input, [0x20]);
 }
 
 /// What a sink counts of the writes it accepts.
@@ -345,42 +292,54 @@ impl Write for Tally {
 
 #[test]
 fn a_decoder_instruction_is_written_with_the_report_of_its_octets() {
-    let mut sink = Tally::default();
-    let report = sink
-        .sync_write_decoder_instruction_unpin(D::StreamCancellation(64.try_into().unwrap()), 8)
-        .unwrap();
-    assert_eq!(sink.bytes, [0x7f, 0x01]);
+    let mut sink = ConstructedAccess::new(Tally::default());
+    let mut stream = DecoderStream::new(&mut sink, DecoderStreamLimits { max_wire_len: 8 });
+    let cancellation = D::StreamCancellation {
+        stream_id: PrefixedField::shortest(StreamId::try_from(64).unwrap()),
+    };
+    let report = run(cancellation.encode_into(&mut stream)).unwrap();
     assert_eq!(report, Writes(2));
+    assert_eq!(sink.into_inner().bytes, [0x7f, 0x01]);
 }
 
 #[test]
-fn each_step_of_an_encoder_instruction_is_written_with_its_own_report() {
+fn an_encoder_instruction_is_written_with_the_report_of_all_of_its_octets() {
+    type Made = EncoderInstruction<&'static [u8], &'static [u8]>;
     let mut sink = ConstructedAccess::new(Tally::default());
-    let mut writer = Writer::new(&mut sink);
+    let mut stream = EncoderStream::new(&mut sink, LIMITS);
+    let mut write = |instruction: Made| run(instruction.encode_into(&mut stream)).unwrap();
     // The integer instructions: the report of their octets.
     assert_eq!(
-        run(writer.set_dynamic_table_capacity(220, 8)).unwrap(),
+        write(EncoderInstruction::SetDynamicTableCapacity { capacity: int(220) }),
         Writes(3)
     );
-    assert_eq!(run(writer.duplicate(31, 8)).unwrap(), Writes(2));
-    // An insertion with a name reference: the reference, then the value,
-    // header and payload, each with its own report.
-    let mut value = ConstructedAccess::new(&b"xy"[..]);
-    let index = Index::try_from(1).unwrap();
-    let name = run(writer.name_reference(NameReference::Static(index), 8, 8)).unwrap();
-    let name_report = name.report;
-    let value_report = run(name.pending.value(Payload::Raw(&mut value))).unwrap();
-    assert_eq!((name_report, value_report), (Writes(1), Writes(3)));
+    assert_eq!(
+        write(EncoderInstruction::Duplicate { index: int(31) }),
+        Writes(2)
+    );
+    // An insertion with a name reference: the reference, the value's length
+    // and its octets, which the raw literal writes itself.
+    let static_name = NameReference::Static {
+        index: PrefixedField::shortest(Index::try_from(1).unwrap()),
+    };
+    assert_eq!(
+        write(EncoderInstruction::InsertWithNameReference {
+            name: static_name,
+            value: raw(&b"xy"[..]),
+        }),
+        Writes(4)
+    );
     // An insertion with a literal name: the name's header and payload, then
-    // the value's header and payload.
-    let mut name = ConstructedAccess::new(&b"ab"[..]);
-    let mut value = ConstructedAccess::new(&b"c"[..]);
-    let name = run(writer.literal_name(Payload::Raw(&mut name), 16, 16)).unwrap();
-    let name_report = name.report;
-    let value_report = run(name.pending.value(Payload::Raw(&mut value))).unwrap();
-    assert_eq!((name_report, value_report), (Writes(3), Writes(2)));
+    // the value's header and its Huffman code.
+    assert_eq!(
+        write(EncoderInstruction::InsertWithLiteralName {
+            name: raw(&b"ab"[..]),
+            value: huffman(&b"a"[..]),
+        }),
+        Writes(5)
+    );
     assert_eq!(
         sink.into_inner().bytes,
-        b"\x3f\xbd\x01\x1f\x00\xc1\x02xy\x42ab\x01c"
+        b"\x3f\xbd\x01\x1f\x00\xc1\x02xy\x42ab\x81\x1f"
     );
 }

@@ -1,18 +1,20 @@
-//! Check opcode dispatch, wire budget, cursor movement and canonical writing.
+//! Check opcode dispatch, wire budget and cursor movement against in-memory
+//! decoding; write each instruction read back and compare it with the
+//! octets it was read from, and check the wire limit before writing.
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 use core::num::NonZeroU64;
 use hatate_qpack::{
     decoder_instruction::{
-        DecoderInstruction as D, DecoderStream, DecoderStreamLimits, StreamId,
-        codec::{ReadError, WriteDecoderInstructionHostExt},
+        DecodeDecoderInstructionError, DecoderInstruction as D, DecoderStream, DecoderStreamLimits,
+        Increment, StreamId,
     },
-    integer,
+    integer::{self, PrefixedField},
 };
 use libfuzzer_sys::fuzz_target;
 use nitori_call::{ReceiverAccess, call};
-use nitori_codec::DecodeFrom;
-use nitori_io::{Read, calls::ReadValue};
+use nitori_codec::{DecodeFrom, EncodeInto};
+use nitori_io::{Read, Write, calls::ReadValue};
 
 /// One instruction from a fresh stream; after a failure the same stream must
 /// report the interruption.
@@ -27,24 +29,47 @@ async fn read_one<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
         Err(_) => {
             assert!(matches!(
                 Option::<ReadValue<D, ()>>::decode_from(&mut stream).await,
-                Err(ReadError::Interrupted)
+                Err(DecodeDecoderInstructionError::Interrupted)
             ));
             Err(())
         }
     }
 }
 
+/// Writes one instruction to a fresh stream within `max_wire_len`.
+#[call(sync)]
+async fn write_one<G: Write<Report = ()>, A: ReceiverAccess<Family = G>>(
+    io: &mut A,
+    instruction: D,
+    max_wire_len: usize,
+) -> bool {
+    let mut stream = DecoderStream::new(io, DecoderStreamLimits { max_wire_len });
+    instruction.encode_into(&mut stream).await.is_ok()
+}
+
 fn reference(first: u8, rest: &mut &[u8]) -> Option<D> {
     match first {
-        0x80..=0xff => Some(D::SectionAcknowledgment(
-            StreamId::try_from(integer::read::<7>(first, rest).ok()?.value().get()).ok()?,
-        )),
-        0x40..=0x7f => Some(D::StreamCancellation(
-            StreamId::try_from(integer::read::<6>(first, rest).ok()?.value().get()).ok()?,
-        )),
-        _ => Some(D::InsertCountIncrement(NonZeroU64::new(
-            integer::read::<6>(first, rest).ok()?.value().get(),
-        )?)),
+        0x80..=0xff => {
+            let field = integer::read::<7>(first, rest).ok()?;
+            let id = StreamId::try_from(field.value().get()).ok()?;
+            Some(D::SectionAcknowledgment {
+                stream_id: PrefixedField::new::<7>(id, field.padding()).unwrap(),
+            })
+        }
+        0x40..=0x7f => {
+            let field = integer::read::<6>(first, rest).ok()?;
+            let id = StreamId::try_from(field.value().get()).ok()?;
+            Some(D::StreamCancellation {
+                stream_id: PrefixedField::new::<6>(id, field.padding()).unwrap(),
+            })
+        }
+        _ => {
+            let field = integer::read::<6>(first, rest).ok()?;
+            let increment = Increment::new(NonZeroU64::new(field.value().get())?);
+            Some(D::InsertCountIncrement {
+                increment: PrefixedField::new::<6>(increment, field.padding()).unwrap(),
+            })
+        }
     }
 }
 
@@ -64,25 +89,24 @@ fuzz_target!(|data: &[u8]| {
         let actual = stream.sync_read_one_unpin(budget);
         // The stream is not empty, so it cannot end at the boundary.
         assert_eq!(actual, expected.map(Some).ok_or(()));
-        assert_eq!(stream.len(), before.len() - (available - bounded.len()));
+        let consumed = before.len() - stream.len();
+        assert_eq!(consumed, available - bounded.len());
         let Ok(Some(instruction)) = actual else {
             return;
         };
+        assert_eq!(instruction.wire_len() as usize, consumed);
+        // Written back, the instruction is the octets it was read from.
         let mut encoded = Vec::new();
-        encoded
-            .sync_write_decoder_instruction_unpin(instruction, budget)
-            .unwrap();
+        assert!(encoded.sync_write_one_unpin(instruction, budget));
+        assert_eq!(encoded, &before[..consumed]);
         let mut replay = encoded.as_slice();
         assert_eq!(replay.sync_read_one_unpin(budget), Ok(Some(instruction)));
         // The end after the instruction is at the boundary.
         assert_eq!(replay.sync_read_one_unpin(budget), Ok(None));
         assert!(replay.is_empty());
+        // A limit below its length writes nothing.
         let mut short = vec![0xa5];
-        assert!(
-            short
-                .sync_write_decoder_instruction_unpin(instruction, encoded.len() - 1)
-                .is_err()
-        );
+        assert!(!short.sync_write_one_unpin(instruction, consumed - 1));
         assert_eq!(short, [0xa5]);
     }
     if budget > 0 {

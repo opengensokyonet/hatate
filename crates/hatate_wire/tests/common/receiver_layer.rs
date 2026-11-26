@@ -8,7 +8,7 @@ use core::{
     task::{Context, Poll},
 };
 use hatate_wire::error_code::{ErrorCode, ErrorCodeOf};
-use nitori_io::{Read, Skip};
+use nitori_io::{Read, ReadChunk, Skip};
 
 /// A receiver that is not Unpin: at most three bytes per read or skip.
 pub struct Fixed<'a> {
@@ -52,6 +52,32 @@ impl Read for Fixed<'_> {
                 count,
                 metadata: (),
             }
+        })))
+    }
+}
+
+/// Hands out chunks like it reads: at most three bytes.
+impl<'a> ReadChunk for Fixed<'a> {
+    type Chunk = &'a [u8];
+    fn poll_read_chunk<'visit>(
+        host: Pin<&mut Self::ReceiverView<'visit>>,
+        _cx: &mut Context<'_>,
+        maximum: core::num::NonZeroUsize,
+    ) -> Poll<Result<Option<nitori_io::ChunkSegment<&'a [u8], ()>>, Self::Error>>
+    where
+        Self: 'visit,
+    {
+        // SAFETY: as above.
+        let this = unsafe { host.get_pin_mut().get_unchecked_mut() };
+        if this.input.is_empty() {
+            return Poll::Ready(Ok(None));
+        }
+        let count = 3.min(this.input.len()).min(maximum.get());
+        let (chunk, tail) = this.input.split_at(count);
+        this.input = tail;
+        Poll::Ready(Ok(Some(nitori_io::ChunkSegment {
+            chunk,
+            metadata: (),
         })))
     }
 }

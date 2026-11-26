@@ -10,7 +10,8 @@
 //! code, H3_CLOSED_CRITICAL_STREAM, is that of every read that meets the end.
 //! [`QpackEncoderStream`] and [`QpackDecoderStream`] hold the instruction
 //! streams of `hatate_qpack` on a stream composed with it; the control stream
-//! of `hatate_wire` uses it as well.
+//! of `hatate_wire` uses it as well. The instructions this endpoint writes go
+//! to the streams of `hatate_qpack` directly.
 //!
 //! [RFC 9204 §4.2]: https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
 use bytes::BufMut;
@@ -22,9 +23,11 @@ use core::{
 };
 use hatate_qpack::{
     decoder_instruction::{
-        DecoderInstruction, DecoderStream, DecoderStreamLimits, codec::ReadError,
+        DecodeDecoderInstructionError, DecoderInstruction, DecoderStream, DecoderStreamLimits,
     },
-    encoder_instruction::{EncoderStream, EncoderStreamLimits, Started, codec::StartError},
+    encoder_instruction::{
+        DecodeEncoderInstructionError, EncoderInstruction, EncoderStream, EncoderStreamLimits,
+    },
 };
 use nitori_call::{Compose, Composed, ReceiverAccess, ReceiverFamily};
 use nitori_codec::DecodeFrom;
@@ -161,12 +164,14 @@ impl<F: Skip> Skip for CriticalSource<F> {
 /// `A` composed with [`CriticalStream`].
 ///
 /// The next instruction is decoded from it as a
-/// `ReadValue<Started<'_, Composed<A, CriticalStream>>, M>`, `M` being the
-/// metadata of the stream's bytes, as from an
-/// [`EncoderStream`] with the difference that the stream never ends: its end,
-/// at the boundary or inside the instruction, is
+/// `ReadValue<EncoderInstruction<S, H>, M>`, `M` being the metadata of the
+/// stream's bytes, as from an [`EncoderStream`] with two differences. The
+/// stream never ends: its end, at the boundary or inside the instruction, is
 /// [`CriticalStreamError::Closed`] as the failure of the stream, so there is
-/// no `None`.
+/// no `None`. Its limits are always those of the dynamic table capacity this
+/// endpoint allows ([`EncoderStreamLimits::for_table_capacity`]), so an
+/// instruction beyond them is one the peer's encoder may not send, and
+/// [`DecodeQpackEncoderInstructionError`] says so.
 #[derive(Debug)]
 pub struct QpackEncoderStream<A> {
     stream: EncoderStream<Composed<A, CriticalStream>>,
@@ -174,13 +179,12 @@ pub struct QpackEncoderStream<A> {
 
 impl<A> QpackEncoderStream<A> {
     /// The stream on `io`, right after its type, reading instructions
-    /// within the default [`EncoderStreamLimits`]: those of a dynamic table
-    /// of capacity 0, which the peer's encoder may not exceed until the
-    /// SETTINGS this endpoint sent say otherwise. Nothing is read.
+    /// within the limits of a dynamic table of capacity 0, which the peer's
+    /// encoder may not exceed until the SETTINGS this endpoint sent say
+    /// otherwise. Nothing is read.
     ///
-    /// The connection sets the limits that follow from the
-    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY it sent with
-    /// [`set_limits`](Self::set_limits).
+    /// The connection sets the SETTINGS_QPACK_MAX_TABLE_CAPACITY it sent
+    /// with [`set_max_table_capacity`](Self::set_max_table_capacity).
     pub fn new(io: A) -> Self {
         Self {
             stream: EncoderStream::new(Composed::new(io, CriticalStream), Default::default()),
@@ -192,38 +196,45 @@ impl<A> QpackEncoderStream<A> {
         self.stream.limits()
     }
 
-    /// Reads the instructions after this call within `limits`, such as
-    /// [`EncoderStreamLimits::for_table_capacity`] of the
-    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY this endpoint sent.
-    pub fn set_limits(&mut self, limits: EncoderStreamLimits) {
-        self.stream.set_limits(limits);
+    /// Reads the instructions after this call within the limits of a
+    /// dynamic table of at most `capacity` octets, the
+    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY this endpoint sent
+    /// ([`EncoderStreamLimits::for_table_capacity`]). An instruction begun
+    /// before keeps the limits it began with.
+    pub fn set_max_table_capacity(&mut self, capacity: u64) {
+        self.stream
+            .set_limits(EncoderStreamLimits::for_table_capacity(capacity));
     }
 }
 
-/// Reads the start of the next instruction, as [`EncoderStream`] does.
+/// Reads the next instruction whole, as [`EncoderStream`] does.
 ///
 /// # Errors
 ///
-/// [`StartError`], whose failures of the stream are [`CriticalStreamError`].
-impl<'s, A, M> DecodeFrom<&'s mut QpackEncoderStream<A>>
-    for ReadValue<Started<'s, Composed<A, CriticalStream>>, M>
+/// [`DecodeQpackEncoderInstructionError`], whose failures of the stream are
+/// [`CriticalStreamError`].
+impl<'s, A, S, H, M> DecodeFrom<&'s mut QpackEncoderStream<A>>
+    for ReadValue<EncoderInstruction<S, H>, M>
 where
     A: ReceiverAccess,
-    Composed<A, CriticalStream>: ReceiverAccess<Family: Read<Metadata = M>>,
+    Composed<A, CriticalStream>: ReceiverAccess<Family: ReadChunk<Metadata = M>>,
+    S: Default
+        + Extend<<<Composed<A, CriticalStream> as ReceiverAccess>::Family as ReadChunk>::Chunk>,
+    H: Default + Extend<u8>,
     M: Combine + Unpin,
 {
-    type Error =
-        StartError<<<Composed<A, CriticalStream> as ReceiverAccess>::Family as Read>::Error>;
+    type Error = DecodeQpackEncoderInstructionError<
+        <<Composed<A, CriticalStream> as ReceiverAccess>::Family as Read>::Error,
+    >;
 
     async fn decode_from(stream: &'s mut QpackEncoderStream<A>) -> Result<Self, Self::Error> {
-        let started =
-            Option::<ReadValue<Started<'s, Composed<A, CriticalStream>>, M>>::decode_from(
-                &mut stream.stream,
-            )
-            .await?;
+        let instruction =
+            Option::<ReadValue<EncoderInstruction<S, H>, M>>::decode_from(&mut stream.stream)
+                .await
+                .map_err(|source| DecodeQpackEncoderInstructionError { source })?;
         // invariant: a critical stream reports its end as a failure, so the
         // instruction stream never sees it end at a boundary.
-        Ok(started.expect("a critical stream does not end"))
+        Ok(instruction.expect("a critical stream does not end"))
     }
 }
 
@@ -231,6 +242,40 @@ impl<A: ReceiverAccess> QpackEncoderStream<A> {
     /// The access, giving up the stream.
     pub fn into_io(self) -> A {
         self.stream.into_io().into_parts().0
+    }
+}
+
+/// An instruction of the peer's QPACK encoder stream
+/// ([`QpackEncoderStream`]) could not be read; `E` is the failure of the
+/// stream.
+///
+/// The limits the instruction was read within are those of the dynamic table
+/// capacity this endpoint allows. An insertion beyond them, by its decoded
+/// literals or by its octets on the wire, or by the least of them that the
+/// octets read so far allow, cannot fit in the table, which the peer's
+/// encoder may not ask for (RFC 9204 §3.2.2): such a failure is the peer's,
+/// unlike the same failure of an [`EncoderStream`] read within limits of the
+/// caller's choice.
+#[derive(Debug, Snafu)]
+#[snafu(display("could not read an instruction of the QPACK encoder stream"))]
+pub struct DecodeQpackEncoderInstructionError<E> {
+    source: DecodeEncoderInstructionError<E>,
+}
+
+impl<E> DecodeQpackEncoderInstructionError<E> {
+    /// The failure of reading the instruction.
+    pub const fn instruction_error(&self) -> &DecodeEncoderInstructionError<E> {
+        &self.source
+    }
+
+    /// The failure of reading the instruction, taken out.
+    pub fn into_instruction_error(self) -> DecodeEncoderInstructionError<E> {
+        self.source
+    }
+
+    /// The error of the stream itself, if the failure came from the stream.
+    pub fn host_error(&self) -> Option<&E> {
+        self.source.host_error()
     }
 }
 
@@ -274,15 +319,17 @@ impl<A> QpackDecoderStream<A> {
 ///
 /// # Errors
 ///
-/// [`ReadError`], whose failures of the stream are [`CriticalStreamError`].
+/// [`DecodeDecoderInstructionError`], whose failures of the stream are
+/// [`CriticalStreamError`].
 impl<'s, A, M> DecodeFrom<&'s mut QpackDecoderStream<A>> for ReadValue<DecoderInstruction, M>
 where
     A: ReceiverAccess,
     Composed<A, CriticalStream>: ReceiverAccess<Family: Read<Metadata = M>>,
     M: Combine + Unpin,
 {
-    type Error =
-        ReadError<<<Composed<A, CriticalStream> as ReceiverAccess>::Family as Read>::Error>;
+    type Error = DecodeDecoderInstructionError<
+        <<Composed<A, CriticalStream> as ReceiverAccess>::Family as Read>::Error,
+    >;
 
     async fn decode_from(stream: &'s mut QpackDecoderStream<A>) -> Result<Self, Self::Error> {
         let instruction =

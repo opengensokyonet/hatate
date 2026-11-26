@@ -23,7 +23,6 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 #![no_std]
-#![feature(impl_trait_in_assoc_type)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

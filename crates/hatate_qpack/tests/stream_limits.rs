@@ -1,16 +1,25 @@
 //! The limits of the instruction streams: the defaults of RFC 9204, the
 //! limits that follow from a table capacity, and limits set between
 //! instructions.
+mod common;
+mod support;
+
+use common::{Read as Instruction, octets};
 use hatate_qpack::{
-    decoder_instruction::{DecoderInstruction, DecoderStream, DecoderStreamLimits, StreamId},
-    encoder_instruction::{
-        EncoderStream, EncoderStreamLimits, NameReference, Started,
-        codec::{LiteralHeaderError, StartError, ValueError},
+    decoder_instruction::{
+        DecodeDecoderInstructionError, DecoderInstruction, DecoderStream, DecoderStreamLimits,
+        StreamId,
     },
+    encoder_instruction::{
+        DecodeEncoderInstructionError as StartError, DecodeLiteralError,
+        EncodeEncoderInstructionError, EncoderInstruction, EncoderStream, EncoderStreamLimits,
+        NameReference,
+    },
+    integer::{PrefixedField, PrefixedInt},
 };
 use nitori_call::{ConstructedAccess, ReceiverAccess};
-use nitori_codec::DecodeFrom;
-use nitori_io::{Read, calls::ReadValue};
+use nitori_codec::{DecodeFrom, EncodeInto};
+use nitori_io::{Read, ReadChunk, calls::ReadValue};
 
 fn run<T>(future: impl core::future::Future<Output = T>) -> T {
     nitori_call::__private::run_sync(future)
@@ -96,19 +105,22 @@ fn the_defaults_are_those_of_a_table_of_capacity_0() {
     );
 }
 
-async fn next_encoder<'a, F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
-    reader: &'a mut EncoderStream<A>,
-) -> Result<Option<Started<'a, A>>, StartError<F::Error>> {
-    let next = Option::<ReadValue<Started<'a, A>, ()>>::decode_from(reader).await?;
+async fn next_encoder<A: ReceiverAccess<Family: ReadChunk<Metadata = ()>>>(
+    reader: &mut EncoderStream<A>,
+) -> Result<Option<Instruction>, StartError<<A::Family as Read>::Error>> {
+    let next = Option::<ReadValue<Instruction, ()>>::decode_from(reader).await?;
     Ok(next.map(|read| read.value))
 }
 
 async fn next_decoder<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     reader: &mut DecoderStream<A>,
-) -> Result<Option<DecoderInstruction>, hatate_qpack::decoder_instruction::codec::ReadError<F::Error>>
-{
+) -> Result<Option<DecoderInstruction>, DecodeDecoderInstructionError<F::Error>> {
     let next = Option::<ReadValue<DecoderInstruction, ()>>::decode_from(reader).await?;
     Ok(next.map(|read| read.value))
+}
+
+fn int(value: u64) -> PrefixedField {
+    PrefixedField::shortest(PrefixedInt::from(value))
 }
 
 #[test]
@@ -142,10 +154,10 @@ fn encoder_limits_set_between_instructions_apply_to_the_next_one() {
             max_decoded_len: 0,
         },
     );
-    assert!(matches!(
-        run(next_encoder(&mut stream)),
-        Ok(Some(Started::Duplicate(0)))
-    ));
+    assert_eq!(
+        run(next_encoder(&mut stream)).unwrap(),
+        Some(EncoderInstruction::Duplicate { index: int(0) })
+    );
     // The insertion needs at least two octets before its value.
     stream.set_limits(EncoderStreamLimits {
         max_wire_len: 1,
@@ -160,26 +172,19 @@ fn encoder_limits_set_between_instructions_apply_to_the_next_one() {
         ConstructedAccess::new(&wire[..]),
         EncoderStreamLimits::default(),
     );
-    assert!(matches!(
-        run(next_encoder(&mut stream)),
-        Ok(Some(Started::Duplicate(0)))
-    ));
+    assert_eq!(
+        run(next_encoder(&mut stream)).unwrap(),
+        Some(EncoderInstruction::Duplicate { index: int(0) })
+    );
     stream.set_limits(EncoderStreamLimits {
         max_wire_len: 4,
         max_decoded_len: 1,
     });
-    let Ok(Some(Started::InsertWithNameReference {
-        name: NameReference::Static(_),
-        value,
-    })) = run(next_encoder(&mut stream))
-    else {
-        panic!("an insertion with a name reference");
-    };
     // Only one decoded octet is allowed, and the value has two.
     assert!(matches!(
-        run(value.open()),
-        Err(ValueError::Value {
-            source: LiteralHeaderError::DecodedLength { .. }
+        run(next_encoder(&mut stream)),
+        Err(StartError::Value {
+            source: DecodeLiteralError::DecodedLength { .. }
         })
     ));
 }
@@ -204,17 +209,22 @@ fn a_larger_limit_set_later_admits_what_the_smaller_refused() {
         ),
     ] {
         let mut stream = EncoderStream::new(ConstructedAccess::new(&wire[..]), limits);
-        let Ok(Some(Started::InsertWithNameReference { value, .. })) =
-            run(next_encoder(&mut stream))
-        else {
-            panic!("an insertion with a name reference");
-        };
-        assert_eq!(run(value.open()).is_ok(), admitted);
+        let read = run(next_encoder(&mut stream));
+        assert_eq!(read.is_ok(), admitted, "{read:?}");
+        if let Ok(Some(EncoderInstruction::InsertWithNameReference {
+            name: NameReference::Static { index },
+            value,
+        })) = read
+        {
+            assert_eq!(index.value().entry().0, b":path");
+            assert_eq!(octets(&value), b"ab");
+        }
     }
 }
 
 #[test]
 fn decoder_limits_set_between_instructions_apply_to_the_next_one() {
+    let id = |id| PrefixedField::shortest(StreamId::try_from(id).unwrap());
     // Stream cancellation of stream 64 takes two octets.
     let wire = [0x84, 0x7f, 0x01];
     let mut stream = DecoderStream::new(
@@ -223,9 +233,7 @@ fn decoder_limits_set_between_instructions_apply_to_the_next_one() {
     );
     assert_eq!(
         run(next_decoder(&mut stream)).unwrap(),
-        Some(DecoderInstruction::SectionAcknowledgment(
-            StreamId::try_from(4).unwrap()
-        ))
+        Some(DecoderInstruction::SectionAcknowledgment { stream_id: id(4) })
     );
     assert!(run(next_decoder(&mut stream)).is_err());
 
@@ -237,35 +245,35 @@ fn decoder_limits_set_between_instructions_apply_to_the_next_one() {
     stream.set_limits(DecoderStreamLimits { max_wire_len: 2 });
     assert_eq!(
         run(next_decoder(&mut stream)).unwrap(),
-        Some(DecoderInstruction::StreamCancellation(
-            StreamId::try_from(64).unwrap()
-        ))
+        Some(DecoderInstruction::StreamCancellation { stream_id: id(64) })
     );
     assert_eq!(run(next_decoder(&mut stream)).unwrap(), None);
 }
 
+/// The octets of `symbols` octets 10, whose code has 30 bits (0x3ffffffc in
+/// RFC 7541 Appendix B), padded with ones.
+fn coded(symbols: usize) -> Vec<u8> {
+    let mut bits: Vec<bool> = Vec::new();
+    for _ in 0..symbols {
+        bits.extend((0..30).rev().map(|bit| (0x3fff_fffcu32 >> bit) & 1 == 1));
+    }
+    while bits.len() % 8 != 0 {
+        bits.push(true);
+    }
+    bits.chunks(8)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .fold(0u8, |byte, &bit| byte << 1 | u8::from(bit))
+        })
+        .collect()
+}
+
 #[test]
 fn the_wire_limit_of_a_capacity_admits_an_insertion_at_the_longest_huffman_wire() {
-    // The octet 10 has a 30-bit code (0x3ffffffc) in RFC 7541 Appendix B.
-    // A name of one such octet and a value of three take 4 and 12 octets
-    // with their padding of ones: 16 octets, one more than 4 decoded octets
-    // would take in one literal at 30 bits each.
-    fn coded(symbols: usize) -> Vec<u8> {
-        let mut bits: Vec<bool> = Vec::new();
-        for _ in 0..symbols {
-            bits.extend((0..30).rev().map(|bit| (0x3fff_fffcu32 >> bit) & 1 == 1));
-        }
-        while bits.len() % 8 != 0 {
-            bits.push(true);
-        }
-        bits.chunks(8)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .fold(0u8, |byte, &bit| byte << 1 | u8::from(bit))
-            })
-            .collect()
-    }
+    // A name of one octet 10 and a value of three take 4 and 12 octets with
+    // their padding of ones: 16 octets, one more than 4 decoded octets would
+    // take in one literal at 30 bits each.
     let (name_octets, value_octets) = (coded(1), coded(3));
     assert_eq!((name_octets.len(), value_octets.len()), (4, 12));
     let mut wire = vec![0x60 | 4]; // literal name, Huffman, length 4
@@ -280,24 +288,39 @@ fn the_wire_limit_of_a_capacity_admits_an_insertion_at_the_longest_huffman_wire(
     assert!(name_octets.len() + value_octets.len() > (4 * 30usize).div_ceil(8));
     assert!(name_octets.len() + value_octets.len() <= limits.max_wire_len - TWO_INTEGERS);
     let mut stream = EncoderStream::new(ConstructedAccess::new(&wire[..]), limits);
-    let Ok(Some(Started::InsertWithLiteralName(mut name))) = run(next_encoder(&mut stream)) else {
+    let Ok(Some(EncoderInstruction::InsertWithLiteralName { name, value })) =
+        run(next_encoder(&mut stream))
+    else {
         panic!("an insertion with a literal name");
     };
-    let mut decoded = Vec::<u8>::new();
-    {
-        use nitori_io::prelude::*;
-        let hatate_qpack::encoder_instruction::literal::LiteralSource::Huffman(mut source) =
-            name.source()
-        else {
-            panic!("a Huffman name");
-        };
-        let mut buffer = [0u8; 8];
-        while let Some(segment) = run(source.read(&mut &mut buffer[..])).unwrap() {
-            decoded.extend(&buffer[..segment.count.get()]);
+    assert_eq!((octets(&name), octets(&value)), (&[10][..], &[10; 3][..]));
+}
+
+#[test]
+fn a_writer_checks_the_limits_of_a_capacity_before_writing() {
+    // The same insertion, made: within the limits of a capacity of 36, and
+    // not within those of 35, which leave three decoded octets.
+    let insertion = || -> EncoderInstruction<&'static [u8], &'static [u8]> {
+        EncoderInstruction::InsertWithLiteralName {
+            name: support::huffman(&[10][..]),
+            value: support::huffman(&[10; 3][..]),
         }
-    }
-    assert_eq!(decoded, [10]);
-    let _ = name.finish().unwrap();
+    };
+    assert_eq!((insertion().wire_len(), insertion().decoded_len()), (18, 4));
+    let mut output = ConstructedAccess::new(Vec::new());
+    let mut stream = EncoderStream::new(&mut output, EncoderStreamLimits::for_table_capacity(35));
+    assert!(matches!(
+        run(insertion().encode_into(&mut stream)),
+        Err(EncodeEncoderInstructionError::DecodedLength { source })
+            if source.length() == 4 && source.remaining() == 3
+    ));
+    stream.set_limits(EncoderStreamLimits::for_table_capacity(36));
+    run(insertion().encode_into(&mut stream)).unwrap();
+    let mut expected = vec![0x64];
+    expected.extend(coded(1));
+    expected.push(0x8c);
+    expected.extend(coded(3));
+    assert_eq!(output.into_inner(), expected);
 }
 
 #[test]
@@ -310,16 +333,14 @@ fn the_defaults_bound_the_literals_only() {
         ConstructedAccess::new(&wire[..]),
         EncoderStreamLimits::default(),
     );
-    let Ok(Some(Started::InsertWithNameReference { value, .. })) = run(next_encoder(&mut stream))
-    else {
-        panic!("an insertion with a name reference");
-    };
-    run(value.open()).unwrap().value.finish().unwrap();
-    let Ok(Some(Started::InsertWithLiteralName(name))) = run(next_encoder(&mut stream)) else {
-        panic!("an insertion with a literal name");
-    };
-    let value = name.finish().unwrap();
-    run(value.open()).unwrap().value.finish().unwrap();
+    assert!(matches!(
+        run(next_encoder(&mut stream)),
+        Ok(Some(EncoderInstruction::InsertWithNameReference { .. }))
+    ));
+    assert!(matches!(
+        run(next_encoder(&mut stream)),
+        Ok(Some(EncoderInstruction::InsertWithLiteralName { .. }))
+    ));
     // A name of one octet is past them.
     let wire = [0x41, b'x', 0x00];
     let mut stream = EncoderStream::new(
@@ -329,7 +350,7 @@ fn the_defaults_bound_the_literals_only() {
     assert!(matches!(
         run(next_encoder(&mut stream)),
         Err(StartError::Name {
-            source: LiteralHeaderError::DecodedLength { .. }
+            source: DecodeLiteralError::DecodedLength { .. }
         })
     ));
 }

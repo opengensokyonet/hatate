@@ -4,7 +4,7 @@
 #[macro_use]
 pub mod receiver_layer;
 
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 use core::{
     convert::Infallible,
     future::Future,
@@ -12,17 +12,23 @@ use core::{
     task::{Context, Poll, Waker},
 };
 use hatate_qpack::{
-    decoder_instruction::{DecoderInstruction, DecoderStream, DecoderStreamLimits},
-    encoder_instruction::{EncoderStream, EncoderStreamLimits, Started},
+    decoder_instruction::{
+        DecodeDecoderInstructionError, DecoderInstruction, DecoderStream, DecoderStreamLimits,
+    },
+    encoder_instruction::{
+        DecodeEncoderInstructionError, EncoderInstruction, EncoderStream, EncoderStreamLimits,
+    },
 };
 use hatate_wire::{
     frame::{FrameType, Http3FrameType},
     registry::ClaimedValue,
 };
-use hatate_wire_qpack::stream::{CriticalStream, QpackDecoderStream, QpackEncoderStream};
+use hatate_wire_qpack::stream::{
+    CriticalStream, DecodeQpackEncoderInstructionError, QpackDecoderStream, QpackEncoderStream,
+};
 use nitori_call::{AsAccess, Composed, ReceiverAccess};
 use nitori_codec::DecodeFrom;
-use nitori_io::{Read, calls::ReadValue, prelude::*};
+use nitori_io::{Read, ReadChunk, calls::ReadValue, prelude::*};
 
 /// A stream that gives at most `chunk` bytes per read and answers
 /// `Pending` once before every read, so that every state a reader keeps
@@ -78,6 +84,38 @@ impl nitori_io::Read for Dribble<'_> {
                 count,
                 metadata: (),
             }
+        })))
+    }
+}
+
+/// Hands out chunks like it reads: at most `chunk` bytes, after one
+/// `Pending`.
+impl<'a> nitori_io::ReadChunk for Dribble<'a> {
+    type Chunk = &'a [u8];
+    fn poll_read_chunk<'visit>(
+        host: Pin<&mut Self::ReceiverView<'visit>>,
+        cx: &mut Context<'_>,
+        maximum: core::num::NonZeroUsize,
+    ) -> Poll<Result<Option<nitori_io::ChunkSegment<&'a [u8], ()>>, Self::Error>>
+    where
+        Self: 'visit,
+    {
+        let this = host.get_pin_mut().get_mut();
+        if !this.waiting {
+            this.waiting = true;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        this.waiting = false;
+        if this.input.is_empty() {
+            return Poll::Ready(Ok(None));
+        }
+        let count = this.chunk.min(this.input.len()).min(maximum.get());
+        let (chunk, tail) = this.input.split_at(count);
+        this.input = tail;
+        Poll::Ready(Ok(Some(nitori_io::ChunkSegment {
+            chunk,
+            metadata: (),
         })))
     }
 }
@@ -510,42 +548,62 @@ pub async fn read_some<A: AsAccess<Family: Read<Metadata = ()>>>(
     Ok(bytes)
 }
 
+/// The octets of a raw literal, copied from chunks of any type.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Collected(pub Vec<u8>);
+
+impl<C: Buf> Extend<C> for Collected {
+    fn extend<I: IntoIterator<Item = C>>(&mut self, chunks: I) {
+        for mut chunk in chunks {
+            while chunk.has_remaining() {
+                let count = chunk.chunk().len();
+                self.0.extend_from_slice(chunk.chunk());
+                chunk.advance(count);
+            }
+        }
+    }
+}
+
+impl AsRef<[u8]> for Collected {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// An encoder instruction as these tests read it.
+pub type Instruction = EncoderInstruction<Collected, Vec<u8>>;
+
 /// Limits `reader` to `wire` and `decoded` octets and reads its next
 /// instruction, whose bytes have no metadata.
-pub async fn next_encoder<'a, F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
-    reader: &'a mut EncoderStream<A>,
+pub async fn next_encoder<A: ReceiverAccess<Family: ReadChunk<Metadata = ()>>>(
+    reader: &mut EncoderStream<A>,
     wire: usize,
     decoded: usize,
-) -> Result<Option<Started<'a, A>>, hatate_qpack::encoder_instruction::codec::StartError<F::Error>>
-{
+) -> Result<Option<Instruction>, DecodeEncoderInstructionError<<A::Family as Read>::Error>> {
     reader.set_limits(EncoderStreamLimits {
         max_wire_len: wire,
         max_decoded_len: decoded,
     });
-    let next = Option::<ReadValue<Started<'a, A>, ()>>::decode_from(reader).await?;
+    let next = Option::<ReadValue<Instruction, ()>>::decode_from(reader).await?;
     Ok(next.map(|read| read.value))
 }
 
-/// As [`next_encoder`], on the critical encoder stream.
-pub async fn next_critical_encoder<'a, A: ReceiverAccess>(
-    reader: &'a mut QpackEncoderStream<A>,
-    wire: usize,
-    decoded: usize,
+/// Reads the next instruction of the critical encoder stream within the
+/// limits of a table of `capacity` octets.
+pub async fn next_critical_encoder<A: ReceiverAccess>(
+    reader: &mut QpackEncoderStream<A>,
+    capacity: u64,
 ) -> Result<
-    Started<'a, Composed<A, CriticalStream>>,
-    hatate_qpack::encoder_instruction::codec::StartError<
+    Instruction,
+    DecodeQpackEncoderInstructionError<
         <<Composed<A, CriticalStream> as ReceiverAccess>::Family as Read>::Error,
     >,
 >
 where
-    Composed<A, CriticalStream>: ReceiverAccess<Family: Read<Metadata = ()>>,
+    Composed<A, CriticalStream>: ReceiverAccess<Family: ReadChunk<Metadata = ()>>,
 {
-    reader.set_limits(EncoderStreamLimits {
-        max_wire_len: wire,
-        max_decoded_len: decoded,
-    });
-    let next =
-        ReadValue::<Started<'a, Composed<A, CriticalStream>>, ()>::decode_from(reader).await?;
+    reader.set_max_table_capacity(capacity);
+    let next = ReadValue::<Instruction, ()>::decode_from(reader).await?;
     Ok(next.value)
 }
 
@@ -553,8 +611,7 @@ where
 pub async fn next_decoder<F: Read<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     reader: &mut DecoderStream<A>,
     wire: usize,
-) -> Result<Option<DecoderInstruction>, hatate_qpack::decoder_instruction::codec::ReadError<F::Error>>
-{
+) -> Result<Option<DecoderInstruction>, DecodeDecoderInstructionError<F::Error>> {
     reader.set_limits(DecoderStreamLimits { max_wire_len: wire });
     let next = Option::<ReadValue<DecoderInstruction, ()>>::decode_from(reader).await?;
     Ok(next.map(|read| read.value))
@@ -566,7 +623,7 @@ pub async fn next_critical_decoder<A: ReceiverAccess>(
     wire: usize,
 ) -> Result<
     DecoderInstruction,
-    hatate_qpack::decoder_instruction::codec::ReadError<
+    DecodeDecoderInstructionError<
         <<Composed<A, CriticalStream> as ReceiverAccess>::Family as Read>::Error,
     >,
 >

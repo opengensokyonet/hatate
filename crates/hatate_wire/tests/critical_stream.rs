@@ -6,9 +6,7 @@
 mod common;
 
 use bytes::{BufMut, Bytes};
-use common::{
-    Boom, Broken, ReadOnly, next_critical_decoder, next_critical_encoder, read_some, run,
-};
+use common::{Boom, Broken, ReadOnly, next_critical_decoder, next_critical_encoder, run};
 use core::{
     convert::Infallible,
     num::NonZeroUsize,
@@ -16,7 +14,6 @@ use core::{
     task::{Context, Poll},
 };
 use frunk_core::{HList, coproduct::Coproduct};
-use hatate_qpack::encoder_instruction::{Started, literal::LiteralSource};
 use hatate_wire::{
     Part, Role,
     error_code::{ErrorCode, ErrorCodeOf},
@@ -445,96 +442,43 @@ fn the_control_stream_ending_before_its_first_frame_is_closed() {
 
 // The QPACK streams.
 
-/// Reads the encoder stream's instructions until one fails, and gives the
-/// code of the failure. `part` says how far into an insertion to read.
-#[derive(Clone, Copy, Debug)]
-enum Reach {
-    /// Only the start of each instruction.
-    Start,
-    /// A literal name, read to its end or the failure.
-    Name,
-    /// A value, header and bytes.
-    Value,
-}
-
-/// Reads a literal's source to its end: `Err` with the code of its failure.
-macro_rules! drain {
-    ($source:expr) => {
-        match $source {
-            LiteralSource::Raw(mut source) => read_some(&mut source, 1000)
-                .await
-                .map(drop)
-                .map_err(|error| error.error_code()),
-            LiteralSource::Huffman(mut source) => read_some(&mut source, 1000)
-                .await
-                .map(drop)
-                .map_err(|error| error.error_code()),
-        }
-    };
-}
-
+/// Reads the encoder stream's instructions, each whole, until one fails,
+/// and gives the code of the failure.
 #[call(sync)]
 async fn encoder_failure<
-    F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
+    F: Read<Error = Infallible, Metadata = ()>
+        + ReadChunk<Metadata = ()>
+        + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
-    reach: Reach,
 ) -> Option<ErrorCode> {
     let mut stream = QpackEncoderStream::new(&mut *io);
     loop {
-        let started = match next_critical_encoder(&mut stream, 1000, 1000).await {
-            Ok(started) => started,
-            Err(error) => return error.error_code(),
-        };
-        let value = match started {
-            Started::SetDynamicTableCapacity(_) | Started::Duplicate(_) => continue,
-            Started::InsertWithNameReference { value, .. } => value,
-            Started::InsertWithLiteralName(mut name) => {
-                if let Reach::Start = reach {
-                    continue;
-                }
-                if let Err(code) = drain!(name.source()) {
-                    return code;
-                }
-                name.finish().expect("a whole name")
-            }
-        };
-        if let Reach::Start | Reach::Name = reach {
-            continue;
+        if let Err(error) = next_critical_encoder(&mut stream, 1032).await {
+            return error.error_code();
         }
-        let mut value = match value.open().await.map(|read| read.value) {
-            Ok(value) => value,
-            Err(error) => return error.error_code(),
-        };
-        if let Err(code) = drain!(value.source()) {
-            return code;
-        }
-        value.finish().expect("a whole value");
     }
 }
 
-fn encoder(wire: &[u8], reach: Reach) -> Option<ErrorCode> {
+fn encoder(wire: &[u8]) -> Option<ErrorCode> {
     let mut input = wire;
-    let code = input.sync_encoder_failure_unpin(reach);
+    let code = input.sync_encoder_failure_unpin();
     let mut dribbled = common::Dribble::new(wire, 1);
-    let (again, _) = run(dribbled.encoder_failure_unpin(reach));
+    let (again, _) = run(dribbled.encoder_failure_unpin());
     assert_eq!(code, again, "{wire:?}");
     code
 }
 
 #[test]
 fn the_encoder_stream_ending_at_an_instruction_boundary_is_closed() {
-    assert_eq!(encoder(&[], Reach::Start), CLOSED);
+    assert_eq!(encoder(&[]), CLOSED);
     // Set Dynamic Table Capacity 5, Duplicate 1, then the end.
-    assert_eq!(encoder(&[0x25, 0x01], Reach::Start), CLOSED);
+    assert_eq!(encoder(&[0x25, 0x01]), CLOSED);
     // A whole insertion with a name reference, then the end.
-    assert_eq!(encoder(&[0xc1, 0x02, b'x', b'y'], Reach::Value), CLOSED);
+    assert_eq!(encoder(&[0xc1, 0x02, b'x', b'y']), CLOSED);
     // A whole insertion with a literal name, then the end.
-    assert_eq!(
-        encoder(&[0x42, b'a', b'b', 0x02, b'x', b'y'], Reach::Value),
-        CLOSED
-    );
+    assert_eq!(encoder(&[0x42, b'a', b'b', 0x02, b'x', b'y']), CLOSED);
 }
 
 #[test]
@@ -548,7 +492,7 @@ fn the_encoder_stream_ending_at_the_start_of_an_instruction_is_closed() {
         &[0x7f],
         &[0x3f, 0x80],
     ] {
-        assert_eq!(encoder(wire, Reach::Start), CLOSED, "{wire:?}");
+        assert_eq!(encoder(wire), CLOSED, "{wire:?}");
     }
 }
 
@@ -564,7 +508,7 @@ fn the_encoder_stream_ending_in_a_literal_name_is_closed() {
         // A name length that goes on.
         &[0x5f],
     ] {
-        assert_eq!(encoder(wire, Reach::Name), CLOSED, "{wire:?}");
+        assert_eq!(encoder(wire), CLOSED, "{wire:?}");
     }
 }
 
@@ -588,7 +532,7 @@ fn the_encoder_stream_ending_in_a_value_is_closed() {
         &[0xc1, 0x01, b'x'],
         &[0xc1, 0x81, 0x1f],
     ] {
-        assert_eq!(encoder(wire, Reach::Value), CLOSED, "{wire:?}");
+        assert_eq!(encoder(wire), CLOSED, "{wire:?}");
     }
 }
 

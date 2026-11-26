@@ -1,334 +1,287 @@
-//! Write a single encoder instruction in wire order. An insertion borrows
-//! the writer until its value has been transferred. Keep one writer for
-//! the stream. Abandon the stream on a partial write or cancelled insertion.
-//!
-//! Each write returns the merged report of the bytes it wrote. An insertion
-//! is written in two steps, each with its own report: the name reference or
-//! the literal name ([`InsertionNameOutput`]), then the value
-//! ([`PendingValue::value`]).
-use super::{NameReference, codec::DecodedLengthError};
-use crate::huffman::{DecodeError, SymbolDecoder};
-use crate::instruction::{EncodedInteger, WireBudget, WireLimitError};
-use core::num::NonZeroU64;
-use nitori_call::ReceiverAccess;
-use nitori_io::{Combine, calls::WriteAllError, prelude::*};
+//! Writing whole encoder instructions to a stream.
+use super::{
+    CAPACITY_BITS, DUPLICATE_BITS, DecodedLengthError, EncoderInstruction, EncoderStream,
+    EncoderStreamLimits, NAME_INDEX_BITS, NAME_LENGTH_BITS, NameReference, VALUE_LENGTH_BITS,
+};
+use crate::{
+    huffman::EncodedBuf,
+    instruction::{self, Sink, WireBudget, WireLimitError},
+    integer::{self, PaddingError},
+    string_literal::{self, LiteralBytes, StringLiteral},
+};
+use bytes::Buf;
+use nitori_call::{Composed, ReceiverAccess};
+use nitori_codec::EncodeInto;
+use nitori_io::{Combine, Write, adapters::WriteLimit, calls::WriteAllError};
 use snafu::{ResultExt, Snafu};
 
-/// A source of the exact bytes to put on the wire for one literal.
-/// In both cases the advertised length is the encoded payload length.
+/// Writes the instruction whole and returns the merged report of its octets
+/// and of what its raw literals reported.
 ///
-/// The source states its length up front ([`ExactLen`]),
-/// which must not fail, since the length is written before the bytes. The
-/// metadata of what it reads is not carried into the write.
-pub enum Payload<S> {
-    /// Uncompressed bytes.
-    Raw(S),
-    /// Bytes already encoded and padded with the RFC 7541 Huffman code.
-    /// The writer validates them and counts decoded symbols while streaming.
-    Huffman(S),
-}
-
-/// Sequential output access to a QPACK encoder stream.
-pub struct Writer<A> {
-    io: A,
-    at_boundary: bool,
-}
-
-/// A header could not be written at the current instruction boundary.
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum HeaderError<W> {
-    /// An earlier instruction was abandoned or failed after output began.
-    #[snafu(display("encoder output is inside an unfinished instruction"))]
-    NotAtBoundary,
-    /// The instruction cannot fit the supplied wire limit.
-    #[snafu(transparent)]
-    WireLimit {
-        /// Required wire size and caller limit.
-        source: WireLimitError,
-    },
-    /// The host failed to accept the header bytes.
-    #[snafu(display("could not write the instruction header"))]
-    Send {
-        /// Write failure and progress within this write.
-        source: WriteAllError<W>,
-    },
-}
-
-/// A literal's header or payload could not be transferred.
-#[derive(Debug, Snafu)]
-#[snafu(module)]
-pub enum LiteralError<R, W> {
-    /// The reported payload length cannot be represented by a QPACK integer.
-    #[snafu(display("literal length cannot be encoded as a u64"))]
-    LengthOutOfRange,
-    /// The uncompressed payload exceeds the remaining decoded limit.
-    #[snafu(transparent)]
-    DecodedLength {
-        /// Advertised raw length and remaining decoded budget.
-        source: DecodedLengthError,
-    },
-    /// Encoded bytes violate the Huffman rules or exceed the decoded budget.
-    #[snafu(display("invalid Huffman payload for encoder instruction"))]
-    Huffman {
-        /// The coding or decoded-size failure.
-        source: DecodeError,
-    },
-    /// Starting or writing this literal's header failed.
-    #[snafu(transparent)]
-    Header {
-        /// The header failure.
-        source: HeaderError<W>,
-    },
-    /// The source ended before its advertised length.
-    #[snafu(display("literal source ended with {missing} octets missing"))]
-    ShortSource {
-        /// Advertised octets still missing.
-        missing: NonZeroU64,
-    },
-    /// The source failed to supply a payload block.
-    #[snafu(display("could not read literal payload"))]
-    Read {
-        /// The original input error.
-        source: R,
-    },
-    /// The host failed to accept a payload block.
-    #[snafu(display("could not write literal payload"))]
-    Send {
-        /// Write failure and progress within this write.
-        source: WriteAllError<W>,
-    },
-}
-
-impl<A: ReceiverAccess> Writer<A>
+/// Before it writes the first octet, it checks that every integer and
+/// literal length has an encoding in its position, that each Huffman
+/// literal holds the decoded octets it was constructed with, and that the
+/// instruction is within the stream's [`EncoderStreamLimits`]: its
+/// [`wire_len`](EncoderInstruction::wire_len) within `max_wire_len` and its
+/// [`decoded_len`](EncoderInstruction::decoded_len) within
+/// `max_decoded_len`. A failed check writes nothing and leaves the stream at
+/// the boundary.
+///
+/// A raw literal writes itself into the stream's access, held to the
+/// octets of the instruction not written yet ([`WriteLimit`]); it must
+/// write as many octets as its length prefix says, or the instruction fails.
+/// A Huffman literal is encoded as it is written.
+///
+/// # Errors
+///
+/// [`EncodeEncoderInstructionError`]. A failure after the stream accepted
+/// an octet of the instruction leaves the stream interrupted.
+impl<'s, A, S, H, P> EncodeInto<&'s mut EncoderStream<A>> for EncoderInstruction<S, H>
 where
-    A::Family: Write<Report: Combine>,
+    A: ReceiverAccess<Family: Write<Report: Combine>>,
+    S: for<'a> EncodeInto<
+            Composed<&'a mut A, &'a mut WriteLimit>,
+            Output = <A::Family as Write>::Report,
+            Error = P,
+        >,
+    H: Buf,
 {
-    /// Start at an instruction boundary using an owned or borrowed access.
-    pub fn new(io: A) -> Self {
-        Self {
-            io,
-            at_boundary: true,
+    type Output = <A::Family as Write>::Report;
+    type Error = EncodeEncoderInstructionError<<A::Family as Write>::Error, P>;
+
+    async fn encode_into(
+        self,
+        stream: &'s mut EncoderStream<A>,
+    ) -> Result<Self::Output, Self::Error> {
+        if !stream.position.at_boundary() {
+            return Err(EncodeEncoderInstructionError::Interrupted);
         }
-    }
-
-    fn boundary(&self) -> Result<(), HeaderError<<A::Family as Write>::Error>> {
-        if self.at_boundary {
-            Ok(())
-        } else {
-            Err(HeaderError::NotAtBoundary)
+        self.check(stream.limits)?;
+        // invariant: the check bounds the length by the usize limit.
+        let length = self.wire_len() as usize;
+        stream.position.begin_write(length);
+        match write_instruction(self, &mut stream.io, &mut stream.position.unwritten).await {
+            Ok(report) => {
+                stream.position.finish();
+                Ok(report)
+            }
+            Err(error) => {
+                stream.position.settle();
+                Err(error)
+            }
         }
-    }
-
-    async fn header(
-        &mut self,
-        encoded: &EncodedInteger,
-    ) -> Result<<A::Family as Write>::Report, HeaderError<<A::Family as Write>::Error>> {
-        self.at_boundary = false;
-        self.io
-            .write_all(encoded.as_slice())
-            .await
-            .context(header_error::SendSnafu)
-    }
-
-    async fn number(
-        &mut self,
-        encoded: EncodedInteger,
-        max_wire_len: usize,
-    ) -> Result<<A::Family as Write>::Report, HeaderError<<A::Family as Write>::Error>> {
-        self.boundary()?;
-        WireBudget::new(max_wire_len).check(encoded.as_slice().len() as u128)?;
-        let report = self.header(&encoded).await?;
-        self.at_boundary = true;
-        Ok(report)
-    }
-
-    /// Emit one Set Dynamic Table Capacity instruction and return the report
-    /// of writing it.
-    pub async fn set_dynamic_table_capacity(
-        &mut self,
-        capacity: u64,
-        max_wire_len: usize,
-    ) -> Result<<A::Family as Write>::Report, HeaderError<<A::Family as Write>::Error>> {
-        self.number(EncodedInteger::new::<5>(0x20, capacity), max_wire_len)
-            .await
-    }
-
-    /// Emit one Duplicate instruction carrying a relative index and return
-    /// the report of writing it.
-    pub async fn duplicate(
-        &mut self,
-        index: u64,
-        max_wire_len: usize,
-    ) -> Result<<A::Family as Write>::Report, HeaderError<<A::Family as Write>::Error>> {
-        self.number(EncodedInteger::new::<5>(0, index), max_wire_len)
-            .await
-    }
-
-    /// Emit an insert's name reference and return the state awaiting its
-    /// value, with the report of what was written.
-    #[allow(clippy::type_complexity)] // The state awaiting the value, and the report.
-    pub async fn name_reference(
-        &mut self,
-        name: NameReference,
-        max_wire_len: usize,
-        max_decoded_len: usize,
-    ) -> Result<
-        InsertionNameOutput<'_, A, <A::Family as Write>::Report>,
-        HeaderError<<A::Family as Write>::Error>,
-    > {
-        self.boundary()?;
-        let header = match name {
-            NameReference::Static(i) => EncodedInteger::new::<6>(0xc0, i.get().into()),
-            NameReference::Relative(i) => EncodedInteger::new::<6>(0x80, i),
-        };
-        let mut wire = WireBudget::new(max_wire_len);
-        wire.take(header.as_slice().len() as u64)?;
-        wire.check(1)?; // Even an empty value needs its length prefix.
-        let report = self.header(&header).await?;
-        Ok(InsertionNameOutput {
-            pending: PendingValue {
-                writer: self,
-                wire,
-                decoded_left: max_decoded_len,
-            },
-            report,
-        })
-    }
-
-    /// Transfer a literal name before asking the caller for its value, and
-    /// return the state awaiting the value, with the report of what was
-    /// written.
-    #[allow(clippy::type_complexity)] // The state awaiting the value, and the report.
-    pub async fn literal_name<F: Read + ExactLen<LengthError = !>>(
-        &mut self,
-        name: Payload<&mut impl ReceiverAccess<Family = F>>,
-        max_wire_len: usize,
-        max_decoded_len: usize,
-    ) -> Result<
-        InsertionNameOutput<'_, A, <A::Family as Write>::Report>,
-        LiteralError<F::Error, <A::Family as Write>::Error>,
-    >
-    where
-        F::Length: TryInto<u64>,
-    {
-        self.boundary()?;
-        let mut pending = PendingValue {
-            writer: self,
-            wire: WireBudget::new(max_wire_len),
-            decoded_left: max_decoded_len,
-        };
-        let report = pending.transfer::<5, F>(name, 0x40, 1).await?;
-        Ok(InsertionNameOutput { pending, report })
     }
 }
 
-/// What writing the name of an insertion produced: the state awaiting the
-/// value, and the merged report `R` of the bytes written, the name
-/// reference or the literal name.
-#[must_use]
-pub struct InsertionNameOutput<'a, A, R> {
-    /// The state awaiting the value.
-    pub pending: PendingValue<'a, A>,
-    /// The merged report of the bytes written.
-    pub report: R,
-}
-
-/// A name has been fully emitted. Supply the value to complete this insertion.
-#[must_use]
-pub struct PendingValue<'a, A> {
-    writer: &'a mut Writer<A>,
-    wire: WireBudget,
-    decoded_left: usize,
-}
-
-impl<A: ReceiverAccess> PendingValue<'_, A>
-where
-    A::Family: Write<Report: Combine>,
-{
-    /// Writes one literal and returns the merged report of its bytes.
-    async fn transfer<const N: u8, F: Read + ExactLen<LengthError = !>>(
-        &mut self,
-        payload: Payload<&mut impl ReceiverAccess<Family = F>>,
-        prefix: u8,
-        minimum_tail: u64,
-    ) -> Result<<A::Family as Write>::Report, LiteralError<F::Error, <A::Family as Write>::Error>>
-    where
-        F::Length: TryInto<u64>,
-    {
-        let (src, prefix, mut decoder) = match payload {
-            Payload::Raw(src) => (src, prefix, None),
-            Payload::Huffman(src) => (
-                src,
-                prefix | (1 << N),
-                Some(SymbolDecoder::new(self.decoded_left)),
-            ),
-        };
-        let Ok(declared) = src.remaining_len().await;
-        let length = declared
-            .try_into()
-            .map_err(|_| LiteralError::LengthOutOfRange)?;
-        let header = EncodedInteger::new::<N>(prefix, length);
-        self.wire
-            .take(header.as_slice().len() as u64)
-            .map_err(HeaderError::from)?;
-        self.wire.take(length).map_err(HeaderError::from)?;
-        self.wire
-            .check(u128::from(minimum_tail))
-            .map_err(HeaderError::from)?;
-        if decoder.is_none() {
-            DecodedLengthError::check(length, self.decoded_left)?;
-            self.decoded_left -= length as usize;
-        }
-        let mut report = self.writer.header(&header).await?;
-        let mut remaining = length;
-        let mut buf = [0; 1024];
-        while let Some(missing) = NonZeroU64::new(remaining) {
-            let request = remaining.min(buf.len() as u64) as usize;
-            let segment = src
-                .read(&mut &mut buf[..request])
-                .await
-                .context(literal_error::ReadSnafu)?;
-            let Some(segment) = segment else {
-                return Err(LiteralError::ShortSource { missing });
-            };
-            let count = segment.count.get();
-            remaining -= count as u64;
-            if let Some(decoder) = &mut decoder {
-                for &octet in &buf[..count] {
-                    for shift in (0..8).rev() {
-                        decoder
-                            .bit((octet >> shift) & 1)
-                            .context(literal_error::HuffmanSnafu)?;
-                    }
+impl<S, H: Buf> EncoderInstruction<S, H> {
+    /// The checks before writing.
+    fn check<W, P>(
+        &self,
+        limits: EncoderStreamLimits,
+    ) -> Result<(), EncodeEncoderInstructionError<W, P>> {
+        use encode_encoder_instruction_error::*;
+        match self {
+            Self::SetDynamicTableCapacity { capacity } => {
+                capacity.check::<CAPACITY_BITS>().context(IntegerSnafu)?;
+            }
+            Self::Duplicate { index } => index.check::<DUPLICATE_BITS>().context(IntegerSnafu)?,
+            Self::InsertWithNameReference { name, value } => {
+                match name {
+                    NameReference::Static { index } => index.check::<NAME_INDEX_BITS>(),
+                    NameReference::Relative { index } => index.check::<NAME_INDEX_BITS>(),
                 }
-                if remaining == 0 {
-                    self.decoded_left -= decoder.finish().context(literal_error::HuffmanSnafu)?;
+                .context(IntegerSnafu)?;
+                value
+                    .check_stream::<VALUE_LENGTH_BITS>()
+                    .context(ValueSnafu)?;
+            }
+            Self::InsertWithLiteralName { name, value } => {
+                name.check_stream::<NAME_LENGTH_BITS>().context(NameSnafu)?;
+                value
+                    .check_stream::<VALUE_LENGTH_BITS>()
+                    .context(ValueSnafu)?;
+            }
+        }
+        WireBudget::new(limits.max_wire_len).check(u128::from(self.wire_len()))?;
+        DecodedLengthError::check(self.decoded_len(), limits.max_decoded_len)?;
+        Ok(())
+    }
+}
+
+/// invariant: `check` found an encoding for each integer and literal length
+/// in its position before anything is written.
+const CHECKED: &str = "checked before writing";
+
+async fn write_instruction<A, S, H, P>(
+    instruction: EncoderInstruction<S, H>,
+    io: &mut A,
+    unwritten: &mut WriteLimit,
+) -> Result<
+    <A::Family as Write>::Report,
+    EncodeEncoderInstructionError<<A::Family as Write>::Error, P>,
+>
+where
+    A: ReceiverAccess<Family: Write<Report: Combine>>,
+    S: for<'a> EncodeInto<Sink<'a, A>, Output = <A::Family as Write>::Report, Error = P>,
+    H: Buf,
+{
+    use encode_encoder_instruction_error::*;
+    match instruction {
+        EncoderInstruction::SetDynamicTableCapacity { capacity } => {
+            let head = integer::encode::<CAPACITY_BITS, _>(0x20, capacity).expect(CHECKED);
+            instruction::put(io, unwritten, head.as_slice())
+                .await
+                .context(SendSnafu)
+        }
+        EncoderInstruction::Duplicate { index } => {
+            let head = integer::encode::<DUPLICATE_BITS, _>(0, index).expect(CHECKED);
+            instruction::put(io, unwritten, head.as_slice())
+                .await
+                .context(SendSnafu)
+        }
+        EncoderInstruction::InsertWithNameReference { name, value } => {
+            let head = match name {
+                NameReference::Static { index } => {
+                    integer::encode::<NAME_INDEX_BITS, _>(0xc0, index)
+                }
+                NameReference::Relative { index } => {
+                    integer::encode::<NAME_INDEX_BITS, _>(0x80, index)
                 }
             }
-            let written = self
-                .writer
-                .io
-                .write_all(&buf[..count])
+            .expect(CHECKED);
+            let report = instruction::put(io, unwritten, head.as_slice())
                 .await
-                .context(literal_error::SendSnafu)?;
-            report = report.combine(written);
+                .context(SendSnafu)?;
+            let value =
+                write_literal::<VALUE_LENGTH_BITS, _, _, _, _>(io, unwritten, 0, value, |source| {
+                    EncodeEncoderInstructionError::Value { source }
+                })
+                .await?;
+            Ok(report.combine(value))
         }
-        Ok(report)
+        EncoderInstruction::InsertWithLiteralName { name, value } => {
+            let name = write_literal::<NAME_LENGTH_BITS, _, _, _, _>(
+                io,
+                unwritten,
+                0x40,
+                name,
+                |source| EncodeEncoderInstructionError::Name { source },
+            )
+            .await?;
+            let value =
+                write_literal::<VALUE_LENGTH_BITS, _, _, _, _>(io, unwritten, 0, value, |source| {
+                    EncodeEncoderInstructionError::Value { source }
+                })
+                .await?;
+            Ok(name.combine(value))
+        }
     }
+}
 
-    /// Transfer a literal value, consuming this state. Success restores the
-    /// instruction boundary and returns the merged report of the value's
-    /// bytes. A failure leaves the writer inside the insertion.
-    pub async fn value<F: Read + ExactLen<LengthError = !>>(
-        mut self,
-        value: Payload<&mut impl ReceiverAccess<Family = F>>,
-    ) -> Result<<A::Family as Write>::Report, LiteralError<F::Error, <A::Family as Write>::Error>>
-    where
-        F::Length: TryInto<u64>,
-    {
-        let report = self.transfer::<7, F>(value, 0, 0).await?;
-        self.writer.at_boundary = true;
-        Ok(report)
+/// Writes a literal whose length prefix of `N` bits begins in an octet with
+/// the high bits `flags`; `which` tells which literal a failure of it is.
+async fn write_literal<const N: u8, A, S, H, P>(
+    io: &mut A,
+    unwritten: &mut WriteLimit,
+    flags: u8,
+    literal: StringLiteral<S, H>,
+    which: impl FnOnce(
+        string_literal::WriteError,
+    ) -> EncodeEncoderInstructionError<<A::Family as Write>::Error, P>,
+) -> Result<
+    <A::Family as Write>::Report,
+    EncodeEncoderInstructionError<<A::Family as Write>::Error, P>,
+>
+where
+    A: ReceiverAccess<Family: Write<Report: Combine>>,
+    S: for<'a> EncodeInto<Sink<'a, A>, Output = <A::Family as Write>::Report, Error = P>,
+    H: Buf,
+{
+    use encode_encoder_instruction_error::*;
+    let length = literal.length();
+    let coded = if literal.is_huffman() { 1 << N } else { 0 };
+    let head = integer::encode::<N, _>(flags | coded, length).expect(CHECKED);
+    match literal.into_bytes() {
+        LiteralBytes::Raw(bytes) => {
+            let report = instruction::put(io, unwritten, head.as_slice())
+                .await
+                .context(SendSnafu)?;
+            let before = unwritten.0;
+            let output = bytes
+                .encode_into(Composed::new(&mut *io, &mut *unwritten))
+                .await
+                .context(PayloadSnafu)?;
+            let written = before - unwritten.0;
+            if written as u64 != length.value().get() {
+                return Err(which(string_literal::WriteError::PayloadLength {
+                    expected: length.value().get(),
+                    actual: written,
+                }));
+            }
+            Ok(report.combine(output))
+        }
+        LiteralBytes::Huffman(decoded) => {
+            let payload = EncodedBuf::new(decoded, length.value().get());
+            instruction::put(io, unwritten, head.as_slice().chain(payload))
+                .await
+                .context(SendSnafu)
+        }
     }
+}
+
+/// An encoder instruction could not be written to a stream whose failures
+/// are `W`, with raw literals whose failures are `P`.
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum EncodeEncoderInstructionError<W, P> {
+    /// An earlier instruction was not finished, or failed after the stream
+    /// accepted some of it: the stream is inside it and is abandoned.
+    #[snafu(display("encoder stream is inside an unfinished or failed instruction"))]
+    Interrupted,
+    /// The instruction exceeds the wire limit. Nothing was written.
+    #[snafu(transparent)]
+    WireLimit {
+        /// The instruction's wire length and the limit.
+        source: WireLimitError,
+    },
+    /// The decoded octets of the instruction's literals exceed the decoded
+    /// limit. Nothing was written.
+    #[snafu(transparent)]
+    DecodedLength {
+        /// The decoded length and the limit.
+        source: DecodedLengthError,
+    },
+    /// The capacity or index of the instruction has no encoding in its
+    /// prefix. Nothing was written.
+    #[snafu(display("invalid instruction integer padding"))]
+    Integer {
+        /// The integer and the prefix width.
+        source: PaddingError,
+    },
+    /// The literal name cannot be written: its length has no encoding in its
+    /// prefix or its payload does not hold its length, which is found before
+    /// anything is written except for a raw payload.
+    #[snafu(display("invalid literal name"))]
+    Name {
+        /// The literal's failure.
+        source: string_literal::WriteError,
+    },
+    /// The value cannot be written, as for [`Self::Name`].
+    #[snafu(display("invalid literal value"))]
+    Value {
+        /// The literal's failure.
+        source: string_literal::WriteError,
+    },
+    /// The stream did not accept the octets of the instruction.
+    #[snafu(display("could not write encoder instruction"))]
+    Send {
+        /// Write failure and progress within this write.
+        source: WriteAllError<W>,
+    },
+    /// A raw literal failed to write itself.
+    #[snafu(display("could not write raw literal"))]
+    Payload {
+        /// The literal's failure.
+        source: P,
+    },
 }

@@ -28,7 +28,7 @@ use hatate_wire_qpack::{
     stream::{QpackDecoderStream, QpackEncoderStream},
 };
 use nitori_call::{AsAccess, ReceiverAccess, call};
-use nitori_io::{Read, Skip, prelude::*};
+use nitori_io::{Read, ReadChunk, Skip, prelude::*};
 use sakuya_var_int::{VarInt, VarIntField, VarIntWidth};
 
 type Parts = HList![Part];
@@ -701,7 +701,9 @@ fn a_control_stream_cut_inside_a_frame_is_a_closed_critical_stream() {
 /// stream fails or ends.
 #[call(sync)]
 async fn qpack_instructions<
-    F: Read<Error = Infallible, Metadata = ()> + Skip<Count = usize, Metadata = ()>,
+    F: Read<Error = Infallible, Metadata = ()>
+        + ReadChunk<Metadata = ()>
+        + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
@@ -722,7 +724,7 @@ async fn qpack_instructions<
         Http3UnidirectionalStream::QpackEncoder(stream) => {
             let mut stream: QpackEncoderStream<_> = stream.into_stream();
             loop {
-                match next_critical_encoder(&mut stream, 1000, 1000).await {
+                match next_critical_encoder(&mut stream, 1032).await {
                     Ok(started) => {
                         // The variants of the instruction belong to hatate_qpack.
                         drop(started);
@@ -759,9 +761,12 @@ fn the_two_qpack_streams_end_only_as_a_closed_critical_stream() {
     let (seen, end) = input.sync_qpack_instructions_unpin();
     assert_eq!(
         seen,
-        ["InsertCountIncrement(5)", "StreamCancellation(StreamId(1))"]
-            .map(String::from)
-            .to_vec()
+        [
+            "InsertCountIncrement { increment: PrefixedField { value: Increment(5), padding: 0 } }",
+            "StreamCancellation { stream_id: PrefixedField { value: StreamId(1), padding: 0 } }"
+        ]
+        .map(String::from)
+        .to_vec()
     );
     assert_eq!(end, End::Closed);
     let mut input = &[0x03][..];

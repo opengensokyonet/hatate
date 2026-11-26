@@ -179,6 +179,45 @@ impl<S, H> StringLiteral<S, H> {
         }
     }
 
+    /// A raw literal read from the wire with the length prefix `length`.
+    pub(crate) fn read_raw(bytes: S, length: PrefixedField) -> Self {
+        Self(Repr::Raw { bytes, length })
+    }
+
+    /// A Huffman literal read from the wire with the length prefix `length`,
+    /// whose `decoded_len` octets are `decoded`.
+    pub(crate) fn read_huffman(decoded: H, decoded_len: u64, length: PrefixedField) -> Self {
+        Self(Repr::Huffman {
+            decoded,
+            decoded_len,
+            length,
+        })
+    }
+
+    /// Validate the literal for a length prefix of `N` bits before it is
+    /// written to a stream: the length prefix's padding and, for a Huffman
+    /// literal, the decoded octets left in the payload. A raw payload written
+    /// to a stream reports its length only by what it writes.
+    pub(crate) fn check_stream<const N: u8>(&self) -> Result<(), WriteError>
+    where
+        H: Buf,
+    {
+        self.length().check::<N>().context(PaddingSnafu)?;
+        if let Repr::Huffman {
+            decoded,
+            decoded_len,
+            ..
+        } = &self.0
+            && *decoded_len != decoded.remaining() as u64
+        {
+            return Err(WriteError::PayloadLength {
+                expected: *decoded_len,
+                actual: decoded.remaining(),
+            });
+        }
+        Ok(())
+    }
+
     /// Validate the literal for a length prefix of `N` bits and split it for
     /// writing: the first octet's H bit, the length prefix and the payload.
     pub(crate) fn into_wire<const N: u8>(
@@ -291,12 +330,14 @@ pub enum WriteError {
         source: PaddingError,
     },
     /// The octets left in the payload differ from the length the literal
-    /// was constructed with: the decoded length for a Huffman literal.
+    /// was constructed with: the decoded length for a Huffman literal. A raw
+    /// payload written to a stream reports the octets it wrote.
     #[snafu(display("literal payload holds {actual} octets instead of {expected}"))]
     PayloadLength {
         /// The length recorded at construction.
         expected: u64,
-        /// The octets remaining in the payload.
+        /// The octets remaining in the payload, or those a raw payload wrote
+        /// to a stream.
         actual: usize,
     },
 }

@@ -1,12 +1,18 @@
 //! Shared limits and stream operations for QPACK instructions.
+use bytes::Buf;
 use core::ops::ControlFlow;
-use nitori_call::ReceiverAccess;
-use nitori_io::{calls::ReadArrayError, prelude::*};
+use nitori_call::{Composed, ReceiverAccess};
+use nitori_io::{
+    Combine, Write,
+    adapters::WriteLimit,
+    calls::{ReadArrayError, WriteAllError},
+    prelude::*,
+};
 use snafu::{ResultExt, Snafu};
 
-use crate::integer;
+use crate::integer::{self, PrefixedField};
 
-/// A read would cross the wire-size limit of the current instruction.
+/// An instruction would cross the wire-size limit of its stream.
 #[derive(Debug, PartialEq, Eq, Snafu)]
 #[snafu(display("instruction needs at least {required} wire bytes, limit is {limit}"))]
 pub struct WireLimitError {
@@ -15,7 +21,8 @@ pub struct WireLimitError {
 }
 
 impl WireLimitError {
-    /// Minimum number of bytes required by the operation that failed.
+    /// Minimum number of bytes required by the operation that failed: the
+    /// whole instruction when writing, a lower bound when reading.
     pub const fn required(&self) -> u128 {
         self.required
     }
@@ -113,11 +120,13 @@ pub enum NumberError<E> {
     },
 }
 
+/// Reads the rest of a prefixed integer of `N` prefix bits whose first octet
+/// is `first`, keeping the padding of its encoding.
 pub(crate) async fn number<const N: u8, F: Read<Metadata = ()>>(
     io: &mut impl ReceiverAccess<Family = F>,
     budget: &mut WireBudget,
     first: u8,
-) -> Result<u64, NumberError<F::Error>> {
+) -> Result<PrefixedField, NumberError<F::Error>> {
     checked_number::<N, F, _>(io, budget, first, |_, _| Ok(()), core::convert::identity).await
 }
 
@@ -129,9 +138,11 @@ pub(crate) async fn checked_number<const N: u8, F: Read<Metadata = ()>, E>(
     first: u8,
     before_digit: impl Fn(&WireBudget, u64) -> Result<(), E>,
     number_error: impl Fn(NumberError<F::Error>) -> E,
-) -> Result<u64, E> {
+) -> Result<PrefixedField, E> {
     let mut state = match integer::Continuation::start::<N>(first) {
-        ControlFlow::Break(value) => return Ok(value),
+        ControlFlow::Break(value) => {
+            return Ok(PrefixedField::shortest(integer::PrefixedInt::from(value)));
+        }
         ControlFlow::Continue(state) => state,
     };
     loop {
@@ -145,28 +156,8 @@ pub(crate) async fn checked_number<const N: u8, F: Read<Metadata = ()>, E>(
             .context(number_error::IntegerSnafu)
             .map_err(&number_error)?
         {
-            return Ok(value);
+            return Ok(state.field::<N>(value));
         }
-    }
-}
-
-/// Shortest wire encoding of one QPACK prefixed integer.
-pub(crate) struct EncodedInteger {
-    bytes: [u8; integer::MAX_ENCODED_LEN],
-    len: usize,
-}
-
-impl EncodedInteger {
-    pub(crate) fn new<const N: u8>(prefix: u8, value: u64) -> Self {
-        let mut bytes = [0; integer::MAX_ENCODED_LEN];
-        let mut rest = &mut bytes[..];
-        let value = integer::PrefixedField::shortest(integer::PrefixedInt::from(value));
-        integer::write::<N, _>(&mut rest, prefix, value).expect("buffer fits every encoded u64");
-        let len = integer::MAX_ENCODED_LEN - rest.len();
-        Self { bytes, len }
-    }
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        &self.bytes[..self.len]
     }
 }
 
@@ -188,4 +179,88 @@ impl<E> NumberError<E> {
             Self::Integer { .. } => None,
         }
     }
+}
+
+/// Where an instruction stream is, for its reads and its writes.
+///
+/// A read is inside an instruction from its first octet on. A write is
+/// inside one once the stream has accepted an octet of it: what is left of
+/// the instruction is counted down in `unwritten`, the composition state of
+/// the sink it is written to, which outlives a write that is dropped.
+#[derive(Debug)]
+pub(crate) struct Position {
+    state: State,
+    /// The octets of the instruction being written that the stream has not
+    /// accepted yet.
+    pub(crate) unwritten: WriteLimit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    /// At an instruction boundary.
+    Boundary,
+    /// Inside an instruction that was not finished, or one that failed.
+    Interrupted,
+    /// Writing an instruction of `length` octets, or a write of one that
+    /// ended before it finished.
+    Writing { length: usize },
+}
+
+impl Position {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: State::Boundary,
+            unwritten: WriteLimit(0),
+        }
+    }
+
+    /// Settle a write that ended without finishing: at the boundary if the
+    /// stream accepted none of its octets, interrupted otherwise.
+    pub(crate) fn settle(&mut self) {
+        if let State::Writing { length } = self.state {
+            self.state = if self.unwritten.0 == length {
+                State::Boundary
+            } else {
+                State::Interrupted
+            };
+        }
+    }
+
+    /// Whether the stream is at an instruction boundary, after settling a
+    /// write that was dropped.
+    pub(crate) fn at_boundary(&mut self) -> bool {
+        self.settle();
+        self.state == State::Boundary
+    }
+
+    /// Enter an instruction being read.
+    pub(crate) fn interrupt(&mut self) {
+        self.state = State::Interrupted;
+    }
+
+    /// Return to the boundary after a whole instruction.
+    pub(crate) fn finish(&mut self) {
+        self.state = State::Boundary;
+    }
+
+    /// Start writing an instruction of `length` octets.
+    pub(crate) fn begin_write(&mut self, length: usize) {
+        self.unwritten = WriteLimit(length);
+        self.state = State::Writing { length };
+    }
+}
+
+/// The sink an instruction is written into: the stream's access, held to the
+/// octets of the instruction not written yet.
+pub(crate) type Sink<'a, A> = Composed<&'a mut A, &'a mut WriteLimit>;
+
+/// Writes `bytes` whole into the stream's access, counting them off
+/// `unwritten`.
+pub(crate) async fn put<A: ReceiverAccess<Family: Write<Report: Combine>>>(
+    io: &mut A,
+    unwritten: &mut WriteLimit,
+    bytes: impl Buf,
+) -> Result<<A::Family as Write>::Report, WriteAllError<<A::Family as Write>::Error>> {
+    let mut sink: Sink<'_, A> = Composed::new(io, unwritten);
+    sink.write_all(bytes).await
 }

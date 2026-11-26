@@ -6,14 +6,14 @@
 mod common;
 
 use common::{
-    Dribble, Ty, next_critical_decoder, next_critical_encoder, read_some, receiver_layer::Outcome,
-    run,
+    Dribble, Instruction, Ty, next_critical_decoder, next_critical_encoder, read_some,
+    receiver_layer::Outcome, run,
 };
 use core::convert::Infallible;
 use frunk_core::{HList, coproduct::Coproduct};
 use hatate_qpack::{
     decoder_instruction::DecoderInstruction,
-    encoder_instruction::{NameReference, Started, literal::LiteralSource},
+    encoder_instruction::{EncoderInstruction, NameReference},
 };
 use hatate_wire::{
     Part, Role,
@@ -33,28 +33,15 @@ use hatate_wire::{
         kind::RequestStreamKind,
     },
 };
-use hatate_wire_qpack::stream::{CriticalStream, QpackDecoderStream, QpackEncoderStream};
-use nitori_call::{Composed, ConstructedAccess, ReceiverAccess, call};
+use hatate_wire_qpack::stream::{QpackDecoderStream, QpackEncoderStream};
+use nitori_call::{ConstructedAccess, ReceiverAccess, call};
 use nitori_codec::{DecodeFrom as _, EncodeInto as _, payload::Chunks};
-use nitori_io::{Read, Skip, calls::ReadValue};
+use nitori_io::{Read, ReadChunk, Skip, calls::ReadValue};
 use sakuya_var_int::VarIntField;
 
 type Parts = HList![Part];
 
 // The constructors.
-
-macro_rules! drain_code {
-    ($w:ident, $source:expr) => {
-        match $source {
-            LiteralSource::Raw(mut source) => {
-                $w!(read_some(&mut source, 1000)).map_err(|error| error.error_code())
-            }
-            LiteralSource::Huffman(mut source) => {
-                $w!(read_some(&mut source, 1000)).map_err(|error| error.error_code())
-            }
-        }
-    };
-}
 
 /// The start of a unidirectional stream of `$class`, then what its kind of
 /// stream reads to its end or failure.
@@ -120,75 +107,36 @@ macro_rules! start_log {
                         Http3UnidirectionalStream::QpackEncoder(stream) => {
                             let mut encoder = stream.into_stream();
                             loop {
-                                let started = match $w!(next_critical_encoder(&mut encoder, 32, 32))
+                                let instruction = match $w!(next_critical_encoder(&mut encoder, 64))
                                 {
-                                    Ok(started) => started,
+                                    Ok(instruction) => instruction,
                                     Err(error) => {
                                         log.push(format!("error {:?}", error.error_code()));
                                         break;
                                     }
                                 };
-                                match started {
-                                    Started::SetDynamicTableCapacity(n) => {
-                                        log.push(format!("capacity {n}"))
+                                log.push(match instruction {
+                                    EncoderInstruction::SetDynamicTableCapacity { capacity } => {
+                                        format!("capacity {}", capacity.value())
                                     }
-                                    Started::Duplicate(n) => log.push(format!("duplicate {n}")),
-                                    Started::InsertWithNameReference { name, value } => {
+                                    EncoderInstruction::Duplicate { index } => {
+                                        format!("duplicate {}", index.value())
+                                    }
+                                    EncoderInstruction::InsertWithNameReference { name, value } => {
                                         let name = match name {
-                                            NameReference::Static(index) => {
-                                                index.entry().0.to_vec()
+                                            NameReference::Static { index } => {
+                                                index.value().entry().0.to_vec()
                                             }
-                                            NameReference::Relative(n) => vec![n as u8],
-                                        };
-                                        let mut value = match $w!(value.open())
-                                            .map(|read| read.value)
-                                        {
-                                            Ok(value) => value,
-                                            Err(error) => {
-                                                log.push(format!("error {:?}", error.error_code()));
-                                                break;
+                                            NameReference::Relative { index } => {
+                                                vec![index.value().get() as u8]
                                             }
                                         };
-                                        match drain_code!($w, value.source()) {
-                                            Ok(bytes) => {
-                                                value.finish().unwrap();
-                                                log.push(format!("insert {name:?} = {bytes:?}"));
-                                            }
-                                            Err(code) => {
-                                                log.push(format!("value error {code:?}"));
-                                                break;
-                                            }
-                                        }
+                                        format!("insert {name:?} = {:?}", value.as_ref())
                                     }
-                                    Started::InsertWithLiteralName(mut name) => {
-                                        let bytes = match drain_code!($w, name.source()) {
-                                            Ok(bytes) => bytes,
-                                            Err(code) => {
-                                                log.push(format!("name error {code:?}"));
-                                                break;
-                                            }
-                                        };
-                                        let mut value = match $w!(name.finish().unwrap().open())
-                                            .map(|read| read.value)
-                                        {
-                                            Ok(value) => value,
-                                            Err(error) => {
-                                                log.push(format!("error {:?}", error.error_code()));
-                                                break;
-                                            }
-                                        };
-                                        match drain_code!($w, value.source()) {
-                                            Ok(text) => {
-                                                value.finish().unwrap();
-                                                log.push(format!("insert {bytes:?} = {text:?}"));
-                                            }
-                                            Err(code) => {
-                                                log.push(format!("value error {code:?}"));
-                                                break;
-                                            }
-                                        }
+                                    EncoderInstruction::InsertWithLiteralName { name, value } => {
+                                        format!("insert {:?} = {:?}", name.as_ref(), value.as_ref())
                                     }
-                                }
+                                });
                             }
                             (log, Some(encoder.into_io()))
                         }
@@ -218,7 +166,9 @@ macro_rules! start_pair {
         #[allow(unreachable_code)]
         async fn $call<F, A: ReceiverAccess<Family = F>>(io: &mut A, discard: bool) -> Outcome
         where
-            F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
+            F: Skip<Count = usize, Metadata = ()>
+                + Read<Error = Infallible, Metadata = ()>
+                + ReadChunk<Metadata = ()>,
         {
             let (log, back) = start_log!(&mut *io, aw, $class, discard);
             match back {
@@ -230,7 +180,9 @@ macro_rules! start_pair {
         #[allow(unreachable_code)]
         fn $recv<F, I: ReceiverAccess<Family = F>>(io: I, discard: bool) -> (Vec<String>, Option<I>)
         where
-            F: Skip<Count = usize, Metadata = ()> + Read<Error = Infallible, Metadata = ()>,
+            F: Skip<Count = usize, Metadata = ()>
+                + Read<Error = Infallible, Metadata = ()>
+                + ReadChunk<Metadata = ()>,
         {
             start_log!(io, ru, $class, discard)
         }
@@ -477,7 +429,6 @@ fn the_streams_and_their_futures_are_send_when_the_receiver_is() {
 }
 
 type Host<'a> = ConstructedAccess<Dribble<'a>>;
-type Critical<A> = Composed<A, CriticalStream>;
 
 #[test]
 fn the_qpack_streams_and_their_reads_are_send_when_the_receiver_is() {
@@ -486,7 +437,7 @@ fn the_qpack_streams_and_their_reads_are_send_when_the_receiver_is() {
     let mut encoder = QpackEncoderStream::new(Host::new(Dribble::new(&input, 1)));
     assert_send(&encoder);
     {
-        let read = ReadValue::<Started<'_, Critical<Host<'_>>>, ()>::decode_from(&mut encoder);
+        let read = ReadValue::<Instruction, ()>::decode_from(&mut encoder);
         assert_send(&read);
     }
     // The access held by `&mut`.
@@ -494,7 +445,7 @@ fn the_qpack_streams_and_their_reads_are_send_when_the_receiver_is() {
     let mut encoder = QpackEncoderStream::new(&mut host);
     assert_send(&encoder);
     {
-        let read = ReadValue::<Started<'_, Critical<&mut Host<'_>>>, ()>::decode_from(&mut encoder);
+        let read = ReadValue::<Instruction, ()>::decode_from(&mut encoder);
         assert_send(&read);
     }
     let mut decoder = QpackDecoderStream::new(Host::new(Dribble::new(&input, 1)));

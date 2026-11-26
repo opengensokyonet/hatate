@@ -1,7 +1,10 @@
 //! The QPACK streams of HTTP/3: the limits they read with, which start as
 //! those of a peer without a dynamic table, and the metadata of the bytes of
 //! an instruction.
+mod common;
+
 use bytes::BufMut;
+use common::Instruction;
 use core::{
     num::NonZeroUsize,
     pin::Pin,
@@ -11,9 +14,9 @@ use frunk_core::{HList, coproduct::Coproduct};
 use hatate_qpack::{
     decoder_instruction::{DecoderInstruction, DecoderStreamLimits, StreamId},
     encoder_instruction::{
-        EncoderStreamLimits, Started,
-        codec::{LiteralHeaderError, StartError, ValueError},
+        DecodeEncoderInstructionError, DecodeLiteralError, EncoderInstruction, EncoderStreamLimits,
     },
+    integer::{PrefixedField, PrefixedInt},
 };
 use hatate_wire::{
     Part,
@@ -22,10 +25,12 @@ use hatate_wire::{
         http3::Http3UnidirectionalStream,
     },
 };
-use hatate_wire_qpack::stream::{CriticalStream, QpackDecoderStream, QpackEncoderStream};
+use hatate_wire_qpack::stream::{
+    CriticalStream, DecodeQpackEncoderInstructionError, QpackDecoderStream, QpackEncoderStream,
+};
 use nitori_call::{Composed, ConstructedAccess, ReceiverAccess, family_receiver};
 use nitori_codec::DecodeFrom;
-use nitori_io::{Combine, Read, ReadSegment, calls::ReadValue};
+use nitori_io::{ChunkSegment, Combine, Read, ReadChunk, ReadSegment, calls::ReadValue};
 
 fn run<T>(future: impl core::future::Future<Output = T>) -> T {
     nitori_call::__private::run_sync(future)
@@ -46,8 +51,8 @@ fn at(positions: &[usize]) -> Positions {
     Positions(positions.to_vec())
 }
 
-/// A stream that hands out one byte per read; the metadata of each byte is
-/// its position.
+/// A stream that hands out one byte per read or chunk; the metadata of each
+/// byte is its position.
 struct Numbered<'a> {
     data: &'a [u8],
     position: usize,
@@ -82,6 +87,28 @@ impl Read for Numbered<'_> {
     }
 }
 
+impl<'a> ReadChunk for Numbered<'a> {
+    type Chunk = &'a [u8];
+    fn poll_read_chunk<'v>(
+        host: Pin<&mut Self::ReceiverView<'v>>,
+        _: &mut Context<'_>,
+        _: NonZeroUsize,
+    ) -> Poll<Result<Option<ChunkSegment<&'a [u8], Positions>>, !>>
+    where
+        Self: 'v,
+    {
+        let this = host.get_pin_mut().get_mut();
+        if this.data.is_empty() {
+            return Poll::Ready(Ok(None));
+        }
+        let (chunk, rest) = this.data.split_at(1);
+        this.data = rest;
+        let metadata = Positions(vec![this.position]);
+        this.position += 1;
+        Poll::Ready(Ok(Some(ChunkSegment { chunk, metadata })))
+    }
+}
+
 fn numbered(data: &[u8]) -> ConstructedAccess<Numbered<'_>> {
     ConstructedAccess::new(Numbered { data, position: 0 })
 }
@@ -89,18 +116,22 @@ fn numbered(data: &[u8]) -> ConstructedAccess<Numbered<'_>> {
 type Critical<A> = Composed<A, CriticalStream>;
 
 /// The next instruction with the limits the stream has.
-async fn next<'s, A, M>(
-    stream: &'s mut QpackEncoderStream<A>,
+async fn next<A, M>(
+    stream: &mut QpackEncoderStream<A>,
 ) -> Result<
-    ReadValue<Started<'s, Critical<A>>, M>,
-    StartError<<<Critical<A> as ReceiverAccess>::Family as Read>::Error>,
+    ReadValue<Instruction, M>,
+    DecodeQpackEncoderInstructionError<<<Critical<A> as ReceiverAccess>::Family as Read>::Error>,
 >
 where
     A: ReceiverAccess,
-    Critical<A>: ReceiverAccess<Family: Read<Metadata = M>>,
+    Critical<A>: ReceiverAccess<Family: ReadChunk<Metadata = M>>,
     M: Combine + Unpin,
 {
     ReadValue::decode_from(stream).await
+}
+
+fn int(value: u64) -> PrefixedField {
+    PrefixedField::shortest(PrefixedInt::from(value))
 }
 
 #[test]
@@ -108,9 +139,11 @@ fn the_encoder_stream_starts_with_the_limits_of_a_table_of_no_capacity() {
     let mut stream = QpackEncoderStream::new(ConstructedAccess::new(&b""[..]));
     assert_eq!(stream.limits(), EncoderStreamLimits::default());
     assert_eq!(stream.limits(), EncoderStreamLimits::for_table_capacity(0));
-    let limits = EncoderStreamLimits::for_table_capacity(4096);
-    stream.set_limits(limits);
-    assert_eq!(stream.limits(), limits);
+    stream.set_max_table_capacity(4096);
+    assert_eq!(
+        stream.limits(),
+        EncoderStreamLimits::for_table_capacity(4096)
+    );
 }
 
 #[test]
@@ -122,21 +155,21 @@ fn an_insertion_is_refused_before_the_settings_allow_a_table() {
     let reference = [0xc1, 0x01, b'x'];
     let mut stream = QpackEncoderStream::new(ConstructedAccess::new(&literal_name[..]));
     assert!(matches!(
-        run(next::<_, ()>(&mut stream)),
-        Err(StartError::Name {
-            source: LiteralHeaderError::DecodedLength { .. }
-        })
+        run(next::<_, ()>(&mut stream))
+            .unwrap_err()
+            .instruction_error(),
+        DecodeEncoderInstructionError::Name {
+            source: DecodeLiteralError::DecodedLength { .. }
+        }
     ));
     let mut stream = QpackEncoderStream::new(ConstructedAccess::new(&reference[..]));
-    let started = run(next::<_, ()>(&mut stream)).unwrap();
-    let Started::InsertWithNameReference { value, .. } = started.value else {
-        panic!("an insertion with a name reference");
-    };
     assert!(matches!(
-        run(value.open()),
-        Err(ValueError::Value {
-            source: LiteralHeaderError::DecodedLength { .. }
-        })
+        run(next::<_, ()>(&mut stream))
+            .unwrap_err()
+            .instruction_error(),
+        DecodeEncoderInstructionError::Value {
+            source: DecodeLiteralError::DecodedLength { .. }
+        }
     ));
 }
 
@@ -145,18 +178,20 @@ fn the_limits_that_follow_from_the_settings_admit_the_insertion() {
     let literal_name = [0x41, b'x', 0x00];
     let reference = [0xc1, 0x01, b'x'];
     // A capacity of 33 leaves one decoded octet for the name and the value.
-    let limits = EncoderStreamLimits::for_table_capacity(33);
     let mut stream = QpackEncoderStream::new(ConstructedAccess::new(&literal_name[..]));
-    stream.set_limits(limits);
-    let started = run(next::<_, ()>(&mut stream)).unwrap();
-    assert!(matches!(started.value, Started::InsertWithLiteralName(_)));
+    stream.set_max_table_capacity(33);
+    let read = run(next::<_, ()>(&mut stream)).unwrap();
+    let EncoderInstruction::InsertWithLiteralName { name, value } = &read.value else {
+        panic!("an insertion with a literal name");
+    };
+    assert_eq!((name.as_ref(), value.as_ref()), (&b"x"[..], &b""[..]));
     let mut stream = QpackEncoderStream::new(ConstructedAccess::new(&reference[..]));
-    stream.set_limits(limits);
-    let started = run(next::<_, ()>(&mut stream)).unwrap();
-    let Started::InsertWithNameReference { value, .. } = started.value else {
+    stream.set_max_table_capacity(33);
+    let read = run(next::<_, ()>(&mut stream)).unwrap();
+    let EncoderInstruction::InsertWithNameReference { value, .. } = &read.value else {
         panic!("an insertion with a name reference");
     };
-    assert!(run(value.open()).is_ok());
+    assert_eq!(value.as_ref(), b"x");
 }
 
 #[test]
@@ -165,32 +200,34 @@ fn an_instruction_with_a_number_is_within_the_default_limits() {
     // allowed.
     let wire = [0x3f, 0xbd, 0x01];
     let mut stream = QpackEncoderStream::new(ConstructedAccess::new(&wire[..]));
-    let started = run(next::<_, ()>(&mut stream)).unwrap();
-    assert!(matches!(
-        started.value,
-        Started::SetDynamicTableCapacity(220)
-    ));
+    let read = run(next::<_, ()>(&mut stream)).unwrap();
+    assert_eq!(
+        read.value,
+        EncoderInstruction::SetDynamicTableCapacity { capacity: int(220) }
+    );
 }
 
 #[test]
-fn the_encoder_stream_gives_the_metadata_of_the_start_of_an_instruction() {
+fn the_encoder_stream_gives_the_metadata_of_all_the_octets_of_an_instruction() {
     // Set Dynamic Table Capacity 220, then an insertion with a name
     // reference whose value header and value follow.
     let wire = [0x3f, 0xbd, 0x01, 0xc1, 0x01, b'x'];
     let mut stream = QpackEncoderStream::new(numbered(&wire));
-    stream.set_limits(EncoderStreamLimits::for_table_capacity(100));
+    stream.set_max_table_capacity(100);
     let capacity = run(next::<_, Positions>(&mut stream)).unwrap();
-    assert!(matches!(
+    assert_eq!(
         capacity.value,
-        Started::SetDynamicTableCapacity(220)
-    ));
+        EncoderInstruction::SetDynamicTableCapacity { capacity: int(220) }
+    );
     assert_eq!(capacity.metadata, at(&[0, 1, 2]));
     let insertion = run(next::<_, Positions>(&mut stream)).unwrap();
-    assert_eq!(insertion.metadata, at(&[3]));
-    let Started::InsertWithNameReference { value, .. } = insertion.value else {
+    assert_eq!(insertion.metadata, at(&[3, 4, 5]));
+    let EncoderInstruction::InsertWithNameReference { value, .. } = insertion.value else {
         panic!("an insertion with a name reference");
     };
-    assert_eq!(run(value.open()).unwrap().metadata, at(&[4]));
+    assert_eq!(value.as_ref(), b"x");
+    // The stream does not end: its end is a failure.
+    assert!(run(next::<_, Positions>(&mut stream)).is_err());
 }
 
 #[test]
@@ -208,9 +245,10 @@ fn the_decoder_stream_has_its_limit_and_gives_the_metadata_of_an_instruction() {
         &mut stream,
     ))
     .unwrap();
+    let id = |id| PrefixedField::shortest(StreamId::try_from(id).unwrap());
     assert_eq!(
         first.value,
-        DecoderInstruction::SectionAcknowledgment(StreamId::try_from(4).unwrap())
+        DecoderInstruction::SectionAcknowledgment { stream_id: id(4) }
     );
     assert_eq!(first.metadata, at(&[0]));
     let second = run(ReadValue::<DecoderInstruction, Positions>::decode_from(
@@ -219,7 +257,7 @@ fn the_decoder_stream_has_its_limit_and_gives_the_metadata_of_an_instruction() {
     .unwrap();
     assert_eq!(
         second.value,
-        DecoderInstruction::StreamCancellation(StreamId::try_from(64).unwrap())
+        DecoderInstruction::StreamCancellation { stream_id: id(64) }
     );
     assert_eq!(second.metadata, at(&[1, 2]));
     // The stream does not end: its end is a failure.
