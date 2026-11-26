@@ -3,6 +3,10 @@
 //! [`FramePayload`] holds the stream and what is left of the payload, and
 //! lends the stream limited to that rest ([`AsAccess`]): reads end at the end
 //! of the payload, so whoever consumes the payload cannot read the next frame.
+//! The lent access is a [`Composed`], whose
+//! `parent_mut` and `state_mut` reach past the limit: reading the stream
+//! through them, or changing the state, breaks the payload and the frame
+//! stream it belongs to. Read through the access itself.
 //! The limited stream passes on [`Read`] and [`ReadChunk`], and [`Skip`] where
 //! the stream skips, and reports its exact remaining length ([`ExactLen`]). A
 //! stream that ends inside the payload is a truncated frame
@@ -172,7 +176,7 @@ impl<S: AsAccess> AsAccess for &mut FramePayload<S> {
 /// stream: it limits reads to the rest of the payload. A [`FramePayload`]
 /// keeps it; its stream, composed with it, is the payload source
 /// ([`PayloadSource`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PayloadLimit {
     remaining: u64,
     state: PayloadState,

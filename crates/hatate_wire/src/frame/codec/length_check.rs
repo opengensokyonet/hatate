@@ -15,7 +15,11 @@ use nitori_io::{LentBuffer, LentOutcome, Write, WriteLent, WriteLentResult, Writ
 /// A payload that writes more than the Length, or ends before it, panics
 /// ([`Frame`](crate::frame::Frame)'s encoding): the Length came from the
 /// payload, so the two disagree only when the payload, or the source it
-/// writes out, does not keep the length it reported.
+/// writes out, does not keep the length it reported. One case fails
+/// instead: a payload that fills storage the sink lends ([`WriteLent`]),
+/// such as `nitori_codec::Fill`, is refused any loan once the Length is
+/// used up, so a source longer than the Length ends its copy with the
+/// copy's no-progress error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayloadWriteLimit {
     length: u64,
@@ -121,9 +125,11 @@ impl<F: Write> Write for PayloadSink<F> {
     }
 }
 
-/// Lends at most what is left of the Length, and at least one byte, so that
-/// a payload that has written all of it can still learn that its source
-/// ended; keeping bytes past the Length panics.
+/// Lends at most what is left of the Length. Once it is used up, it accepts
+/// nothing (`Ok(None)`) without asking the sink below, as
+/// `nitori_io::adapters::WriteLimit` does at its boundary: a copy then probes
+/// whether its source ended, and a full sink below cannot hold up a frame
+/// that is already whole.
 impl<F: WriteLent> WriteLent for PayloadSink<F> {
     type Buffer<'l> = F::Buffer<'l>;
     fn poll_write_lent<'v, T, A, Fill>(
@@ -137,10 +143,12 @@ impl<F: WriteLent> WriteLent for PayloadSink<F> {
         Fill: for<'l> FnOnce(&mut LentBuffer<Self::Buffer<'l>>) -> Result<T, A>,
     {
         let view = host.project();
-        let allowed = usize::try_from(view.state.remaining)
-            .ok()
-            .and_then(NonZeroUsize::new)
-            .map_or(NonZeroUsize::MIN, |left| left.min(wanted));
+        let Some(left) =
+            NonZeroUsize::new(usize::try_from(view.state.remaining).unwrap_or(usize::MAX))
+        else {
+            return Poll::Ready(Ok(None));
+        };
+        let allowed = left.min(wanted);
         let result = ready!(F::poll_write_lent(view.parent, cx, allowed, fill))?;
         if let Some(LentOutcome::Kept(segment)) = &result {
             view.state.take(segment.count.get());
