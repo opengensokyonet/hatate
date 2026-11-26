@@ -456,7 +456,7 @@ where
     let LiteralSource::Raw(mut src) = value.source() else {
         panic!("expected raw value")
     };
-    match pending.value(Payload::Raw(&mut src)).await {
+    match pending.pending.value(Payload::Raw(&mut src)).await {
         Ok(()) => {
             value.finish().unwrap();
             writer.duplicate(0, 1).await.unwrap();
@@ -531,6 +531,7 @@ async fn reference_output<F: Read + ExactLen<LengthError = !>, G: Write<Report =
         .name_reference(NameReference::Static(index), 17, 15)
         .await
         .unwrap()
+        .pending
         .value(Payload::Raw(input))
         .await
         .unwrap();
@@ -538,6 +539,7 @@ async fn reference_output<F: Read + ExactLen<LengthError = !>, G: Write<Report =
         .name_reference(NameReference::Relative(63), 3, 0)
         .await
         .unwrap()
+        .pending
         .value(Payload::Raw(input))
         .await
         .unwrap();
@@ -587,7 +589,7 @@ where
         .literal_name(Payload::Huffman(name), usize::MAX, limit)
         .await
     {
-        Ok(pending) => pending,
+        Ok(output) => output.pending,
         Err(LiteralError::Huffman { source }) => return Err(source),
         Err(error) => panic!("{error:?}"),
     };

@@ -218,7 +218,7 @@ impl<L: FrameSetOn<K>, K: StreamKind, I, M> FrameStream<L, K, I, M> {
 
     /// The access, giving up the stream, wherever it is.
     pub fn into_io(self) -> I {
-        self.payload.source
+        self.payload.stream.into_parts().0
     }
 }
 
@@ -302,10 +302,10 @@ where
             }
             FrameStreamState::Ended => return Ok(false),
         }
-        let mut head = Composed::new(&mut self.payload.source, &mut self.head);
+        let mut head = Composed::new(self.payload.stream.parent_mut(), &mut self.head);
         match read_head::<L, K, _, M>(&mut head, self.role).await {
             Ok(Some((r#type, length))) => {
-                self.payload.limit = PayloadLimit::new(length.value.get().get());
+                *self.payload.stream.state_mut() = PayloadLimit::new(length.value.get().get());
                 self.r#type = r#type;
                 self.length = length;
                 self.state = FrameStreamState::InFrame;
@@ -333,7 +333,7 @@ where
             .field("role", &self.role)
             .field("type", &self.r#type)
             .field("length", &self.length)
-            .field("payload", &self.payload.limit)
+            .field("payload", self.payload.stream.state())
             .field("state", &self.state)
             .finish_non_exhaustive()
     }

@@ -1,5 +1,4 @@
 #![feature(impl_trait_in_assoc_type)]
-#![allow(unused_imports, dead_code)] // TEMP
 //! The unidirectional and bidirectional streams that hold their access, on
 //! the two layers (see `receiver_layer_frames.rs`): the constructors, the
 //! critical streams, and whether the streams and their futures are Send.
@@ -439,7 +438,6 @@ fn bidirectional_streams_are_the_same_on_both_layers() {
 
 fn assert_send<T: Send>(_: &T) {}
 
-#[cfg(any())] // TEMP: see progress file, Send of decode futures
 #[test]
 fn the_streams_and_their_futures_are_send_when_the_receiver_is() {
     let input = [0x01, 0x01, b'a', 0x00, 0x00];

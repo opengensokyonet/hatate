@@ -200,7 +200,7 @@ where
     let Ok(next) = writer.literal_name(name, wire, decoded).await else {
         return false;
     };
-    next.value(value).await.is_ok()
+    next.pending.value(value).await.is_ok()
 }
 
 fn check_raw_writer(body: &[u8], split: usize, wire: usize, decoded: usize) {

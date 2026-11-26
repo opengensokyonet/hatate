@@ -314,7 +314,7 @@ fn a_decoder_instruction_is_written_with_the_report_of_its_octets() {
 }
 
 #[test]
-fn an_encoder_instruction_is_written_with_the_report_of_all_of_it() {
+fn each_step_of_an_encoder_instruction_is_written_with_its_own_report() {
     let mut sink = ConstructedAccess::new(Tally::default());
     let mut writer = Writer::new(&mut sink);
     // The integer instructions: the report of their octets.
@@ -323,24 +323,22 @@ fn an_encoder_instruction_is_written_with_the_report_of_all_of_it() {
         Writes(3)
     );
     assert_eq!(run(writer.duplicate(31, 8)).unwrap(), Writes(2));
-    // An insertion with a name reference: the reference and the value,
-    // header and payload, are one report.
+    // An insertion with a name reference: the reference, then the value,
+    // header and payload, each with its own report.
     let mut value = ConstructedAccess::new(&b"xy"[..]);
     let index = Index::try_from(1).unwrap();
-    let pending = run(writer.name_reference(NameReference::Static(index), 8, 8)).unwrap();
-    assert_eq!(
-        run(pending.value(Payload::Raw(&mut value))).unwrap(),
-        Writes(4)
-    );
-    // An insertion with a literal name: the name's header and payload, the
-    // value's header and payload.
+    let name = run(writer.name_reference(NameReference::Static(index), 8, 8)).unwrap();
+    let name_report = name.report;
+    let value_report = run(name.pending.value(Payload::Raw(&mut value))).unwrap();
+    assert_eq!((name_report, value_report), (Writes(1), Writes(3)));
+    // An insertion with a literal name: the name's header and payload, then
+    // the value's header and payload.
     let mut name = ConstructedAccess::new(&b"ab"[..]);
     let mut value = ConstructedAccess::new(&b"c"[..]);
-    let pending = run(writer.literal_name(Payload::Raw(&mut name), 16, 16)).unwrap();
-    assert_eq!(
-        run(pending.value(Payload::Raw(&mut value))).unwrap(),
-        Writes(5)
-    );
+    let name = run(writer.literal_name(Payload::Raw(&mut name), 16, 16)).unwrap();
+    let name_report = name.report;
+    let value_report = run(name.pending.value(Payload::Raw(&mut value))).unwrap();
+    assert_eq!((name_report, value_report), (Writes(3), Writes(2)));
     assert_eq!(
         sink.into_inner().bytes,
         b"\x3f\xbd\x01\x1f\x00\xc1\x02xy\x42ab\x01c"

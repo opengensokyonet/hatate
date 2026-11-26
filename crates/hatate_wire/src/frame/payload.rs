@@ -41,22 +41,21 @@ use snafu::Snafu;
 #[must_use = "a payload not finished leaves its stream inside the payload"]
 #[derive(Debug)]
 pub struct FramePayload<S> {
-    pub(crate) source: S,
-    pub(crate) limit: PayloadLimit,
+    /// The stream composed with what is left of the payload.
+    pub(crate) stream: Composed<S, PayloadLimit>,
 }
 
 impl<S> FramePayload<S> {
     /// The payload of `length` bytes that `source` is at the start of.
     pub(crate) const fn new(source: S, length: u64) -> Self {
         Self {
-            source,
-            limit: PayloadLimit::new(length),
+            stream: Composed::new(source, PayloadLimit::new(length)),
         }
     }
 
     /// The bytes of the payload not yet consumed.
     pub const fn remaining(&self) -> u64 {
-        self.limit.remaining
+        self.stream.state().remaining
     }
 
     /// The stream, at the frame boundary, if nothing of the payload is left
@@ -66,8 +65,9 @@ impl<S> FramePayload<S> {
     ///
     /// The payload, when bytes of it are left or reading it failed.
     pub fn into_source(self) -> Result<S, Self> {
-        if self.limit.remaining == 0 && self.limit.state != PayloadState::Failed {
-            Ok(self.source)
+        let limit = self.stream.state();
+        if limit.remaining == 0 && limit.state != PayloadState::Failed {
+            Ok(self.stream.into_parts().0)
         } else {
             Err(self)
         }
@@ -93,7 +93,7 @@ where
     /// payload and is not given back.
     pub async fn finish(mut self) -> Result<S, PayloadError<<S::Family as Read>::Error>> {
         self.access().skip_to_end().await?;
-        Ok(self.source)
+        Ok(self.stream.into_parts().0)
     }
 }
 
@@ -115,9 +115,9 @@ impl<S: AsAccess> FramePayload<S> {
     where
         V: for<'a> DecodeFrom<&'a mut Self, Error = E>,
     {
-        self.limit.begin_value();
+        self.stream.state_mut().begin_value();
         let value = V::decode_from(&mut *self).await;
-        self.limit.end_value();
+        self.stream.state_mut().end_value();
         value
     }
 
@@ -136,7 +136,7 @@ impl<S: AsAccess> FramePayload<S> {
             .decode::<V, E>()
             .await
             .map_err(|source| DecodeToEndError::Value { source })?;
-        match NonZeroU64::new(self.limit.remaining) {
+        match NonZeroU64::new(self.stream.state().remaining) {
             None => Ok(value),
             Some(left) => Err(DecodeToEndError::Unread { left }),
         }
@@ -146,12 +146,9 @@ impl<S: AsAccess> FramePayload<S> {
 /// The stream limited to the rest of the payload.
 impl<S: AsAccess> AsAccess for FramePayload<S> {
     type Family = PayloadSource<Lent<S::Family>>;
-    type Access<'a>
-        = Composed<S::Access<'a>, &'a mut PayloadLimit>
-    where
-        Self: 'a;
-    fn access(&mut self) -> Self::Access<'_> {
-        Composed::new(self.source.access(), &mut self.limit)
+    type Access = Composed<S, PayloadLimit>;
+    fn access(&mut self) -> &mut Self::Access {
+        &mut self.stream
     }
 }
 
@@ -159,12 +156,9 @@ impl<S: AsAccess> AsAccess for FramePayload<S> {
 /// from a frame.
 impl<S: AsAccess> AsAccess for &mut FramePayload<S> {
     type Family = PayloadSource<Lent<S::Family>>;
-    type Access<'a>
-        = Composed<S::Access<'a>, &'a mut PayloadLimit>
-    where
-        Self: 'a;
-    fn access(&mut self) -> Self::Access<'_> {
-        Composed::new(self.source.access(), &mut self.limit)
+    type Access = Composed<S, PayloadLimit>;
+    fn access(&mut self) -> &mut Self::Access {
+        &mut self.stream
     }
 }
 

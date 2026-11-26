@@ -11,7 +11,8 @@ use crate::{
     stream::kind::StreamKind,
 };
 use core::num::NonZeroU64;
-use nitori_call::{AsAccess, ReceiverAccess};
+use length_check::PayloadWriteLimit;
+use nitori_call::{AsAccess, Composed, ReceiverAccess};
 use nitori_codec::{DecodeFrom, EncodeInto, prelude::*};
 use nitori_io::{Combine, Read, Write, calls::ReadValue};
 use sakuya_var_int::{
@@ -19,6 +20,8 @@ use sakuya_var_int::{
     stream::{ReadVarIntError, WriteVarIntError},
 };
 use snafu::{ResultExt, Snafu};
+
+pub mod length_check;
 
 /// The Type of the next frame, with the metadata of its bytes, or `None` at
 /// the end of the stream.
@@ -429,16 +432,30 @@ impl<E: ErrorCodeOf<ErrorCode>> ErrorCodeOf<ErrorCode> for ReadVarIntError<Paylo
 }
 
 /// Encodes a frame: its Type and Length, each at its width, and then its
-/// payload, which encodes itself into the sink. The output is the merged
-/// report of the head and the payload's output.
-impl<S, T, P, M> EncodeInto<S> for Frame<T, P, M>
+/// payload, which encodes itself into the sink held to the Length
+/// ([`PayloadWriteLimit`]). The output is the merged report of the head and
+/// the payload's output.
+///
+/// # Panics
+///
+/// When the payload writes more or fewer bytes than the Length, which it
+/// does only if it, or the source it writes out, does not keep the length it
+/// reported: such as a source whose exact length ([`ExactLen`](nitori_io::ExactLen))
+/// is wrong, or a payload swapped for one of another length
+/// ([`Frame::map_payload`]). A frame with such a payload would be written
+/// with a head that does not match it.
+impl<S, T, P, M, O, E> EncodeInto<S> for Frame<T, P, M>
 where
     S: AsAccess<Family: Write<Report: Combine>>,
     T: Copy + Into<VarInt> + TryFrom<VarInt>,
-    P: EncodeInto<S>,
+    P: for<'a> EncodeInto<
+            Composed<&'a mut S::Access, &'a mut PayloadWriteLimit>,
+            Output = O,
+            Error = E,
+        >,
 {
-    type Output = FrameOutput<<S::Family as Write>::Report, P::Output>;
-    type Error = EncodeFrameError<<S::Family as Write>::Error, P::Error>;
+    type Output = FrameOutput<<S::Family as Write>::Report, O>;
+    type Error = EncodeFrameError<<S::Family as Write>::Error, E>;
 
     async fn encode_into(self, mut sink: S) -> Result<Self::Output, Self::Error> {
         let r#type = self
@@ -453,11 +470,13 @@ where
             .encode_into(sink.access())
             .await
             .context(encode_frame_error::LengthSnafu)?;
+        let mut limit = PayloadWriteLimit::new(self.length.value.get().get());
         let payload = self
             .payload
-            .encode_into(sink)
+            .encode_into(Composed::new(sink.access(), &mut limit))
             .await
             .context(encode_frame_error::PayloadSnafu)?;
+        limit.finish();
         Ok(FrameOutput {
             head: r#type.combine(length),
             payload,

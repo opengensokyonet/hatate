@@ -2,8 +2,10 @@
 //! the writer until its value has been transferred. Keep one writer for
 //! the stream. Abandon the stream on a partial write or cancelled insertion.
 //!
-//! Each write returns the merged report of the bytes it wrote; an insertion
-//! returns the report of all of it from [`PendingValue::value`].
+//! Each write returns the merged report of the bytes it wrote. An insertion
+//! is written in two steps, each with its own report: the name reference or
+//! the literal name ([`InsertionNameOutput`]), then the value
+//! ([`PendingValue::value`]).
 use super::{NameReference, codec::DecodedLengthError};
 use crate::huffman::{DecodeError, SymbolDecoder};
 use crate::instruction::{EncodedInteger, WireBudget, WireLimitError};
@@ -160,13 +162,17 @@ where
     }
 
     /// Emit an insert's name reference and return the state awaiting its
-    /// value, which keeps the report of what was written.
+    /// value, with the report of what was written.
+    #[allow(clippy::type_complexity)] // The state awaiting the value, and the report.
     pub async fn name_reference(
         &mut self,
         name: NameReference,
         max_wire_len: usize,
         max_decoded_len: usize,
-    ) -> Result<PendingValue<'_, A>, HeaderError<<A::Family as Write>::Error>> {
+    ) -> Result<
+        InsertionNameOutput<'_, A, <A::Family as Write>::Report>,
+        HeaderError<<A::Family as Write>::Error>,
+    > {
         self.boundary()?;
         let header = match name {
             NameReference::Static(i) => EncodedInteger::new::<6>(0xc0, i.get().into()),
@@ -176,22 +182,29 @@ where
         wire.take(header.as_slice().len() as u64)?;
         wire.check(1)?; // Even an empty value needs its length prefix.
         let report = self.header(&header).await?;
-        Ok(PendingValue {
-            writer: self,
-            wire,
-            decoded_left: max_decoded_len,
+        Ok(InsertionNameOutput {
+            pending: PendingValue {
+                writer: self,
+                wire,
+                decoded_left: max_decoded_len,
+            },
             report,
         })
     }
 
-    /// Transfer a literal name before asking the caller for its value. The
-    /// state awaiting the value keeps the report of what was written.
+    /// Transfer a literal name before asking the caller for its value, and
+    /// return the state awaiting the value, with the report of what was
+    /// written.
+    #[allow(clippy::type_complexity)] // The state awaiting the value, and the report.
     pub async fn literal_name<F: Read + ExactLen<LengthError = !>>(
         &mut self,
         name: Payload<&mut impl ReceiverAccess<Family = F>>,
         max_wire_len: usize,
         max_decoded_len: usize,
-    ) -> Result<PendingValue<'_, A>, LiteralError<F::Error, <A::Family as Write>::Error>>
+    ) -> Result<
+        InsertionNameOutput<'_, A, <A::Family as Write>::Report>,
+        LiteralError<F::Error, <A::Family as Write>::Error>,
+    >
     where
         F::Length: TryInto<u64>,
     {
@@ -200,40 +213,42 @@ where
             writer: self,
             wire: WireBudget::new(max_wire_len),
             decoded_left: max_decoded_len,
-            report: Default::default(),
         };
-        pending.transfer::<5, F>(name, 0x40, 1).await?;
-        Ok(pending)
+        let report = pending.transfer::<5, F>(name, 0x40, 1).await?;
+        Ok(InsertionNameOutput { pending, report })
     }
 }
 
-/// A name has been fully emitted. Supply the value to complete this insertion.
-/// It holds the merged report of what the insertion has written so far.
+/// What writing the name of an insertion produced: the state awaiting the
+/// value, and the merged report `R` of the bytes written, the name
+/// reference or the literal name.
 #[must_use]
-pub struct PendingValue<'a, A: ReceiverAccess>
-where
-    A::Family: Write,
-{
+pub struct InsertionNameOutput<'a, A, R> {
+    /// The state awaiting the value.
+    pub pending: PendingValue<'a, A>,
+    /// The merged report of the bytes written.
+    pub report: R,
+}
+
+/// A name has been fully emitted. Supply the value to complete this insertion.
+#[must_use]
+pub struct PendingValue<'a, A> {
     writer: &'a mut Writer<A>,
     wire: WireBudget,
     decoded_left: usize,
-    report: <A::Family as Write>::Report,
 }
 
 impl<A: ReceiverAccess> PendingValue<'_, A>
 where
     A::Family: Write<Report: Combine>,
 {
-    fn merge(&mut self, next: <A::Family as Write>::Report) {
-        self.report = core::mem::take(&mut self.report).combine(next);
-    }
-
+    /// Writes one literal and returns the merged report of its bytes.
     async fn transfer<const N: u8, F: Read + ExactLen<LengthError = !>>(
         &mut self,
         payload: Payload<&mut impl ReceiverAccess<Family = F>>,
         prefix: u8,
         minimum_tail: u64,
-    ) -> Result<(), LiteralError<F::Error, <A::Family as Write>::Error>>
+    ) -> Result<<A::Family as Write>::Report, LiteralError<F::Error, <A::Family as Write>::Error>>
     where
         F::Length: TryInto<u64>,
     {
@@ -261,8 +276,7 @@ where
             DecodedLengthError::check(length, self.decoded_left)?;
             self.decoded_left -= length as usize;
         }
-        let report = self.writer.header(&header).await?;
-        self.merge(report);
+        let mut report = self.writer.header(&header).await?;
         let mut remaining = length;
         let mut buf = [0; 1024];
         while let Some(missing) = NonZeroU64::new(remaining) {
@@ -288,21 +302,20 @@ where
                     self.decoded_left -= decoder.finish().context(literal_error::HuffmanSnafu)?;
                 }
             }
-            let report = self
+            let written = self
                 .writer
                 .io
                 .write_all(&buf[..count])
                 .await
                 .context(literal_error::SendSnafu)?;
-            self.merge(report);
+            report = report.combine(written);
         }
-        Ok(())
+        Ok(report)
     }
 
     /// Transfer a literal value, consuming this state. Success restores the
-    /// instruction boundary and returns the merged report of the whole
-    /// insertion: its name reference or name, and the value. A failure leaves
-    /// the writer inside the insertion.
+    /// instruction boundary and returns the merged report of the value's
+    /// bytes. A failure leaves the writer inside the insertion.
     pub async fn value<F: Read + ExactLen<LengthError = !>>(
         mut self,
         value: Payload<&mut impl ReceiverAccess<Family = F>>,
@@ -310,8 +323,8 @@ where
     where
         F::Length: TryInto<u64>,
     {
-        self.transfer::<7, F>(value, 0, 0).await?;
+        let report = self.transfer::<7, F>(value, 0, 0).await?;
         self.writer.at_boundary = true;
-        Ok(self.report)
+        Ok(report)
     }
 }

@@ -12,15 +12,15 @@ cargo-fuzz = true
 resolver = "3"
 
 [dependencies]
-nitori_io = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "0de5f36b921c891815d138226c6180c6aa70953b", default-features = false }
-nitori_call = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "0de5f36b921c891815d138226c6180c6aa70953b", default-features = false }
-nitori_codec = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "0de5f36b921c891815d138226c6180c6aa70953b", default-features = false }
+nitori_io = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "2323adf5114e1f36e0dacfdce4c330f959e4dd89", default-features = false }
+nitori_call = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "2323adf5114e1f36e0dacfdce4c330f959e4dd89", default-features = false }
+nitori_codec = { version = "0.0.0", git = "https://github.com/opengensokyonet/nitori", rev = "2323adf5114e1f36e0dacfdce4c330f959e4dd89", default-features = false }
 hatate_qpack = { path = "../../crates/hatate_qpack" }
 hatate_wire = { path = "../../crates/hatate_wire" }
 hatate_wire_datagram = { path = "../../crates/hatate_wire_datagram" }
 hatate_wire_extended_connect = { path = "../../crates/hatate_wire_extended_connect" }
 frunk_core = { version = "=0.5.0", default-features = false }
-sakuya_var_int = { version = "0.0.0", git = "https://github.com/opengensokyonet/sakuya", rev = "39c4bc0fad1f032be7d00cc6f5b5c14585b19eb9" }
+sakuya_var_int = { version = "0.0.0", git = "https://github.com/opengensokyonet/sakuya", rev = "06b6644bd4ebd4f42c1ae264f2267f1ec808c726" }
 libfuzzer-sys = "0.4.13"
 bytes = { version = "1.12.1", default-features = false }
 
