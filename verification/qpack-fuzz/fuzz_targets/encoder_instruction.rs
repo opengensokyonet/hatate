@@ -2,7 +2,10 @@
 //! from the bounded wire region, from sources that hand out chunks of
 //! different sizes; write each instruction read back and compare it with the
 //! octets it was read from. Write instructions made of the input and compare
-//! them with an independent encoding.
+//! them with an independent encoding, and instructions whose integers and
+//! length prefixes carry padding, read back. The limits come from the input
+//! or from a table capacity (`EncoderStreamLimits::for_table_capacity`);
+//! a failed read has the kind its first octet allows.
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
@@ -17,7 +20,8 @@ use hatate_qpack::{
         DecodeEncoderInstructionError, EncoderInstruction, EncoderStream, EncoderStreamLimits,
         NameReference,
     },
-    huffman, integer,
+    huffman,
+    integer::{self, PrefixedField, PrefixedInt},
     static_table::Index,
     string_literal::{CopiedBytes, StringLiteral},
 };
@@ -160,12 +164,63 @@ fn parsed(instruction: &Read) -> Parsed {
     }
 }
 
+/// The kind of a failed read.
+#[derive(Debug, PartialEq, Eq)]
+enum Failure {
+    /// The first octet could not be read.
+    Prefix,
+    /// The octets read so far already exceed the wire limit.
+    Wire,
+    Capacity,
+    Duplicate,
+    NameIndex,
+    StaticName,
+    Name,
+    ValuePrefix,
+    Value,
+}
+
+impl Failure {
+    fn of<E>(error: &DecodeEncoderInstructionError<E>) -> Self {
+        use DecodeEncoderInstructionError as D;
+        match error {
+            D::Interrupted => unreachable!("the first read of a stream"),
+            D::WireLimit { .. } => Self::Wire,
+            D::Prefix { .. } => Self::Prefix,
+            D::Capacity { .. } => Self::Capacity,
+            D::Duplicate { .. } => Self::Duplicate,
+            D::NameIndex { .. } => Self::NameIndex,
+            D::StaticName { .. } => Self::StaticName,
+            D::Name { .. } => Self::Name,
+            D::ValuePrefix { .. } => Self::ValuePrefix,
+            D::Value { .. } => Self::Value,
+        }
+    }
+
+    /// Whether an instruction that begins with `first`, read from a
+    /// nonempty source within `wire` octets, can fail this way.
+    fn possible(&self, first: u8, wire: usize) -> bool {
+        match self {
+            // The source has no host failure and is not empty: only an
+            // empty budget stops the first octet.
+            Self::Prefix => wire == 0,
+            _ if wire == 0 => false,
+            Self::Wire => first >= 0x80,
+            Self::Duplicate => first <= 0x1f,
+            Self::Capacity => (0x20..=0x3f).contains(&first),
+            Self::NameIndex | Self::ValuePrefix | Self::Value => first >= 0x40,
+            Self::StaticName => first >= 0xc0,
+            Self::Name => (0x40..=0x7f).contains(&first),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     /// The stream ended at the instruction boundary.
     End,
     Item(Read),
-    Failed,
+    Failed(Failure),
 }
 
 #[call(sync)]
@@ -181,13 +236,13 @@ where
     match Option::<ReadValue<Read, ()>>::decode_from(&mut stream).await {
         Ok(Some(read)) => Outcome::Item(read.value),
         Ok(None) => Outcome::End,
-        Err(_) => {
+        Err(error) => {
             // A failed instruction leaves the stream interrupted.
             assert!(matches!(
                 Option::<ReadValue<Read, ()>>::decode_from(&mut stream).await,
                 Err(DecodeEncoderInstructionError::Interrupted)
             ));
-            Outcome::Failed
+            Outcome::Failed(Failure::of(&error))
         }
     }
 }
@@ -282,18 +337,131 @@ fn check_writer(body: &[u8], split: u8, wire: usize, decoded: usize) {
     }
 }
 
+/// A literal of `octets` padded by `padding` where its `N`-bit length
+/// prefix allows it.
+fn padded_literal<const N: u8>(
+    octets: &[u8],
+    coded: bool,
+    padding: u8,
+) -> StringLiteral<&[u8], &[u8]> {
+    let literal = literal(octets, coded);
+    literal
+        .clone()
+        .with_length_padding::<N>(padding)
+        .unwrap_or(literal)
+}
+
+/// A field of `value` padded by `padding` where its `N`-bit prefix allows
+/// it.
+fn padded<const N: u8, T: Copy + Into<PrefixedInt>>(value: T, padding: u8) -> PrefixedField<T> {
+    PrefixedField::new::<N>(value, padding).unwrap_or(PrefixedField::shortest(value))
+}
+
+/// Writes an instruction of the input with padded integers and length
+/// prefixes, and reads it back.
+fn check_padded(mode: u8, numeric: u64, padding: u8, body: &[u8], split: u8, block: usize) {
+    let (name, value) = body.split_at(usize::from(split).min(body.len()));
+    let (name_coded, value_coded) = (mode & 8 != 0, mode & 16 != 0);
+    let (made, expected): (Made<'_>, Parsed) = match (mode >> 1) & 3 {
+        0 => (
+            EncoderInstruction::SetDynamicTableCapacity {
+                capacity: padded::<5, _>(PrefixedInt::from(numeric), padding),
+            },
+            Parsed::Capacity(numeric),
+        ),
+        1 => (
+            EncoderInstruction::Duplicate {
+                index: padded::<5, _>(PrefixedInt::from(numeric), padding),
+            },
+            Parsed::Duplicate(numeric),
+        ),
+        2 => {
+            let (name, parsed) = if mode & 32 != 0 {
+                let index = numeric % 99;
+                (
+                    NameReference::Static {
+                        index: padded::<6, _>(Index::try_from(index).unwrap(), padding),
+                    },
+                    Name::Static(index),
+                )
+            } else {
+                (
+                    NameReference::Relative {
+                        index: padded::<6, _>(PrefixedInt::from(numeric), padding),
+                    },
+                    Name::Relative(numeric),
+                )
+            };
+            (
+                EncoderInstruction::InsertWithNameReference {
+                    name,
+                    value: padded_literal::<7>(body, value_coded, padding),
+                },
+                Parsed::Reference(parsed, body.to_vec()),
+            )
+        }
+        _ => (
+            EncoderInstruction::InsertWithLiteralName {
+                name: padded_literal::<5>(name, name_coded, padding),
+                value: padded_literal::<7>(value, value_coded, padding),
+            },
+            Parsed::Literal(name.to_vec(), value.to_vec()),
+        ),
+    };
+    let wire_len = made.wire_len() as usize;
+    let mut written = Vec::new();
+    assert!(written.sync_write_insertion_unpin(made, usize::MAX, usize::MAX));
+    assert_eq!(written.len(), wire_len);
+    // A reader that decodes the padding gets the values that were made.
+    let decoded = 2 * written.len() + 16;
+    let mut cursor = written.as_slice();
+    assert_eq!(reference(&mut cursor, decoded), Some(expected));
+    assert!(cursor.is_empty());
+    // The stream reads it whole, and writes the same octets back.
+    let mut input = Blocks {
+        rest: &written,
+        block,
+    };
+    let Outcome::Item(read) = input.sync_parse_unpin(written.len(), decoded) else {
+        panic!("a written instruction is read");
+    };
+    assert!(input.rest.is_empty());
+    let mut again = Vec::new();
+    assert!(again.sync_write_back_unpin(read, written.len(), decoded));
+    assert_eq!(again, written);
+}
+
 fuzz_target!(|data: &[u8]| {
-    let [wire, decoded, chunk, body @ ..] = data else {
+    let [mode, exponent, wire, decoded, chunk, selector, body @ ..] = data else {
         return;
     };
-    let wire = usize::from(*wire);
-    let decoded = usize::from(*decoded);
+    // The limits come from the input, or from a table capacity of up to 2^60
+    // or so.
+    let limits = if mode & 1 != 0 {
+        let capacity = (u64::from(*decoded) << 8 | u64::from(*wire)) << (exponent % 44);
+        EncoderStreamLimits::for_table_capacity(capacity)
+    } else {
+        limits(usize::from(*wire), usize::from(*decoded))
+    };
+    let (wire, decoded) = (limits.max_wire_len, limits.max_decoded_len);
     let block = usize::from(*chunk) + 1;
+    let mut numeric = [0; 8];
+    let count = body.len().min(8);
+    numeric[..count].copy_from_slice(&body[..count]);
+    check_padded(
+        *mode,
+        u64::from_le_bytes(numeric),
+        selector >> 4,
+        body,
+        *selector,
+        block,
+    );
     check_writer(body, *chunk, wire, decoded);
     let mut src = body;
     while !src.is_empty() {
         let before = src;
         let size = src.len().min(wire);
+        let first = src[0];
         let mut bounded = &src[..size];
         let expected = reference(&mut bounded, decoded);
         let mut input = Blocks { rest: src, block };
@@ -318,8 +486,15 @@ fuzz_target!(|data: &[u8]| {
                 assert!(written.sync_write_back_unpin(read, wire, decoded));
                 assert_eq!(written, &before[..consumed]);
             }
-            (Outcome::Failed, None) => {
+            (Outcome::Failed(failure), None) => {
                 assert!(consumed <= size);
+                // Nothing is read from an empty budget, and an octet is
+                // read otherwise.
+                assert_eq!(consumed == 0, wire == 0);
+                assert!(
+                    failure.possible(first, wire),
+                    "{failure:?} after {first:#x}"
+                );
                 return;
             }
             (actual, expected) => panic!("{actual:?} against {expected:?}"),

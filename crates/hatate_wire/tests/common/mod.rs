@@ -488,6 +488,15 @@ pub enum Ty {
     Unknown(u64),
 }
 
+/// The SETTINGS_QPACK_MAX_TABLE_CAPACITY of `octets`, in its shortest
+/// encoding.
+pub fn table_capacity(octets: u64) -> hatate_wire_qpack::QpackMaxTableCapacity {
+    use sakuya_var_int::{VarInt, VarIntField};
+    hatate_wire_qpack::QpackMaxTableCapacity::new(VarIntField::shortest(
+        VarInt::new(octets).expect("a capacity within the varint range"),
+    ))
+}
+
 pub fn ty<C: ClaimedValue>(frame_type: FrameType<C>) -> Ty {
     match frame_type {
         FrameType::Known(known) => Ty::Known(known.value().get()),
@@ -602,7 +611,7 @@ pub async fn next_critical_encoder<A: ReceiverAccess>(
 where
     Composed<A, CriticalStream>: ReceiverAccess<Family: ReadChunk<Metadata = ()>>,
 {
-    reader.set_max_table_capacity(capacity);
+    reader.set_max_table_capacity(table_capacity(capacity));
     let next = ReadValue::<Instruction, ()>::decode_from(reader).await?;
     Ok(next.value)
 }

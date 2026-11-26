@@ -52,8 +52,8 @@ where
         .context(IntegerSnafu)?;
         let bytes = encoded.as_slice();
         WireBudget::new(stream.limits.max_wire_len).check(bytes.len() as u128)?;
-        stream.position.begin_write(bytes.len());
-        match instruction::put(&mut stream.io, &mut stream.position.unwritten, bytes).await {
+        let unwritten = stream.position.begin_write(bytes.len());
+        match instruction::put(&mut stream.io, unwritten, bytes).await {
             Ok(report) => {
                 stream.position.finish();
                 Ok(report)

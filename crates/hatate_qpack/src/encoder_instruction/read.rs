@@ -4,7 +4,7 @@ use super::{
     VALUE_LENGTH_BITS,
 };
 use crate::{
-    huffman::{self, SymbolDecoder},
+    huffman::{self, BatchingDecoder, Decoded},
     instruction::{self, NumberError, OctetError, WireBudget, WireLimitError},
     static_table,
     string_literal::StringLiteral,
@@ -180,36 +180,38 @@ where
     S: Default + Extend<F::Chunk>,
     H: Default + Extend<u8>,
 {
-    let length = if tail > 0 {
-        // The accumulated length is a lower bound even before its last
-        // digit. Leave room for that digit and what follows.
-        instruction::checked_number::<N, F, _>(
-            io,
-            wire,
-            first,
-            |wire, minimum| Ok(wire.check(u128::from(minimum) + 1 + u128::from(tail))?),
-            |source| DecodeLiteralError::Length { source },
-        )
-        .await?
-    } else {
-        instruction::number::<N, F>(io, wire, first)
-            .await
-            .context(decode_literal_error::LengthSnafu)?
-    };
+    let raw = first & (1 << N) == 0;
+    // The accumulated length is a lower bound even before its last digit.
+    // Leave room for that digit and what follows, and a raw literal's
+    // decoded octets are at least as many.
+    let length = instruction::checked_number::<N, F, _>(
+        io,
+        wire,
+        first,
+        |wire, minimum| {
+            wire.check(u128::from(minimum) + 1 + u128::from(tail))?;
+            if raw {
+                DecodedLengthError::check(minimum, decoded_left)?;
+            }
+            Ok(())
+        },
+        |source| DecodeLiteralError::Length { source },
+    )
+    .await?;
     let declared = length.value().get();
     wire.check(u128::from(declared) + u128::from(tail))?;
     wire.take(declared)?;
     // The complete payload fits the usize-sized wire budget.
     let count = declared as usize;
-    if first & (1 << N) == 0 {
+    if raw {
         DecodedLengthError::check(declared, decoded_left)?;
         let bytes = read_raw(io, count).await?;
         Ok(StringLiteral::read_raw(bytes, length))
     } else {
-        let (decoded, decoded_len) = read_huffman(io, count, decoded_left).await?;
+        let decoded: Decoded<H> = read_huffman(io, count, decoded_left).await?;
         Ok(StringLiteral::read_huffman(
-            decoded,
-            decoded_len as u64,
+            decoded.octets,
+            decoded.len as u64,
             length,
         ))
     }
@@ -226,6 +228,10 @@ async fn read_raw<F: ReadChunk<Metadata = ()>, S: Default + Extend<F::Chunk>>(
         match io.read_chunk(missing).await {
             Ok(Some(segment)) => {
                 let taken = segment.chunk.remaining();
+                // invariant: `read_chunk` hands out a nonempty chunk of at
+                // most the octets requested, by the contract of nitori_io;
+                // only a host that breaks it, not the peer, reaches this, as
+                // with the same assertion in nitori's own adapters.
                 assert!(taken > 0 && taken <= remaining, "invalid chunk length");
                 remaining -= taken;
                 bytes.extend(core::iter::once(segment.chunk));
@@ -242,14 +248,10 @@ async fn read_huffman<F: Read<Metadata = ()>, H: Default + Extend<u8>>(
     io: &mut impl ReceiverAccess<Family = F>,
     count: usize,
     limit: usize,
-) -> Result<(H, usize), DecodeLiteralError<F::Error>> {
+) -> Result<Decoded<H>, DecodeLiteralError<F::Error>> {
     use decode_literal_error::HuffmanSnafu;
-    let mut output = H::default();
-    let mut decoder = SymbolDecoder::new(limit);
+    let mut decoder = BatchingDecoder::new(limit);
     let mut encoded = [0; 64];
-    // Hand symbols over in batches rather than one `extend` call each.
-    let mut batch = [0; 64];
-    let mut filled = 0;
     let mut remaining = count;
     while let Some(missing) = NonZeroUsize::new(remaining) {
         let request = remaining.min(encoded.len());
@@ -260,21 +262,10 @@ async fn read_huffman<F: Read<Metadata = ()>, H: Default + Extend<u8>>(
         };
         remaining -= read;
         for &octet in &encoded[..read] {
-            for shift in (0..8).rev() {
-                if let Some(symbol) = decoder.bit((octet >> shift) & 1).context(HuffmanSnafu)? {
-                    batch[filled] = symbol;
-                    filled += 1;
-                    if filled == batch.len() {
-                        output.extend(batch.iter().copied());
-                        filled = 0;
-                    }
-                }
-            }
+            decoder.octet(octet).context(HuffmanSnafu)?;
         }
     }
-    let produced = decoder.finish().context(HuffmanSnafu)?;
-    output.extend(batch[..filled].iter().copied());
-    Ok((output, produced))
+    decoder.finish().context(HuffmanSnafu)
 }
 
 /// The decoded octets of a literal, or of the literals of an instruction,
@@ -297,7 +288,8 @@ impl DecodedLengthError {
         }
     }
 
-    /// The decoded length: a raw literal's length when reading, the
+    /// The decoded length: a raw literal's length when reading, or a lower
+    /// bound of it from the digits of its length read so far; the
     /// instruction's [`decoded_len`](EncoderInstruction::decoded_len) when
     /// writing.
     pub const fn length(&self) -> u64 {

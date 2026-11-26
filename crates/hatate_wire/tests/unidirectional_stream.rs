@@ -701,9 +701,7 @@ fn a_control_stream_cut_inside_a_frame_is_a_closed_critical_stream() {
 /// stream fails or ends.
 #[call(sync)]
 async fn qpack_instructions<
-    F: Read<Error = Infallible, Metadata = ()>
-        + ReadChunk<Metadata = ()>
-        + Skip<Count = usize, Metadata = ()>,
+    F: Read<Error = !, Metadata = ()> + ReadChunk<Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,

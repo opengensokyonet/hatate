@@ -2,7 +2,7 @@ use super::{FieldLine, TableIndex};
 use crate::InsufficientCapacityError;
 use crate::huffman::EncodedBuf;
 use crate::integer::{self, Encoded, PaddingError, PrefixedField, PrefixedInt};
-use crate::string_literal::{self, LiteralBytes, StringLiteral};
+use crate::string_literal::{self, LiteralBytes, StringLiteral, WireLiteral};
 use bytes::buf::Chain;
 use bytes::{Buf, BufMut};
 use snafu::{ResultExt, Snafu};
@@ -84,8 +84,11 @@ impl<S: Buf, H: Buf> Part<S, H> {
         flags: u8,
         literal: StringLiteral<S, H>,
     ) -> Result<Self, string_literal::WriteError> {
-        let (huffman, length, bytes) = literal.into_wire::<N>()?;
-        let flags = if huffman { flags | 1 << N } else { flags };
+        let WireLiteral { length, bytes } = literal.into_wire::<N>()?;
+        let flags = match bytes {
+            LiteralBytes::Raw(_) => flags,
+            LiteralBytes::Huffman(_) => flags | 1 << N,
+        };
         let mut part = Self::integer::<N, _>(flags, length)
             .expect("the literal checked its length prefix at this width");
         part.len += u128::from(length.value().get());

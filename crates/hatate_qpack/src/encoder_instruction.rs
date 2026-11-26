@@ -63,7 +63,7 @@ mod read;
 mod write;
 
 pub use read::{DecodeEncoderInstructionError, DecodeLiteralError, DecodedLengthError};
-pub use write::{EncodeEncoderInstructionError, EncoderInstructionOutput};
+pub use write::{EncodeEncoderInstructionError, EncoderInstructionOutput, ShortPayloadError};
 
 use crate::{
     instruction::Position,

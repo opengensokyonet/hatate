@@ -184,15 +184,10 @@ impl<E> NumberError<E> {
 /// Where an instruction stream is, for its reads and its writes.
 ///
 /// A read is inside an instruction from its first octet on. A write is
-/// inside one once the stream has accepted an octet of it: what is left of
-/// the instruction is counted down in `unwritten`, the composition state of
-/// the sink it is written to, which outlives a write that is dropped.
+/// inside one once the stream has accepted an octet of it.
 #[derive(Debug)]
 pub(crate) struct Position {
     state: State,
-    /// The octets of the instruction being written that the stream has not
-    /// accepted yet.
-    pub(crate) unwritten: WriteLimit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,23 +197,27 @@ enum State {
     /// Inside an instruction that was not finished, or one that failed.
     Interrupted,
     /// Writing an instruction of `length` octets, or a write of one that
-    /// ended before it finished.
-    Writing { length: usize },
+    /// ended before it finished. The octets the stream has not accepted yet
+    /// are counted down in `unwritten`, the composition state of the sink
+    /// the instruction is written to, which outlives a write that is dropped.
+    Writing {
+        length: usize,
+        unwritten: WriteLimit,
+    },
 }
 
 impl Position {
     pub(crate) const fn new() -> Self {
         Self {
             state: State::Boundary,
-            unwritten: WriteLimit(0),
         }
     }
 
     /// Settle a write that ended without finishing: at the boundary if the
     /// stream accepted none of its octets, interrupted otherwise.
     pub(crate) fn settle(&mut self) {
-        if let State::Writing { length } = self.state {
-            self.state = if self.unwritten.0 == length {
+        if let State::Writing { length, unwritten } = self.state {
+            self.state = if unwritten.0 == length {
                 State::Boundary
             } else {
                 State::Interrupted
@@ -243,10 +242,18 @@ impl Position {
         self.state = State::Boundary;
     }
 
-    /// Start writing an instruction of `length` octets.
-    pub(crate) fn begin_write(&mut self, length: usize) {
-        self.unwritten = WriteLimit(length);
-        self.state = State::Writing { length };
+    /// Start writing an instruction of `length` octets; gives the count of
+    /// its octets not written yet, to write it with.
+    pub(crate) fn begin_write(&mut self, length: usize) -> &mut WriteLimit {
+        self.state = State::Writing {
+            length,
+            unwritten: WriteLimit(length),
+        };
+        match &mut self.state {
+            State::Writing { unwritten, .. } => unwritten,
+            // invariant: the state was set to writing just above.
+            State::Boundary | State::Interrupted => unreachable!("the state is writing"),
+        }
     }
 }
 

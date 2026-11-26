@@ -34,6 +34,8 @@ use nitori_codec::DecodeFrom;
 use nitori_io::{ChunkSegment, Combine, Min, Read, ReadChunk, ReadSegment, Skip, calls::ReadValue};
 use snafu::Snafu;
 
+use crate::QpackMaxTableCapacity;
+
 /// Composition state for a critical stream: the end of the stream is a
 /// failure, [`CriticalStreamError::Closed`], rather than an end.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -201,9 +203,10 @@ impl<A> QpackEncoderStream<A> {
     /// SETTINGS_QPACK_MAX_TABLE_CAPACITY this endpoint sent
     /// ([`EncoderStreamLimits::for_table_capacity`]). An instruction begun
     /// before keeps the limits it began with.
-    pub fn set_max_table_capacity(&mut self, capacity: u64) {
+    pub fn set_max_table_capacity(&mut self, capacity: QpackMaxTableCapacity) {
+        let octets = u64::from(capacity.value().get());
         self.stream
-            .set_limits(EncoderStreamLimits::for_table_capacity(capacity));
+            .set_limits(EncoderStreamLimits::for_table_capacity(octets));
     }
 }
 

@@ -15,15 +15,18 @@ use hatate_qpack::{
         DecoderInstruction as D, DecoderStream, DecoderStreamLimits, Increment, StreamId,
     },
     encoder_instruction::{
-        EncoderInstruction, EncoderInstructionOutput, EncoderStream, EncoderStreamLimits,
-        NameReference,
+        EncodeEncoderInstructionError, EncoderInstruction, EncoderInstructionOutput, EncoderStream,
+        EncoderStreamLimits, NameReference,
     },
     integer::{PrefixedField, PrefixedInt},
     static_table::Index,
     string_literal::StringLiteral,
 };
 use nitori_call::{ConstructedAccess, family_receiver};
-use nitori_codec::{DecodeFrom, EncodeInto, payload::Chunks};
+use nitori_codec::{
+    DecodeFrom, EncodeInto, EncodedLen,
+    payload::{Buffered, Chunks, Fill},
+};
 use nitori_io::{
     ChunkSegment, Combine, Read, ReadChunk, ReadSegment, Write, WriteSegment,
     calls::{CopyTotal, ReadValue},
@@ -384,4 +387,125 @@ fn a_raw_literal_from_a_source_gives_the_output_of_its_copy() {
         }
     );
     assert_eq!(sink.into_inner().bytes, b"\x43abc\x02xy");
+}
+
+/// A source that claims the length `claimed` and writes as its wrapped
+/// source does.
+struct Claims<S> {
+    claimed: u64,
+    inner: S,
+}
+
+impl<S> EncodedLen for Claims<S> {
+    type LengthError = !;
+    async fn encoded_len(&mut self) -> Result<u64, !> {
+        Ok(self.claimed)
+    }
+}
+
+impl<K, S: EncodeInto<K>> EncodeInto<K> for Claims<S> {
+    type Output = S::Output;
+    type Error = S::Error;
+    async fn encode_into(self, sink: K) -> Result<S::Output, S::Error> {
+        self.inner.encode_into(sink).await
+    }
+}
+
+fn filled(bytes: &'static [u8]) -> Fill<ConstructedAccess<&'static [u8]>> {
+    Fill {
+        source: ConstructedAccess::new(bytes),
+        chunk_maximum: NonZeroUsize::new(2).unwrap(),
+    }
+}
+
+fn buffered(bytes: &'static [u8]) -> Buffered<ConstructedAccess<&'static [u8]>, [u8; 2]> {
+    Buffered {
+        source: ConstructedAccess::new(bytes),
+        buffer: [0; 2],
+    }
+}
+
+/// A raw literal of a source that tells its length.
+fn lit<S: EncodedLen<LengthError: core::fmt::Debug>>(source: S) -> StringLiteral<S, &'static [u8]> {
+    run(StringLiteral::raw(source)).unwrap()
+}
+
+fn copied(count: u64) -> CopyTotal<(), ()> {
+    CopyTotal {
+        count,
+        metadata: (),
+        report: (),
+    }
+}
+
+/// A raw literal made of a source and the output of its copy: the wire
+/// holds the length prefixes and the payloads, and the output is the
+/// wrapper's.
+#[test]
+fn a_raw_literal_from_a_fill_or_a_buffer_gives_the_output_of_its_copy() {
+    let expected = EncoderInstructionOutput {
+        head: (),
+        name: Some(copied(3)),
+        value: Some(copied(2)),
+    };
+    let mut sink = ConstructedAccess::new(Vec::<u8>::new());
+    let mut stream = EncoderStream::new(&mut sink, LIMITS);
+    let instruction = EncoderInstruction::InsertWithLiteralName {
+        name: lit(filled(b"abc")),
+        value: lit(filled(b"xy")),
+    };
+    assert_eq!(run(instruction.encode_into(&mut stream)).unwrap(), expected);
+    assert_eq!(sink.into_inner(), b"\x43abc\x02xy");
+    let mut sink = ConstructedAccess::new(Vec::<u8>::new());
+    let mut stream = EncoderStream::new(&mut sink, LIMITS);
+    let instruction = EncoderInstruction::InsertWithLiteralName {
+        name: lit(buffered(b"abc")),
+        value: lit(buffered(b"xy")),
+    };
+    assert_eq!(run(instruction.encode_into(&mut stream)).unwrap(), expected);
+    assert_eq!(sink.into_inner(), b"\x43abc\x02xy");
+}
+
+/// A source with more octets than its literal claims: the octets beyond the
+/// length do not reach the stream, and the instruction fails.
+#[test]
+fn a_raw_literal_from_a_fill_or_a_buffer_longer_than_its_length_stops_at_it() {
+    let mut sink = ConstructedAccess::new(Vec::<u8>::new());
+    let mut stream = EncoderStream::new(&mut sink, LIMITS);
+    let instruction = EncoderInstruction::InsertWithLiteralName {
+        name: raw::<_, &'static [u8]>(Claims {
+            claimed: 2,
+            inner: filled(b"abcd"),
+        }),
+        value: raw(Claims {
+            claimed: 1,
+            inner: filled(b"x"),
+        }),
+    };
+    assert!(matches!(
+        run(instruction.encode_into(&mut stream)),
+        Err(EncodeEncoderInstructionError::Payload { .. })
+    ));
+    // The stream is left inside the instruction.
+    let after = EncoderInstruction::<&'static [u8], &'static [u8]>::Duplicate { index: int(0) };
+    assert!(matches!(
+        run(after.encode_into(&mut stream)),
+        Err(EncodeEncoderInstructionError::Interrupted)
+    ));
+    assert_eq!(sink.into_inner(), b"\x42ab");
+    // The value of a name reference, from a buffer.
+    let mut sink = ConstructedAccess::new(Vec::<u8>::new());
+    let mut stream = EncoderStream::new(&mut sink, LIMITS);
+    let instruction = EncoderInstruction::<_, &'static [u8]>::InsertWithNameReference {
+        name: NameReference::Relative { index: int(0) },
+        value: raw(Claims {
+            claimed: 2,
+            inner: buffered(b"xyz"),
+        }),
+    };
+    assert!(matches!(
+        run(instruction.encode_into(&mut stream)),
+        Err(EncodeEncoderInstructionError::Payload { .. })
+    ));
+    assert_eq!(sink.into_inner(), b"\x80\x02xy");
 }

@@ -219,10 +219,9 @@ impl<S, H> StringLiteral<S, H> {
     }
 
     /// Validate the literal for a length prefix of `N` bits and split it for
-    /// writing: the first octet's H bit, the length prefix and the payload.
-    pub(crate) fn into_wire<const N: u8>(
-        self,
-    ) -> Result<(bool, PrefixedField, LiteralBytes<S, H>), WriteError>
+    /// writing into its length prefix and its payload, whose variant is the
+    /// first octet's H bit.
+    pub(crate) fn into_wire<const N: u8>(self) -> Result<WireLiteral<S, H>, WriteError>
     where
         S: Buf,
         H: Buf,
@@ -240,8 +239,20 @@ impl<S, H> StringLiteral<S, H> {
         if expected != actual as u64 {
             return Err(WriteError::PayloadLength { expected, actual });
         }
-        Ok((self.is_huffman(), length, self.into_bytes()))
+        Ok(WireLiteral {
+            length,
+            bytes: self.into_bytes(),
+        })
     }
+}
+
+/// A literal checked for writing, split into its parts on the wire.
+#[derive(Debug)]
+pub(crate) struct WireLiteral<S, H> {
+    /// The length prefix.
+    pub(crate) length: PrefixedField,
+    /// The payload: a raw payload, or the decoded octets of a Huffman one.
+    pub(crate) bytes: LiteralBytes<S, H>,
 }
 
 impl<S: AsRef<[u8]>, H: AsRef<[u8]>> AsRef<[u8]> for StringLiteral<S, H> {
@@ -330,14 +341,15 @@ pub enum WriteError {
         source: PaddingError,
     },
     /// The octets left in the payload differ from the length the literal
-    /// was constructed with: the decoded length for a Huffman literal. A raw
-    /// payload written to a stream reports the octets it wrote.
+    /// was constructed with: the decoded length for a Huffman literal, the
+    /// length for a raw literal in memory. It is found before anything is
+    /// written; a raw payload written to a stream reports its length only by
+    /// what it writes.
     #[snafu(display("literal payload holds {actual} octets instead of {expected}"))]
     PayloadLength {
         /// The length recorded at construction.
         expected: u64,
-        /// The octets remaining in the payload, or those a raw payload wrote
-        /// to a stream.
+        /// The octets remaining in the payload.
         actual: usize,
     },
 }
@@ -355,10 +367,10 @@ pub(crate) fn read<const N: u8, S: Buf + SplitTo, H: Default + Extend<u8>>(
     let count = usize::try_from(length.value().get()).map_err(|_| ReadError::AddressSpace)?;
     let data = src.split_to(count).context(PayloadSnafu)?;
     if encoded {
-        let (decoded, decoded_len) = huffman::decode_counted(data, limit).context(HuffmanSnafu)?;
+        let decoded = huffman::decode_counted(data, limit).context(HuffmanSnafu)?;
         Ok(StringLiteral(Repr::Huffman {
-            decoded,
-            decoded_len: decoded_len as u64,
+            decoded: decoded.octets,
+            decoded_len: decoded.len as u64,
             length,
         }))
     } else {

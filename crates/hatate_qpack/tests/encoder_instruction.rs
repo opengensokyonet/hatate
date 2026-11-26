@@ -137,6 +137,78 @@ fn the_two_budgets_follow_the_name_and_the_value() {
     }
 }
 
+/// The kind of the failure of reading the next instruction within `wire`
+/// and `decoded`.
+#[call(sync)]
+async fn failure<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
+    io: &mut A,
+    wire: usize,
+    decoded: usize,
+) -> &'static str
+where
+    <F as Read>::Error: Debug,
+{
+    let mut reader = encoder_stream(io);
+    match next_encoder(&mut reader, wire, decoded).await {
+        Err(ReadError::Value {
+            source: DecodeLiteralError::WireLimit { .. },
+        }) => "value wire limit",
+        Err(ReadError::Name {
+            source: DecodeLiteralError::DecodedLength { .. },
+        }) => "name decoded length",
+        Err(ReadError::Name {
+            source:
+                DecodeLiteralError::Huffman {
+                    source: huffman::DecodeError::OutputTooLong { .. },
+                },
+        }) => "name huffman output",
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_value_length_over_the_wire_limit_is_refused_before_its_last_digit() {
+    // A static name reference, then a value length whose digits are all
+    // continuations: 127 plus 127 is within the limit of 400, and the
+    // third digit, worth 127 * 128, is over it.
+    let mut wire = vec![0xc0, 0x7f];
+    wire.extend([0xff; 20]);
+    wire.extend([0x00, 0x20]);
+    let mut input = &wire[..];
+    assert_eq!(
+        input.sync_failure_unpin(400, usize::MAX),
+        "value wire limit"
+    );
+    // The second continuation octet was the last one read.
+    assert_eq!(input.len(), wire.len() - 4);
+}
+
+#[test]
+fn a_raw_name_length_over_the_decoded_limit_is_refused_before_its_last_digit() {
+    let mut wire = vec![0x5f];
+    wire.extend([0xff; 20]);
+    wire.extend([0x00, 0x20]);
+    let mut input = &wire[..];
+    // 31 is within the limit of 100; 31 plus the next digit is not.
+    assert_eq!(
+        input.sync_failure_unpin(usize::MAX, 100),
+        "name decoded length"
+    );
+    assert_eq!(input.len(), wire.len() - 2);
+}
+
+#[test]
+fn a_huffman_name_length_is_not_refused_by_the_decoded_limit() {
+    // A Huffman name of 34 octets, within the wire limit: its decoded length
+    // is not told by its length, so the prefix is accepted and the decoding
+    // reaches the limit of 2 after reading the octets.
+    let mut wire = vec![0x7f, 0x03];
+    wire.extend([0x00; 34]);
+    let mut input = &wire[..];
+    assert_eq!(input.sync_failure_unpin(100, 2), "name huffman output");
+    assert!(input.len() < wire.len() - 2);
+}
+
 #[call(sync)]
 async fn reference<F: ReadChunk<Metadata = ()>, A: ReceiverAccess<Family = F>>(
     io: &mut A,
@@ -650,12 +722,8 @@ where
     };
     let short = matches!(
         insertion.encode_into(&mut writer).await,
-        Err(WriteError::Name {
-            source: Literal::PayloadLength {
-                expected: 3,
-                actual: 2
-            }
-        })
+        Err(WriteError::ShortName { source })
+            if (source.length(), source.missing()) == (3, 1)
     );
     let long = matches!(
         E::<Liar, &[u8]>::Duplicate { index: int(0) }
@@ -664,6 +732,60 @@ where
         Err(WriteError::Interrupted)
     );
     [short, long]
+}
+
+/// Writes an insertion whose raw value claims 3 octets and writes 2, and
+/// then another instruction; whether the first failed with `ShortValue` and
+/// the second with `Interrupted`.
+#[call(sync)]
+async fn lie_value<G: Write<Report = ()>>(
+    output: &mut impl ReceiverAccess<Family = G>,
+    literal_name: bool,
+) -> [bool; 2]
+where
+    <G as Write>::Error: Debug,
+{
+    let mut writer = EncoderStream::new(output, limits(usize::MAX, usize::MAX));
+    let value = raw(Liar {
+        claimed: 3,
+        actual: b"ab",
+    });
+    let insertion: E<Liar, &[u8]> = if literal_name {
+        E::InsertWithLiteralName {
+            name: raw(Liar {
+                claimed: 1,
+                actual: b"k",
+            }),
+            value,
+        }
+    } else {
+        E::InsertWithNameReference {
+            name: static_name(0),
+            value,
+        }
+    };
+    let short = matches!(
+        insertion.encode_into(&mut writer).await,
+        Err(WriteError::ShortValue { source })
+            if (source.length(), source.missing()) == (3, 1)
+    );
+    let interrupted = matches!(
+        E::<Liar, &[u8]>::Duplicate { index: int(0) }
+            .encode_into(&mut writer)
+            .await,
+        Err(WriteError::Interrupted)
+    );
+    [short, interrupted]
+}
+
+#[test]
+fn a_raw_value_that_writes_fewer_octets_fails_the_instruction() {
+    let mut output = Vec::new();
+    assert_eq!(output.sync_lie_value_unpin(false), [true, true]);
+    assert_eq!(output, b"\xc0\x03ab");
+    let mut output = Vec::new();
+    assert_eq!(output.sync_lie_value_unpin(true), [true, true]);
+    assert_eq!(output, b"\x41k\x03ab");
 }
 
 #[call(sync)]
@@ -686,6 +808,40 @@ where
             source: WriteAllError::WriteZero { .. }
         })
     )
+}
+
+#[call(sync)]
+async fn overlong_name<G: Write<Report = ()>>(output: &mut impl ReceiverAccess<Family = G>) -> bool
+where
+    <G as Write>::Error: Debug,
+{
+    let mut writer = EncoderStream::new(output, limits(usize::MAX, usize::MAX));
+    // The name writes past its length what would read as the rest of an
+    // insertion: a value of one octet.
+    let insertion: E<Liar, &[u8]> = E::InsertWithLiteralName {
+        name: raw(Liar {
+            claimed: 3,
+            actual: b"abc\x01x",
+        }),
+        value: raw(Liar {
+            claimed: 2,
+            actual: b"zz",
+        }),
+    };
+    matches!(
+        insertion.encode_into(&mut writer).await,
+        Err(WriteError::Payload {
+            source: WriteAllError::WriteZero { .. }
+        })
+    )
+}
+
+#[test]
+fn a_raw_name_that_writes_more_stops_at_its_own_length() {
+    let mut output = Vec::new();
+    assert!(output.sync_overlong_name_unpin());
+    // Nothing of the name's excess reaches the stream.
+    assert_eq!(output, b"\x43abc");
 }
 
 #[test]

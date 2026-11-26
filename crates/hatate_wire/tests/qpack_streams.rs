@@ -4,7 +4,7 @@
 mod common;
 
 use bytes::BufMut;
-use common::Instruction;
+use common::{Instruction, table_capacity};
 use core::{
     num::NonZeroUsize,
     pin::Pin,
@@ -139,7 +139,7 @@ fn the_encoder_stream_starts_with_the_limits_of_a_table_of_no_capacity() {
     let mut stream = QpackEncoderStream::new(ConstructedAccess::new(&b""[..]));
     assert_eq!(stream.limits(), EncoderStreamLimits::default());
     assert_eq!(stream.limits(), EncoderStreamLimits::for_table_capacity(0));
-    stream.set_max_table_capacity(4096);
+    stream.set_max_table_capacity(table_capacity(4096));
     assert_eq!(
         stream.limits(),
         EncoderStreamLimits::for_table_capacity(4096)
@@ -179,14 +179,14 @@ fn the_limits_that_follow_from_the_settings_admit_the_insertion() {
     let reference = [0xc1, 0x01, b'x'];
     // A capacity of 33 leaves one decoded octet for the name and the value.
     let mut stream = QpackEncoderStream::new(ConstructedAccess::new(&literal_name[..]));
-    stream.set_max_table_capacity(33);
+    stream.set_max_table_capacity(table_capacity(33));
     let read = run(next::<_, ()>(&mut stream)).unwrap();
     let EncoderInstruction::InsertWithLiteralName { name, value } = &read.value else {
         panic!("an insertion with a literal name");
     };
     assert_eq!((name.as_ref(), value.as_ref()), (&b"x"[..], &b""[..]));
     let mut stream = QpackEncoderStream::new(ConstructedAccess::new(&reference[..]));
-    stream.set_max_table_capacity(33);
+    stream.set_max_table_capacity(table_capacity(33));
     let read = run(next::<_, ()>(&mut stream)).unwrap();
     let EncoderInstruction::InsertWithNameReference { value, .. } = &read.value else {
         panic!("an insertion with a name reference");
@@ -213,7 +213,7 @@ fn the_encoder_stream_gives_the_metadata_of_all_the_octets_of_an_instruction() {
     // reference whose value header and value follow.
     let wire = [0x3f, 0xbd, 0x01, 0xc1, 0x01, b'x'];
     let mut stream = QpackEncoderStream::new(numbered(&wire));
-    stream.set_max_table_capacity(100);
+    stream.set_max_table_capacity(table_capacity(100));
     let capacity = run(next::<_, Positions>(&mut stream)).unwrap();
     assert_eq!(
         capacity.value,

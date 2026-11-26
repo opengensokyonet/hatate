@@ -67,35 +67,75 @@ static TREE: [[u16; 2]; LEAF as usize] = {
 /// octets. `H` grows through [`Extend`], which does not report allocation
 /// failure.
 pub fn decode<H: Default + Extend<u8>>(src: impl Buf, limit: usize) -> Result<H, DecodeError> {
-    decode_counted(src, limit).map(|(output, _)| output)
+    decode_counted(src, limit).map(|decoded| decoded.octets)
 }
 
 /// [`decode`], also returning the number of decoded octets.
 pub(crate) fn decode_counted<H: Default + Extend<u8>>(
     mut src: impl Buf,
     limit: usize,
-) -> Result<(H, usize), DecodeError> {
-    let mut output = H::default();
-    let mut decoder = SymbolDecoder::new(limit);
-    // Hand symbols over in batches rather than one `extend` call each.
-    let mut batch = [0; 64];
-    let mut filled = 0;
+) -> Result<Decoded<H>, DecodeError> {
+    let mut decoder = BatchingDecoder::new(limit);
     while src.has_remaining() {
-        let byte = src.get_u8();
+        decoder.octet(src.get_u8())?;
+    }
+    decoder.finish()
+}
+
+/// The decoded octets of a Huffman payload, collected in `H`, and how many
+/// there are.
+pub(crate) struct Decoded<H> {
+    /// The decoded octets.
+    pub(crate) octets: H,
+    /// The number of decoded octets.
+    pub(crate) len: usize,
+}
+
+/// Decodes a Huffman payload octet by octet into `H`, handing the symbols
+/// over in batches rather than in one `extend` call each.
+pub(crate) struct BatchingDecoder<H> {
+    octets: H,
+    decoder: SymbolDecoder,
+    batch: [u8; 64],
+    filled: usize,
+}
+
+impl<H: Default + Extend<u8>> BatchingDecoder<H> {
+    /// A decoder of at most `limit` octets.
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            octets: H::default(),
+            decoder: SymbolDecoder::new(limit),
+            batch: [0; 64],
+            filled: 0,
+        }
+    }
+
+    /// Decodes the next octet of code.
+    pub(crate) fn octet(&mut self, octet: u8) -> Result<(), DecodeError> {
         for shift in (0..8).rev() {
-            if let Some(symbol) = decoder.bit((byte >> shift) & 1)? {
-                batch[filled] = symbol;
-                filled += 1;
-                if filled == batch.len() {
-                    output.extend(batch.iter().copied());
-                    filled = 0;
+            if let Some(symbol) = self.decoder.bit((octet >> shift) & 1)? {
+                self.batch[self.filled] = symbol;
+                self.filled += 1;
+                if self.filled == self.batch.len() {
+                    self.octets.extend(self.batch.iter().copied());
+                    self.filled = 0;
                 }
             }
         }
+        Ok(())
     }
-    let produced = decoder.finish()?;
-    output.extend(batch[..filled].iter().copied());
-    Ok((output, produced))
+
+    /// Ends the payload: checks its padding and hands over the octets.
+    pub(crate) fn finish(mut self) -> Result<Decoded<H>, DecodeError> {
+        let len = self.decoder.finish()?;
+        self.octets
+            .extend(self.batch[..self.filled].iter().copied());
+        Ok(Decoded {
+            octets: self.octets,
+            len,
+        })
+    }
 }
 
 // Carries a partial code across encoded input octets and buffer boundaries.

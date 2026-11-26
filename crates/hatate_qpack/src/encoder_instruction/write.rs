@@ -28,11 +28,15 @@ use snafu::{ResultExt, Snafu};
 /// `max_decoded_len`. A failed check writes nothing and leaves the stream at
 /// the boundary.
 ///
-/// A raw literal writes itself into the stream's access, held to the
-/// octets of the instruction not written yet ([`WriteLimit`]), so a source
-/// wrapped in `nitori_codec::payload::Chunks`, `Fill` or `Buffered` can be
-/// one; it must write as many octets as its length prefix says, or the
-/// instruction fails.
+/// A raw literal writes itself into the stream's access, held to its own
+/// length ([`WriteLimit`]), so a source wrapped in
+/// `nitori_codec::payload::Chunks`, `Fill` or `Buffered` can be one. It
+/// must write as many octets as its length prefix says: one that writes
+/// more is stopped at the end of its length, where its write fails, and one
+/// that writes fewer fails the instruction
+/// ([`ShortName`](EncodeEncoderInstructionError::ShortName),
+/// [`ShortValue`](EncodeEncoderInstructionError::ShortValue)). Either way
+/// the stream holds no octet beyond the literal's length.
 /// A Huffman literal is encoded as it is written.
 ///
 /// # Errors
@@ -58,8 +62,8 @@ where
         self.check(stream.limits)?;
         // invariant: the check bounds the length by the usize limit.
         let length = self.wire_len() as usize;
-        stream.position.begin_write(length);
-        match write_instruction(self, &mut stream.io, &mut stream.position.unwritten).await {
+        let unwritten = stream.position.begin_write(length);
+        match write_instruction(self, &mut stream.io, unwritten).await {
             Ok(report) => {
                 stream.position.finish();
                 Ok(report)
@@ -163,7 +167,7 @@ where
                 unwritten,
                 0,
                 value,
-                |source| EncodeEncoderInstructionError::Value { source },
+                |source| EncodeEncoderInstructionError::ShortValue { source },
             )
             .await?;
             Ok(EncoderInstructionOutput {
@@ -178,7 +182,7 @@ where
                 unwritten,
                 0x40,
                 name,
-                |source| EncodeEncoderInstructionError::Name { source },
+                |source| EncodeEncoderInstructionError::ShortName { source },
             )
             .await?;
             let (value_head, value) = write_literal::<VALUE_LENGTH_BITS, _, _, _, _, _>(
@@ -186,7 +190,7 @@ where
                 unwritten,
                 0,
                 value,
-                |source| EncodeEncoderInstructionError::Value { source },
+                |source| EncodeEncoderInstructionError::ShortValue { source },
             )
             .await?;
             Ok(EncoderInstructionOutput {
@@ -199,7 +203,8 @@ where
 }
 
 /// Writes a literal whose length prefix of `N` bits begins in an octet with
-/// the high bits `flags`; `which` tells which literal a failure of it is.
+/// the high bits `flags`; `short` tells which literal a raw payload that
+/// wrote too few octets is.
 /// Gives the report of the octets written here, the length prefix and a
 /// Huffman payload, and the output of a raw payload.
 async fn write_literal<const N: u8, A, S, H, O, P>(
@@ -207,8 +212,8 @@ async fn write_literal<const N: u8, A, S, H, O, P>(
     unwritten: &mut WriteLimit,
     flags: u8,
     literal: StringLiteral<S, H>,
-    which: impl FnOnce(
-        string_literal::WriteError,
+    short: impl FnOnce(
+        ShortPayloadError,
     ) -> EncodeEncoderInstructionError<<A::Family as Write>::Error, P>,
 ) -> Result<
     (<A::Family as Write>::Report, Option<O>),
@@ -228,18 +233,23 @@ where
             let report = instruction::put(io, unwritten, head.as_slice())
                 .await
                 .context(SendSnafu)?;
-            let before = unwritten.0;
+            let expected = length.value().get();
+            // invariant: `check` bounds the instruction by the usize limit,
+            // and the octets of the instruction left after the length prefix
+            // hold this payload.
+            let after = unwritten.0 - expected as usize;
+            // Hold the payload to its own length, so that one writing more
+            // stops at its end rather than in what follows it. If the write
+            // fails or is dropped before the rest is put back, the stream has
+            // accepted the length prefix and settles as interrupted anyway.
+            unwritten.0 = expected as usize;
             let output = bytes
                 .encode_into(Composed::new(&mut *io, &mut *unwritten))
                 .await
                 .context(PayloadSnafu)?;
-            let written = before - unwritten.0;
-            if written as u64 != length.value().get() {
-                return Err(which(string_literal::WriteError::PayloadLength {
-                    expected: length.value().get(),
-                    actual: written,
-                }));
-            }
+            let missing = unwritten.0;
+            unwritten.0 += after;
+            ShortPayloadError::check(expected, missing).map_err(short)?;
             Ok((report, Some(output)))
         }
         LiteralBytes::Huffman(decoded) => {
@@ -300,8 +310,8 @@ pub enum EncodeEncoderInstructionError<W, P> {
         source: PaddingError,
     },
     /// The literal name cannot be written: its length has no encoding in its
-    /// prefix or its payload does not hold its length, which is found before
-    /// anything is written except for a raw payload.
+    /// prefix, or a Huffman payload does not hold its decoded length.
+    /// Nothing was written.
     #[snafu(display("invalid literal name"))]
     Name {
         /// The literal's failure.
@@ -325,4 +335,46 @@ pub enum EncodeEncoderInstructionError<W, P> {
         /// The literal's failure.
         source: P,
     },
+    /// The raw literal name wrote fewer octets than its length prefix says.
+    #[snafu(display("raw literal name ended short of its length"))]
+    ShortName {
+        /// Its length and the octets missing.
+        source: ShortPayloadError,
+    },
+    /// The raw value wrote fewer octets than its length prefix says.
+    #[snafu(display("raw literal value ended short of its length"))]
+    ShortValue {
+        /// Its length and the octets missing.
+        source: ShortPayloadError,
+    },
+}
+
+/// A raw literal written to a stream wrote fewer octets than its length
+/// prefix says. Its measurements can only be obtained from a write that
+/// ended short.
+#[derive(Debug, PartialEq, Eq, Snafu)]
+#[snafu(display("raw literal of {length} octets wrote {missing} too few"))]
+pub struct ShortPayloadError {
+    length: u64,
+    missing: usize,
+}
+
+impl ShortPayloadError {
+    fn check(length: u64, missing: usize) -> Result<(), Self> {
+        if missing == 0 {
+            Ok(())
+        } else {
+            Err(Self { length, missing })
+        }
+    }
+
+    /// The length the literal's prefix says.
+    pub const fn length(&self) -> u64 {
+        self.length
+    }
+
+    /// The octets of that length it did not write, at least one.
+    pub const fn missing(&self) -> usize {
+        self.missing
+    }
 }

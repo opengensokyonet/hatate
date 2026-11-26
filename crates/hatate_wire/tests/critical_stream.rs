@@ -446,9 +446,7 @@ fn the_control_stream_ending_before_its_first_frame_is_closed() {
 /// and gives the code of the failure.
 #[call(sync)]
 async fn encoder_failure<
-    F: Read<Error = Infallible, Metadata = ()>
-        + ReadChunk<Metadata = ()>
-        + Skip<Count = usize, Metadata = ()>,
+    F: Read<Error = !, Metadata = ()> + ReadChunk<Metadata = ()> + Skip<Count = usize, Metadata = ()>,
     A: ReceiverAccess<Family = F>,
 >(
     io: &mut A,
